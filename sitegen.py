@@ -42,6 +42,7 @@ import traceback
 import unicodedata
 import webbrowser
 from html import escape as _escape, unescape as _unescape
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -192,17 +193,125 @@ FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})\s*([\w+#.-]*).*$")
 QUOTE_RE = re.compile(r"^\s{0,3}>\s?(.*)$")
 SEP_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
 RAW_RE = re.compile(r"^\s{0,3}<(!--|/?([a-zA-Z][\w-]*))")
-_EVENT_ATTR = re.compile(r"""\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""", re.I)
-_RAW_URL = re.compile(r"""(\s(?:src|href|poster)\s*=\s*)(["'])(.*?)\2""", re.I | re.S)
+# Raw HTML inside markdown is passed through an allowlist sanitizer built on html.parser.
+# The parser decodes entities in attribute values the same way a browser does, so tricks such as
+# href="&#106;avascript:..." are caught. Tags outside the allowlist are dropped (script and style
+# lose their contents too), event handler attributes are removed and URLs are checked by scheme.
+_SAFE_TAGS = BLOCK_TAGS | INLINE_TAGS | set(
+    "pre caption colgroup col tfoot track main small".split()
+)
+_DROP_CONTENT = {"script", "style", "template", "noscript"}
+_URL_ATTRS = {"href", "src", "poster", "action", "formaction", "cite", "data", "background", "longdesc"}
+_SAFE_SCHEMES = ("http:", "https:", "mailto:", "tel:")
+_ATTR_NAME = re.compile(r"^[a-zA-Z_:][-a-zA-Z0-9_:.]*$")
+_BAD_CSS = re.compile(r"expression|javascript|vbscript|behavior|-moz-binding|@import", re.I)
 
 
-def clean_raw(s):
-    """Best-effort removal of scripts, styles, inline event handlers and javascript: URLs."""
-    s = re.sub(r"<\s*(script|style)\b.*?<\s*/\s*\1\s*>", "", s, flags=re.I | re.S)
-    s = re.sub(r"<\s*/?\s*(script|style)\b[^>]*>", "", s, flags=re.I)
-    s = _EVENT_ATTR.sub("", s)
-    s = re.sub(r"(?i)javascript\s*:", "blocked:", s)
-    return s
+def safe_url(value, prefix, attr_name="href"):
+    """Return a URL that is safe to emit, or '#'. Relative URLs get the page prefix."""
+    v = str(value or "").strip()
+    compact = re.sub(r"[\s\x00-\x1f\x7f]+", "", v).lower()
+    if not compact:
+        return "#" if attr_name == "href" else ""
+    if _SCHEME.match(compact):
+        if compact.startswith(_SAFE_SCHEMES):
+            return v
+        if attr_name in ("src", "poster") and re.match(r"^data:image/(png|jpe?g|gif|webp|avif);", compact):
+            return v
+        return "#" if attr_name in ("href", "action") else ""
+    return fix_url(v, prefix)
+
+
+def _safe_srcset(value, prefix):
+    out = []
+    for cand in str(value).split(","):
+        bits = cand.strip().split()
+        if not bits:
+            continue
+        url = safe_url(bits[0], prefix, "src")
+        if not url or url == "#":
+            return ""
+        out.append(" ".join([url] + bits[1:]))
+    return ", ".join(out)
+
+
+class _Sanitizer(HTMLParser):
+    def __init__(self, prefix):
+        super().__init__(convert_charrefs=True)
+        self.prefix = prefix
+        self.out = []
+        self.skip = 0
+
+    def _attrs(self, attrs):
+        parts = []
+        for name, value in attrs:
+            name = (name or "").lower()
+            if not _ATTR_NAME.match(name) or name.startswith("on") or name in ("srcdoc", "formaction"):
+                continue
+            if value is None:
+                parts.append(" " + name)
+                continue
+            if name in _URL_ATTRS or name.endswith(":href"):
+                value = safe_url(value, self.prefix, name)
+                if not value:
+                    continue
+            elif name == "srcset":
+                value = _safe_srcset(value, self.prefix)
+                if not value:
+                    continue
+            elif name == "style":
+                if _BAD_CSS.search(re.sub(r"/\*.*?\*/|\\", "", value, flags=re.S)):
+                    continue
+            parts.append(' %s="%s"' % (name, attr(value)))
+        return "".join(parts)
+
+    def handle_starttag(self, tag, attrs):
+        if tag in _DROP_CONTENT:
+            self.skip += 1
+            return
+        if self.skip or tag not in _SAFE_TAGS:
+            return
+        self.out.append("<%s%s>" % (tag, self._attrs(attrs)))
+
+    def handle_startendtag(self, tag, attrs):
+        if self.skip or tag not in _SAFE_TAGS:
+            return
+        self.out.append("<%s%s>" % (tag, self._attrs(attrs)))
+
+    def handle_endtag(self, tag):
+        if tag in _DROP_CONTENT:
+            self.skip = max(0, self.skip - 1)
+            return
+        if self.skip or tag not in _SAFE_TAGS:
+            return
+        self.out.append("</%s>" % tag)
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.out.append(esc(data))
+
+    # comments, doctype, processing instructions and CDATA are dropped
+    def handle_comment(self, data):
+        pass
+
+    def handle_decl(self, decl):
+        pass
+
+    def handle_pi(self, data):
+        pass
+
+    def unknown_decl(self, data):
+        pass
+
+
+def sanitize_html(s, prefix=""):
+    p = _Sanitizer(prefix)
+    try:
+        p.feed(s)
+        p.close()
+    except Exception:  # malformed input: fall back to showing it as text
+        return esc(s)
+    return "".join(p.out)
 
 
 class Markdown:
@@ -216,10 +325,7 @@ class Markdown:
         return self.blocks(text.split("\n"))
 
     def raw(self, s):
-        s = clean_raw(s)
-        return _RAW_URL.sub(
-            lambda m: "%s%s%s%s" % (m.group(1), m.group(2), fix_url(m.group(3), self.prefix), m.group(2)), s
-        )
+        return sanitize_html(s, self.prefix)
 
     # ---- blocks
     def unique_id(self, text):
@@ -1752,7 +1858,10 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- helpers
     def read_body(self, limit):
-        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            n = max(0, int(self.headers.get("Content-Length") or 0))
+        except ValueError:
+            raise ApiError("Bad Content-Length header.")
         if n > limit:
             raise ApiError("That file is too large.", 413)
         return self.rfile.read(n) if n else b""
@@ -1760,13 +1869,18 @@ class Handler(BaseHTTPRequestHandler):
     def read_json(self):
         raw = self.read_body(8 * 1024 * 1024)
         try:
-            return json.loads(raw.decode("utf-8")) if raw else {}
+            d = json.loads(raw.decode("utf-8")) if raw else {}
         except ValueError:
             raise ApiError("Bad request body.")
+        if not isinstance(d, dict):
+            raise ApiError("Bad request body.")
+        return d
 
-    def send_bytes(self, status, ctype, data):
+    def send_bytes(self, status, ctype, data, extra=None):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -1805,7 +1919,12 @@ class Handler(BaseHTTPRequestHandler):
             ctype = "application/rss+xml"
         if ctype.startswith("text/") or ctype.endswith("xml") or ctype == "application/javascript":
             ctype += "; charset=utf-8"
-        self.send_bytes(200, ctype, target.read_bytes())
+        # Built pages share an origin with the editor, so scripts are refused outright. The generated
+        # site has none, and this stops an uploaded SVG or pasted HTML from reaching the editor API.
+        self.send_bytes(200, ctype, target.read_bytes(), {
+            "Content-Security-Policy": "script-src 'none'; object-src 'none'; base-uri 'self'",
+            "X-Content-Type-Options": "nosniff",
+        })
 
     # ---- routing
     def dispatch(self, method):
