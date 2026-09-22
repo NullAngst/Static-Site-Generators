@@ -4,8 +4,9 @@ Two single-file static site generators, each with a local markdown editor and li
 
 - **SiteGen** (`sitegen.py`) builds general sites and blogs: pages, a post feed, tags, RSS and SEO fields.
 - **WikiGen** (`wikigen.py`) builds wiki-style sites: sections, articles, a sidebar with dropdown sections, search, and links between articles.
+- **StoryGen** (`storygen.py`) builds fiction sites: short stories, novellas and serials, with the chapter list down the left side.
 
-Both are plain Python with no third-party packages. Each is one file, and that file is the whole program.
+All three are plain Python with no third-party packages. Each is one file, and that file is the whole program.
 
 ## Requirements
 
@@ -19,13 +20,14 @@ Nothing to install beyond Python. Both tools run on Linux, macOS, and Windows.
 ```sh
 git clone https://github.com/NullAngst/Static-Site-Generators.git
 cd Static-Site-Generators
-python3 sitegen.py ~/my-site      # a site or blog
-python3 wikigen.py ~/my-wiki      # a wiki
+python3 sitegen.py ~/my-site       # a site or blog
+python3 wikigen.py ~/my-wiki       # a wiki
+python3 storygen.py ~/my-stories   # short stories and serials
 ```
 
-Each command creates the folder if it does not exist, starts a local server on `127.0.0.1`, and opens the editor in your browser. When you are done, the folder holds the finished website. Upload its contents (everything except the hidden `.sitegen/` or `.wikigen/` folder) to any static host or web server.
+Each command creates the folder if it does not exist, starts a local server on `127.0.0.1`, and opens the editor in your browser. When you are done, the folder holds the finished website. Upload its contents (everything except the hidden `.sitegen/`, `.wikigen/` or `.storygen/` folder) to any static host or web server.
 
-Common options, the same for both tools:
+Common options, the same for all three:
 
 ```sh
 python3 sitegen.py                    # reopen the last site you used
@@ -34,7 +36,7 @@ python3 sitegen.py ~/my-site --no-browser
 python3 sitegen.py --help
 ```
 
-The default ports are 8765 for SiteGen and 8766 for WikiGen, so both can run at the same time.
+The default ports are 8765 for SiteGen, 8766 for WikiGen and 8767 for StoryGen, so they can all run at the same time.
 
 ---
 
@@ -193,17 +195,78 @@ Clean light, Classic wiki, Slate dark, Nord, Gruvbox dark, Dracula, Solarized li
 
 ---
 
+# StoryGen
+
+StoryGen is built for fiction. The library page lists your stories, each story has its own page with a cover, blurb and chapter list, and every chapter page keeps the chapter list down the left so readers can move through a serial without going back and forth.
+
+Its output has no JavaScript.
+
+## Features
+
+- Stories in two forms: a **single piece** for a standalone short story, or **chapters** for a novella or serial
+- A library page with cover, blurb, status, genres, word count and reading time per story
+- Chapter pages with the chapter list in a sidebar, chapter numbering, previous and next links, and an optional author's note
+- Story details: subtitle, author, cover image, blurb, genres, content notes, series name and number, start and completion dates
+- Status per story: Draft, Ongoing, On hiatus, Complete. Completed stories end with "The end"
+- Genre pages, so `genre/horror.html` lists everything tagged Horror
+- Drafts at both levels: a draft story or a draft chapter is saved but left out of the built site
+- Word counts and reading-time estimates, calculated at build time, with an adjustable words-per-minute figure
+- Book typography: indented or spaced paragraphs, optional drop capital, and `* * *` scene breaks
+- Extra pages (an About page is created for you) that appear in the top navigation
+- An optional RSS feed of new chapters, plus meta descriptions, canonical links, sitemap.xml and robots.txt
+- Nine themes aimed at reading, and a CSS editor
+
+## Using it
+
+- **New story** asks for a title and whether it is a single piece or has chapters. Its editor holds everything about the story, and for a single piece the same editor holds the story text.
+- **New chapter** opens the chapter editor. Pick the story, write, and press **Save** (or Ctrl+S). Changing the story moves the chapter. A live word count sits in the toolbar.
+- Chapters are ordered by hand with Up and Down, in the story editor or the chapter editor, so posting order and reading order can differ.
+- **Import file** loads a `.md` or `.txt` file from your computer into the chapter editor, which suits drafts written elsewhere.
+- **Add page** creates an About, Contact or similar page.
+- **Rescan files** picks up stories and chapters written outside the editor, the same way WikiGen does. A folder under `.storygen/stories/` becomes a story and each `.md` file in it becomes a chapter.
+- **Settings** holds the site title, author name, paragraph style, drop capital, word count and reading time options, the feed, and the sitemap.
+
+The preview can be shown at desktop width, phone width, or the width of the pane.
+
+## Scene breaks and formatting
+
+A line containing `* * *` (or `***`) becomes a centred scene break. Emphasis is the usual Markdown: `*italic*` and `**bold**`. A blockquote makes an epigraph. If a chapter file starts with a `# Heading` that matches the chapter title, it is dropped, since the page prints the title itself.
+
+## Output structure
+
+```
+my-stories/
+  index.html                    library page
+  about.html                    extra pages
+  <story>/index.html            story page: cover, blurb, chapter list
+  <story>/<chapter>.html        chapters
+  genre/<genre>.html            genre listings
+  style.css                     your stylesheet
+  assets/                       covers and images
+  rss, rss.xml                  when the feed is enabled
+  sitemap.xml, robots.txt       when enabled
+  .storygen/                    markdown sources, settings, trash
+```
+
+Deleted stories and chapters are moved to `.storygen/trash` rather than destroyed, and pages for chapters you delete, rename or turn into drafts are removed from the output on the next build.
+
+## Themes
+
+Paperback, Night reading, Parchment, Manuscript, Ink on white, Midnight blue, Sepia, Noir, and Pulp.
+
+---
+
 # Shared details
 
 ## Markdown support
 
-Both tools use their own renderer, covering a practical subset rather than the full CommonMark specification: headings, bold, italic, strikethrough, inline code, links, images, ordered and unordered lists, task lists, blockquotes, tables, and fenced code blocks. Links and images use paths from the site root, for example `about.html` or `assets/photo.png`, and are adjusted automatically for pages in subfolders.
+All three tools use the same renderer, covering a practical subset rather than the full CommonMark specification: headings, bold, italic, strikethrough, inline code, links, images, ordered and unordered lists, task lists, blockquotes, tables, and fenced code blocks. Links and images use paths from the site root, for example `about.html` or `assets/photo.png`, and are adjusted automatically for pages in subfolders.
 
 Raw HTML in Markdown passes through an allowlist sanitizer. It keeps common layout and formatting tags, removes `<script>`, `<style>` and other unsafe elements, strips event handler attributes, and rejects `javascript:` and similar URLs, including entity-encoded ones. Embedded HTML outside that allowlist will not render.
 
 ## Security notes
 
-Both editors are local authoring tools, not public web services. The server binds to `127.0.0.1` only and is meant to run on the machine you are working on.
+All three editors are local authoring tools, not public web services. The server binds to `127.0.0.1` only and is meant to run on the machine you are working on.
 
 Each run creates a random token that every API request must carry, requests with an unexpected Host header are refused, and file serving for previews is confined to the site folder. Built pages opened from the editor are served with a Content-Security-Policy that blocks inline script, so a hostile SVG or pasted HTML cannot reach the editor's API. These measures reduce risk from other local processes and stray requests. They do not make it safe to expose the editor port to a network, so do not do that. The built sites are static files with no server-side component.
 
@@ -213,10 +276,11 @@ Stated plainly so you can decide whether these fit:
 
 - Single author. There are no accounts, no multi-user editing, and no page history beyond the trash folder. Keeping the site folder in git gives you history.
 - No plugins, shortcodes or templating language beyond Markdown, themes, and direct CSS.
-- Every save rebuilds the whole site. WikiGen skips rewriting unchanged files, which keeps deploys through rsync or git small. Very large sites will rebuild more slowly.
+- Every save rebuilds the whole site. WikiGen and StoryGen skip rewriting unchanged files, which keeps deploys through rsync or git small. Very large sites will rebuild more slowly.
 - WikiGen sections are one level deep. There are no sub-sections.
+- StoryGen has no reader accounts, comments or view counts, and no EPUB export. Word counts are computed from the rendered text, so they differ slightly from what a word processor reports.
 - The Markdown renderer is a subset, as described above.
-- Keep the `.sitegen/` or `.wikigen/` folder if you want to keep editing. Everything else in the site folder is generated output.
+- Keep the hidden `.sitegen/`, `.wikigen/` or `.storygen/` folder if you want to keep editing. Everything else in the site folder is generated output.
 
 ## License
 
