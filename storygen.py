@@ -41,14 +41,18 @@ import argparse
 import copy
 import datetime
 import email.utils
+import ftplib
 import json
 import mimetypes
 import os
 import re
 import secrets
+import shlex
 import shutil
+import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import traceback
 import unicodedata
@@ -128,7 +132,7 @@ def read_text(path):
 def clean_date(s):
     try:
         return datetime.date.fromisoformat(str(s)[:10]).isoformat()
-    except Exception:
+    except (TypeError, ValueError):
         return datetime.date.today().isoformat()
 
 
@@ -2076,6 +2080,795 @@ class Library:
 
 
 # ----------------------------------------------------------------------------
+# Publishing to a server
+#
+# Transfers use tools already on your machine (rsync, ssh, sftp, git) or Python's own
+# ftplib. Nothing here implements SSH, so password logins for rsync and sftp need
+# sshpass; key logins need nothing extra and are the better option.
+#
+# Security rules this code keeps:
+#   * Settings are validated before any program runs. They live in config.json, which can
+#     arrive with a site folder someone else made, so they are treated as untrusted.
+#   * Secrets never appear on a command line or in the log. sshpass and git read them
+#     from the environment, which only this user can read.
+#   * Only regular files are published. Symlinks are skipped, so a link inside the site
+#     folder cannot leak the file it points at.
+#   * Files are copied to a private staging folder first, so saving in the editor during
+#     a publish cannot change what is being sent halfway through.
+#   * Deletions on the server only touch plain relative paths inside the target, and only
+#     files an earlier publish sent there (rsync mirror mode excepted, which asks first).
+# ----------------------------------------------------------------------------
+
+DEPLOY_METHODS = ("rsync", "sftp", "ftp", "ftps", "git", "folder")
+PASSWORD_ENV = APP.upper() + "_PASSWORD"
+PUBLISH_DOTFILES = (".htaccess", ".well-known")
+JOB = {"running": False, "ok": None, "what": "", "lines": [], "started": "", "proc": None, "cancel": False}
+JOB_LOCK = threading.Lock()
+
+_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+_HOST_RE = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})(?:\.[A-Za-z0-9-]{1,63})*\.?|\[[0-9A-Fa-f:.]+\]|[0-9A-Fa-f:.]+)$")
+_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
+_FTP_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._@+-]{0,127}$")
+_BRANCH_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]{0,99}$")
+_SHELL_META = set("$`;&|<>()*?[]{}'\"\\!#")
+_DANGEROUS_ROOTS = {"", "/", "~", ".", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt", "/proc",
+                    "/root", "/run", "/sbin", "/srv", "/sys", "/tmp", "/usr", "/var", "/var/www", "/var/lib"}
+
+
+def default_deploy():
+    return {
+        "method": "rsync",
+        "host": "",
+        "port": "",
+        "user": "",
+        "path": "",
+        "key": "",
+        "remote": "",
+        "branch": "main",
+        "mirror": False,
+        "include_sources": False,
+        "save_password": False,
+        "passive": True,
+        "insecure_tls": False,
+    }
+
+
+def clean_deploy(d, current):
+    """Merge submitted settings over the stored ones. Shape only; validate_deploy checks meaning."""
+    out = dict(default_deploy())
+    if isinstance(current, dict):
+        out.update({k: v for k, v in current.items() if k in out})
+    if d.get("method") in DEPLOY_METHODS:
+        out["method"] = d["method"]
+    if out.get("method") not in DEPLOY_METHODS:
+        out["method"] = "rsync"
+    for k, limit in (("host", 253), ("user", 128), ("path", 400), ("key", 400), ("remote", 400), ("branch", 100)):
+        if k in d:
+            out[k] = str(d.get(k) or "").strip()[:limit]
+        out[k] = str(out.get(k) or "")
+    if "port" in d:
+        out["port"] = str(d.get("port") or "").strip()[:5]
+    out["port"] = str(out.get("port") or "")
+    for k in ("mirror", "include_sources", "save_password", "passive", "insecure_tls"):
+        if k in d:
+            out[k] = bool(d[k])
+        out[k] = bool(out.get(k))
+    return out
+
+
+def validate_deploy(dep, require=True):
+    """Refuse anything that could be read as a command line option, a shell fragment, or a
+    path outside the target. Raises ApiError with a message the user can act on.
+    require=False allows blank fields, for saving settings that are not finished yet."""
+    m = dep["method"]
+    for k in ("host", "user", "path", "key", "remote", "branch", "port"):
+        if _CTRL.search(dep.get(k) or ""):
+            raise ApiError("The %s contains a control character, which is not allowed." % k)
+    if dep.get("port"):
+        if not dep["port"].isdigit() or not 1 <= int(dep["port"]) <= 65535:
+            raise ApiError("The port must be a number from 1 to 65535, or blank for the default.")
+    if m in ("rsync", "sftp", "ftp", "ftps"):
+        if not dep.get("host") and require:
+            raise ApiError("Fill in the Host.")
+        if dep.get("host") and not _HOST_RE.match(dep["host"]):
+            raise ApiError("The host must be a plain hostname or IP address, such as vps.example.com.")
+        user = dep.get("user") or ""
+        if m in ("ftp", "ftps"):
+            if not user and require:
+                raise ApiError("FTP needs a User.")
+            if user and not _FTP_USER_RE.match(user):
+                raise ApiError("The user name contains characters that are not allowed.")
+        elif user and not _USER_RE.match(user):
+            raise ApiError("The user name may only contain letters, digits, dot, dash and underscore.")
+    if m in ("rsync", "sftp", "ftp", "ftps", "folder"):
+        path = dep.get("path") or ""
+        if not path and require:
+            raise ApiError("Fill in the Path.")
+        if path.startswith("-"):
+            raise ApiError("The path cannot start with a dash.")
+        if ".." in path.replace("\\", "/").split("/"):
+            raise ApiError("The path cannot contain '..'. Use the full path instead.")
+        if m != "folder" and (_SHELL_META & set(path) or " " in path):
+            raise ApiError("The server path may only contain letters, digits, and . _ - / ~ @ + characters.")
+    if m in ("rsync", "sftp", "git") and dep.get("key"):
+        if dep["key"].startswith("-") or not Path(dep["key"]).expanduser().is_file():
+            raise ApiError("The SSH key file %s does not exist." % dep["key"])
+    if m == "git":
+        remote = dep.get("remote") or ""
+        if not remote and require:
+            raise ApiError("Fill in the Git remote URL.")
+        if remote.startswith("-"):
+            raise ApiError("The git remote cannot start with a dash.")
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*::", remote):
+            raise ApiError("Git remote helpers of the form transport::address are not allowed here.")
+        bits = urlsplit(remote)
+        if bits.scheme and len(bits.scheme) > 1:
+            if bits.scheme not in ("https", "http", "ssh", "git", "file"):
+                raise ApiError("Use an https://, ssh:// or git@host:path remote.")
+            if bits.password:
+                raise ApiError("Do not put a password or token in the URL. Use the Password box instead.")
+            if bits.hostname and bits.hostname.startswith("-"):
+                raise ApiError("The host in the git remote cannot start with a dash.")
+        branch = dep.get("branch") or "main"
+        if not _BRANCH_RE.match(branch) or ".." in branch or branch.endswith((".lock", "/")):
+            raise ApiError("The branch name is not valid.")
+    return dep
+
+
+def mirror_path_is_dangerous(path):
+    p = path.strip().rstrip("/") or "/"
+    if p in _DANGEROUS_ROOTS:
+        return True
+    return bool(re.match(r"^(/home/[^/]+|/Users/[^/]+|~[^/]*)$", p))
+
+
+# ---- the job log
+
+def job_say(line):
+    with JOB_LOCK:
+        JOB["lines"].append(str(line).rstrip("\r\n"))
+        del JOB["lines"][:-800]
+
+
+def job_status(since=0):
+    try:
+        since = max(0, int(since))
+    except (TypeError, ValueError):
+        since = 0
+    with JOB_LOCK:
+        return {"running": JOB["running"], "ok": JOB["ok"], "what": JOB["what"],
+                "total": len(JOB["lines"]), "lines": JOB["lines"][since:]}
+
+
+def job_cancelled():
+    with JOB_LOCK:
+        return JOB["cancel"]
+
+
+def cancel_publish():
+    with JOB_LOCK:
+        if not JOB["running"]:
+            return {"ok": False}
+        JOB["cancel"] = True
+        proc = JOB["proc"]
+    job_say("Stopping at your request...")
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+    return {"ok": True}
+
+
+def run_stream(cmd, env=None, cwd=None):
+    """Run a command with no terminal attached, sending its output to the job log."""
+    job_say("$ " + " ".join(shlex.quote(c) for c in cmd))
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             env=env, cwd=cwd, text=True, bufsize=1, errors="replace")
+    except FileNotFoundError:
+        raise ApiError("%s is not installed on this machine." % cmd[0])
+    with JOB_LOCK:
+        JOB["proc"] = p
+    try:
+        for line in p.stdout:
+            job_say(line)
+        return p.wait()
+    finally:
+        with JOB_LOCK:
+            JOB["proc"] = None
+        if job_cancelled():
+            raise ApiError("Stopped before it finished. The server may hold a partial upload; publish again to complete it.")
+
+
+# ---- ssh helpers
+
+def ssh_opts(dep, password):
+    opts = ["-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=20",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]
+    opts += ["-o", "BatchMode=no"] if password else ["-o", "BatchMode=yes"]
+    if dep.get("key"):
+        opts += ["-i", str(Path(dep["key"]).expanduser()), "-o", "IdentitiesOnly=yes"]
+    if dep.get("port"):
+        opts += ["-o", "Port=" + dep["port"]]
+    return opts
+
+
+def with_sshpass(cmd, password):
+    """Put sshpass in front of a command. It reads the password from SSHPASS in the
+    environment, which other users cannot read, instead of from the command line."""
+    env = dict(os.environ)
+    env.pop("SSHPASS", None)
+    if not password:
+        return cmd, env
+    if not shutil.which("sshpass"):
+        raise ApiError(
+            "Password logins for this method need the sshpass program, which is not installed. "
+            "Install it (openSUSE: sudo zypper install sshpass), or leave the password blank and use "
+            "an SSH key, which is the safer option anyway."
+        )
+    env["SSHPASS"] = password
+    return ["sshpass", "-e"] + cmd, env
+
+
+def remote_target(dep):
+    user = dep.get("user") or ""
+    return ("%s@%s" % (user, dep["host"])) if user else dep["host"]
+
+
+def server_path(dep):
+    """Path on the server. For sftp and ftp a leading ~/ means the login folder, which is
+    where relative paths start anyway."""
+    p = dep["path"].strip()
+    if dep["method"] in ("sftp", "ftp", "ftps"):
+        if p in ("~", "~/"):
+            return "."
+        if p.startswith("~/"):
+            return p[2:].rstrip("/") or "."
+    return p.rstrip("/") or "/"
+
+
+# ---- what gets published
+
+def local_files(root):
+    """Regular files to publish, relative to the site folder. Hidden files and folders are
+    skipped (that covers the markdown sources and .git), except .htaccess and .well-known.
+    Symlinks are skipped and reported, so a link cannot publish the file it points at."""
+    out, skipped = [], []
+    root = Path(root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        keep = []
+        for d in sorted(dirnames):
+            full = here / d
+            if full.is_symlink():
+                skipped.append(full.relative_to(root).as_posix() + "/")
+            elif not d.startswith(".") or d in PUBLISH_DOTFILES:
+                keep.append(d)
+        dirnames[:] = keep
+        for f in sorted(filenames):
+            full = here / f
+            rel = full.relative_to(root).as_posix()
+            if f.startswith(".") and f not in PUBLISH_DOTFILES:
+                continue
+            if full.is_symlink() or not full.is_file():
+                skipped.append(rel)
+                continue
+            out.append(rel)
+    return out, skipped
+
+
+def safe_rel(rel):
+    """True for a plain relative path with no way to climb out of the folder it is joined to."""
+    if not isinstance(rel, str) or not rel or _CTRL.search(rel) or "\\" in rel:
+        return False
+    if rel.startswith("/") or re.match(r"^[A-Za-z]:", rel):
+        return False
+    return all(part not in ("", ".", "..") for part in rel.split("/"))
+
+
+def stage(site, files):
+    """Copy the files into a private temporary folder and publish from there."""
+    tmp = Path(tempfile.mkdtemp(prefix="%s-publish-" % APP.lower()))
+    for rel in files:
+        dst = tmp / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(site.root / rel, dst, follow_symlinks=False)
+    return tmp
+
+
+def target_key(dep):
+    return "|".join([dep["method"], dep.get("host", ""), dep.get("port", ""), dep.get("user", ""),
+                     dep.get("path", ""), dep.get("remote", "")])
+
+
+def load_published(site, dep):
+    """Files the last publish to this exact target sent, or None if there was none. Entries
+    that are not plain relative paths are dropped, since the record lives in an editable file."""
+    try:
+        d = json.loads((site.meta / "published.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or d.get("target") != target_key(dep):
+        return None
+    return [f for f in (d.get("files") or []) if safe_rel(f)]
+
+
+def save_published(site, dep, files):
+    write_text(site.meta / "published.json",
+               json.dumps({"target": target_key(dep), "files": sorted(files),
+                           "when": datetime.date.today().isoformat()}, indent=1))
+
+
+# ---- saved password
+
+def secret_path(site):
+    return site.meta / "secret.json"
+
+
+def secret_key(dep):
+    """A saved password is tied to the method, host, port and user it was saved for, so
+    pointing config.json somewhere else does not send it to a different server."""
+    return "|".join([dep["method"], dep.get("host", ""), dep.get("port", ""), dep.get("user", ""),
+                     dep.get("remote", "")])
+
+
+def load_password(site, dep):
+    try:
+        d = json.loads(secret_path(site).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(d, dict) or d.get("for") != secret_key(dep):
+        return ""
+    return str(d.get("password") or "")
+
+
+def store_password(site, dep, password, keep):
+    """Save or forget the password. A blank password never overwrites a saved one. The file
+    is created with owner-only permissions, so it is never readable by others, even briefly."""
+    p = secret_path(site)
+    if not keep:
+        if p.exists():
+            p.unlink()
+        return
+    if not password:
+        return
+    data = json.dumps({"for": secret_key(dep), "password": password}).encode("utf-8")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    os.replace(tmp, p)
+
+
+def resolve_password(site, dep, given):
+    """Password from the form, then the one saved for this target, then the environment."""
+    if given:
+        return given
+    return load_password(site, dep) or os.environ.get(PASSWORD_ENV, "")
+
+
+# ---- the methods
+
+def deploy_rsync(dep, password, staged, dry):
+    if not shutil.which("rsync"):
+        raise ApiError("rsync is not installed on this machine. Install it, or choose another method.")
+    ssh = ["ssh"] + ssh_opts(dep, password)
+    # -r -t -z without -l or -p: no symlinks, no local permission bits; --chmod gives sane web
+    # permissions. The protect filter keeps server-side dotfiles (.htaccess, .well-known) safe
+    # from --delete.
+    cmd = ["rsync", "-rtz", "--human-readable", "--itemize-changes", "--timeout=120",
+           "--chmod=D755,F644", "--filter=P .*"]
+    if dry:
+        cmd.append("--dry-run")
+    if dep.get("mirror"):
+        cmd.append("--delete")
+    cmd += ["-e", " ".join(shlex.quote(x) for x in ssh), "--",
+            str(staged) + "/", "%s:%s/" % (remote_target(dep), server_path(dep).rstrip("/"))]
+    cmd, env = with_sshpass(cmd, password)
+    code = run_stream(cmd, env=env)
+    if code != 0:
+        raise ApiError("rsync exited with code %d. The log above says why." % code)
+
+
+def sftp_quote(s):
+    """Quote an argument for an sftp batch file. Control characters are refused, so a name
+    can never start a new batch command."""
+    if _CTRL.search(s):
+        raise ApiError("A file name contains a control character: %r" % s)
+    return '"%s"' % s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def deploy_sftp(site, dep, password, files, staged, dry):
+    if not shutil.which("sftp"):
+        raise ApiError("The sftp program (part of OpenSSH) is not installed. Install it, or choose another method.")
+    odd = [f for f in files if set(f) & set("*?[]\\\"")]
+    if odd:
+        raise ApiError("sftp treats * ? [ ] as wildcards, so these names cannot be uploaded safely with it: %s. "
+                       "Rename them or use rsync." % ", ".join(odd[:5]))
+    base = server_path(dep)
+    previous = load_published(site, dep) or []
+    stale = [f for f in previous if f not in files] if dep.get("mirror") else []
+    lines, made = [], set()
+    prefix = "/" if base.startswith("/") else ""
+    walked = []
+    for part in [p for p in base.split("/") if p and p != "."]:
+        walked.append(part)
+        lines.append("-mkdir " + sftp_quote(prefix + "/".join(walked)))
+    for f in files:
+        parts = f.split("/")[:-1]
+        for i in range(len(parts)):
+            sub = "/".join(parts[: i + 1])
+            if sub not in made:
+                made.add(sub)
+                lines.append("-mkdir " + sftp_quote(base + "/" + sub))
+    for f in files:
+        lines.append("put %s %s" % (sftp_quote(str(staged / f)), sftp_quote(base + "/" + f)))
+    for f in stale:
+        lines.append("-rm " + sftp_quote(base + "/" + f))
+    if dry:
+        job_say("Dry run. %d file(s) would be uploaded and %d removed." % (len(files), len(stale)))
+        for line in lines[:80]:
+            job_say("  " + line)
+        if len(lines) > 80:
+            job_say("  ... and %d more" % (len(lines) - 80))
+        return
+    fd, batch = tempfile.mkstemp(prefix="%s-sftp-" % APP.lower(), suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        cmd = ["sftp"] + ssh_opts(dep, password) + ["-b", batch, "--", remote_target(dep)]
+        cmd, env = with_sshpass(cmd, password)
+        code = run_stream(cmd, env=env)
+    finally:
+        os.unlink(batch)
+    if code != 0:
+        raise ApiError("sftp exited with code %d. The log above says why." % code)
+
+
+def ftp_close(ftp):
+    try:
+        ftp.quit()
+    except (OSError, EOFError, ftplib.Error):
+        ftp.close()
+
+
+def ftp_connect(dep, password):
+    """Log in over FTP, or FTPS with the certificate checked unless that was switched off.
+    FTP_TLS.login secures the control channel before the password is sent."""
+    tls = dep["method"] == "ftps"
+    if tls:
+        ctx = ssl.create_default_context()
+        if dep.get("insecure_tls"):
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            job_say("The server certificate is not being checked, because you asked for that.")
+        ftp = ftplib.FTP_TLS(context=ctx, timeout=30)
+    else:
+        job_say("WARNING: plain FTP sends your password and files unencrypted. Use FTPS or SFTP if you can.")
+        ftp = ftplib.FTP(timeout=30)
+    port = int(dep.get("port") or 21)
+    job_say("Connecting to %s:%d" % (dep["host"], port))
+    try:
+        ftp.connect(dep["host"], port)
+        ftp.login(dep.get("user") or "", password)
+        if tls:
+            ftp.prot_p()
+    except ssl.SSLError as e:
+        ftp.close()
+        raise ApiError("The server's TLS certificate was refused (%s). Fix the certificate, tick "
+                       "\"trust a self-signed certificate\", or use SFTP." % e)
+    except ftplib.error_perm as e:
+        ftp.close()
+        raise ApiError("The server refused the login: %s" % e)
+    except (OSError, EOFError) as e:
+        ftp.close()
+        raise ApiError("Could not connect: %s" % e)
+    ftp.set_pasv(bool(dep.get("passive", True)))
+    job_say("Logged in as %s" % dep.get("user"))
+    return ftp
+
+
+def ftp_enter(ftp, path, create):
+    """Change into path one folder at a time, creating folders when asked. Returns the full path."""
+    if path.startswith("/"):
+        ftp.cwd("/")
+    for part in [p for p in path.split("/") if p and p != "."]:
+        try:
+            ftp.cwd(part)
+        except ftplib.error_perm:
+            if not create:
+                raise
+            ftp.mkd(part)
+            ftp.cwd(part)
+    return ftp.pwd()
+
+
+def deploy_ftp(site, dep, password, files, staged, dry):
+    if not password:
+        raise ApiError("FTP needs a password.")
+    previous = load_published(site, dep) or []
+    stale = [f for f in previous if f not in files] if dep.get("mirror") else []
+    if dry:
+        job_say("Dry run. %d file(s) would be uploaded and %d removed." % (len(files), len(stale)))
+        return
+    ftp = ftp_connect(dep, password)
+    try:
+        home = ftp_enter(ftp, server_path(dep), create=True).rstrip("/")
+        made = set()
+        for i, f in enumerate(files, 1):
+            if job_cancelled():
+                raise ApiError("Stopped before it finished. Publish again to complete the upload.")
+            parts = f.split("/")[:-1]
+            for j in range(len(parts)):
+                sub = "/".join(parts[: j + 1])
+                if sub not in made:
+                    made.add(sub)
+                    try:
+                        ftp.mkd(home + "/" + sub)
+                    except ftplib.error_perm:
+                        pass
+            with open(staged / f, "rb") as fh:
+                ftp.storbinary("STOR " + home + "/" + f, fh)
+            if i % 10 == 0 or i == len(files):
+                job_say("Uploaded %d/%d" % (i, len(files)))
+        for f in stale:
+            try:
+                ftp.delete(home + "/" + f)
+                job_say("Removed " + f)
+            except ftplib.error_perm as e:
+                job_say("Could not remove %s (%s)" % (f, e))
+    finally:
+        ftp_close(ftp)
+
+
+def git_env(dep, password):
+    """Environment for git: no prompts, ordinary transports only, and credentials supplied by
+    a helper that reads them from the environment instead of the URL or the command line."""
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ALLOW_PROTOCOL"] = "https:http:ssh:git:file"
+    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=20"]
+    if dep.get("key"):
+        ssh += ["-i", str(Path(dep["key"]).expanduser()), "-o", "IdentitiesOnly=yes"]
+    env["GIT_SSH_COMMAND"] = " ".join(shlex.quote(x) for x in ssh)
+    env["PUBLISH_GIT_USER"] = dep.get("user") or "git"
+    env["PUBLISH_GIT_PASS"] = password or ""
+    return env
+
+
+def git_cmd(*args):
+    """git with this app's settings. The first empty credential.helper switches off any helper
+    in your git config, so the token is neither read from nor saved into a credential store."""
+    helper = ('!f() { test "$1" = get || return 0; echo "username=$PUBLISH_GIT_USER"; '
+              'echo "password=$PUBLISH_GIT_PASS"; }; f')
+    return ["git", "-c", "credential.helper=", "-c", "credential.helper=" + helper,
+            "-c", "protocol.ext.allow=never", "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60"] + list(args)
+
+
+def deploy_git(site, dep, password, dry):
+    if not shutil.which("git"):
+        raise ApiError("git is not installed on this machine.")
+    branch = dep.get("branch") or "main"
+    root = str(site.root)
+    env = git_env(dep, password)
+    who = (site.cfg.get("site") or {}).get("author") or APP
+    for k, v in (("GIT_AUTHOR_NAME", who), ("GIT_COMMITTER_NAME", who),
+                 ("GIT_AUTHOR_EMAIL", APP.lower() + "@localhost"), ("GIT_COMMITTER_EMAIL", APP.lower() + "@localhost")):
+        env.setdefault(k, v)
+    if not (site.root / ".git").exists():
+        if run_stream(git_cmd("init", "-q", "-b", branch), cwd=root, env=env) != 0:
+            raise ApiError("git init failed.")
+    ignore = site.root / ".gitignore"
+    current = read_text(ignore)
+    if dep.get("include_sources"):
+        wanted = [META_DIR + "/secret.json", META_DIR + "/secret.json.tmp", META_DIR + "/published.json"]
+    else:
+        wanted = [META_DIR + "/"]
+    add = [w for w in wanted if w not in current.split("\n")]
+    if add:
+        write_text(ignore, (current.rstrip("\n") + "\n" if current.strip() else "") + "\n".join(add) + "\n")
+    run_stream(git_cmd("rm", "-r", "-q", "--cached", "--ignore-unmatch", META_DIR + "/secret.json"), cwd=root, env=env)
+    if run_stream(git_cmd("add", "-A"), cwd=root, env=env) != 0:
+        raise ApiError("git add failed.")
+    if dry:
+        run_stream(git_cmd("status", "--short"), cwd=root, env=env)
+        job_say("Dry run. Nothing was committed or pushed.")
+        return
+    if run_stream(git_cmd("diff", "--cached", "--quiet"), cwd=root, env=env) != 0:
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        if run_stream(git_cmd("commit", "-q", "-m", "Publish " + stamp), cwd=root, env=env) != 0:
+            raise ApiError("git could not commit. The log above says why.")
+    else:
+        job_say("No changes to commit. Pushing the current commit anyway.")
+    code = run_stream(git_cmd("push", "--", dep["remote"], "HEAD:refs/heads/" + branch), cwd=root, env=env)
+    if code != 0:
+        raise ApiError("git push exited with code %d. The log above says why." % code)
+
+
+def folder_dest(site, dep):
+    dest = Path(dep["path"]).expanduser().resolve()
+    root = site.root.resolve()
+    if dest == root or root in dest.parents or dest in root.parents:
+        raise ApiError("The destination cannot be the site folder, inside it, or a folder that contains it.")
+    return dest
+
+
+def deploy_folder(site, dep, files, staged, dry):
+    dest = folder_dest(site, dep)
+    previous = load_published(site, dep) or []
+    stale = [f for f in previous if f not in files] if dep.get("mirror") else []
+    if dry:
+        job_say("Dry run. %d file(s) would be copied to %s and %d removed." % (len(files), dest, len(stale)))
+        return
+    dest.mkdir(parents=True, exist_ok=True)
+    for i, f in enumerate(files, 1):
+        if job_cancelled():
+            raise ApiError("Stopped before it finished.")
+        target = dest / f
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.is_symlink():
+            target.unlink()
+        shutil.copy2(staged / f, target, follow_symlinks=False)
+        if i % 25 == 0 or i == len(files):
+            job_say("Copied %d/%d" % (i, len(files)))
+    for f in stale:
+        p = dest / f
+        try:
+            inside = dest in p.resolve().parents
+        except OSError:
+            inside = False
+        if inside and (p.is_file() or p.is_symlink()):
+            p.unlink()
+            job_say("Removed " + f)
+
+
+def run_deploy(site, dep, password, dry):
+    method = dep["method"]
+    if method == "git":
+        deploy_git(site, dep, password, dry)
+        return
+    files, skipped = local_files(site.root)
+    for s in skipped:
+        job_say("Skipped %s (a symlink or special file, which is never published)" % s)
+    job_say("%d file(s) to publish from %s" % (len(files), site.root))
+    staged = stage(site, files)
+    try:
+        if method == "rsync":
+            deploy_rsync(dep, password, staged, dry)
+        elif method == "sftp":
+            deploy_sftp(site, dep, password, files, staged, dry)
+        elif method in ("ftp", "ftps"):
+            deploy_ftp(site, dep, password, files, staged, dry)
+        elif method == "folder":
+            deploy_folder(site, dep, files, staged, dry)
+        else:
+            raise ApiError("Unknown publish method.")
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
+    if not dry:
+        save_published(site, dep, files)
+
+
+def test_deploy(site, dep, password):
+    """A reachability check that changes nothing on the server."""
+    method = dep["method"]
+    if method in ("rsync", "sftp"):
+        if not shutil.which("ssh"):
+            raise ApiError("The ssh program is not installed, so the connection cannot be tested here.")
+        path = server_path(dep)
+        cmd = ["ssh"] + ssh_opts(dep, password) + [
+            "--", remote_target(dep), "test -d %s && echo FOUND || echo MISSING" % shlex.quote(path)]
+        cmd, env = with_sshpass(cmd, password)
+        code = run_stream(cmd, env=env)
+        if code != 0:
+            raise ApiError("Could not log in (ssh exited %d). The log above says why." % code)
+        job_say("Logged in. MISSING above means the path does not exist yet; the first publish creates it.")
+    elif method in ("ftp", "ftps"):
+        if not password:
+            raise ApiError("FTP needs a password.")
+        ftp = ftp_connect(dep, password)
+        try:
+            ftp_enter(ftp, server_path(dep), create=False)
+            job_say("Path %s exists." % dep["path"])
+        except ftplib.error_perm:
+            job_say("Path %s does not exist yet. The first publish creates it." % dep["path"])
+        finally:
+            ftp_close(ftp)
+    elif method == "git":
+        if run_stream(git_cmd("ls-remote", "--heads", "--", dep["remote"]), env=git_env(dep, password)) != 0:
+            raise ApiError("git could not reach that remote. The log above says why.")
+        job_say("Remote reachable.")
+    elif method == "folder":
+        dest = Path(dep["path"]).expanduser()
+        job_say("%s: %s" % (dest, "exists" if dest.is_dir() else "does not exist yet, it will be created"))
+        parent = dest if dest.is_dir() else dest.parent
+        if not os.access(str(parent), os.W_OK):
+            raise ApiError("No permission to write to %s" % parent)
+        job_say("Writable.")
+    else:
+        raise ApiError("Unknown publish method.")
+
+
+def start_publish(site, d, dry=False, test=False):
+    """Validate, build, then transfer on a background thread so the editor stays responsive."""
+    d = d if isinstance(d, dict) else {}
+    with JOB_LOCK:
+        if JOB["running"]:
+            raise ApiError("A publish is already running.")
+    dep = validate_deploy(clean_deploy(d, site.cfg.get("deploy")))
+    if dep["method"] == "folder":
+        folder_dest(site, dep)
+    if dep["method"] == "rsync" and dep.get("mirror") and not dry and not test:
+        if mirror_path_is_dangerous(server_path(dep)):
+            raise ApiError("Refusing to mirror into %s: removing files there could wipe far more than the "
+                           "site. Point Path at the site's own folder." % dep["path"])
+        if load_published(site, dep) is None and not d.get("confirm_mirror"):
+            return {"needs_confirm": True, "message": (
+                "This is the first publish to %s:%s with \"remove files\" turned on.\n\n"
+                "Anything already in that folder on the server that is not part of this site will be "
+                "deleted. Hidden files such as .htaccess and .well-known are kept.\n\n"
+                "Run a dry run first if you are not sure. Continue?" % (dep["host"], dep["path"]))}
+    site.cfg["deploy"] = dep
+    site.save_cfg()
+    given = str(d.get("password") or "")
+    password = resolve_password(site, dep, given)
+    if "save_password" in d:
+        store_password(site, dep, given, dep.get("save_password"))
+    if not test:
+        site.build()
+    what = "Testing the connection" if test else ("Dry run" if dry else "Publishing")
+    with JOB_LOCK:
+        JOB.update(running=True, ok=None, what=what, lines=[], proc=None, cancel=False,
+                   started=datetime.datetime.now().isoformat(" ", "seconds"))
+    job_say("%s (%s) at %s" % (what, dep["method"], JOB["started"]))
+
+    def work():
+        ok = False
+        try:
+            if test:
+                test_deploy(site, dep, password)
+            else:
+                run_deploy(site, dep, password, dry)
+            job_say("Done.")
+            ok = True
+        except ApiError as e:
+            job_say("Stopped: %s" % e)
+        except Exception as e:  # noqa: BLE001  (report anything unexpected instead of dying silently)
+            job_say("Stopped: %s: %s" % (type(e).__name__, e))
+            traceback.print_exc()
+        with JOB_LOCK:
+            JOB.update(running=False, ok=ok, proc=None)
+
+    threading.Thread(target=work, daemon=True, name="publish").start()
+    return {"started": True}
+
+
+def deploy_info(site):
+    dep = clean_deploy({}, site.cfg.get("deploy"))
+    with JOB_LOCK:
+        running = JOB["running"]
+    return {
+        "deploy": dep,
+        "has_password": bool(load_password(site, dep)),
+        "env_var": PASSWORD_ENV,
+        "secret_path": str(secret_path(site)),
+        "running": running,
+        "tools": {t: bool(shutil.which(t)) for t in ("rsync", "ssh", "sftp", "sshpass", "git")},
+    }
+
+
+def save_deploy(site, d):
+    d = d if isinstance(d, dict) else {}
+    dep = validate_deploy(clean_deploy(d, site.cfg.get("deploy")), require=False)
+    site.cfg["deploy"] = dep
+    site.save_cfg()
+    if "save_password" in d:
+        store_password(site, dep, str(d.get("password") or ""), dep.get("save_password"))
+    return {"ok": True, "has_password": bool(load_password(site, dep))}
+
+
+# ----------------------------------------------------------------------------
 # Opening libraries, remembering the last one
 # ----------------------------------------------------------------------------
 
@@ -2089,7 +2882,7 @@ def remember_folder(path):
 def last_folder():
     try:
         return json.loads((CONFIG_HOME / "last.json").read_text(encoding="utf-8")).get("folder")
-    except Exception:
+    except (OSError, ValueError, AttributeError):
         return None
 
 
@@ -2145,7 +2938,7 @@ def pick_folder():
     for cmd in cmds:
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             continue
         if r.returncode == 0:
             return {"path": r.stdout.strip() or None, "available": True}
@@ -2224,6 +3017,20 @@ def api(method, route, query, h):
     if parts == ["build"] and method == "POST":
         w.build()
         return {"ok": True}
+    if parts == ["deploy"]:
+        if method == "GET":
+            return deploy_info(w)
+        if method == "PUT":
+            return save_deploy(w, h.read_json())
+    if parts == ["publish"] and method == "POST":
+        d = h.read_json()
+        return start_publish(w, d, dry=bool(d.get("dry")), test=bool(d.get("test")))
+    if parts == ["publish", "status"] and method == "GET":
+        return job_status(q.get("since", ["0"])[0])
+    if parts == ["publish", "cancel"] and method == "POST":
+        return cancel_publish()
+    if parts == ["publish", "cancel"] and method == "POST":
+        return cancel_publish()
     raise ApiError("Unknown request.", 404)
 
 
@@ -2467,6 +3274,12 @@ details.box .pad { max-width: none; }
 #toast.show { opacity: 1; }
 #toast.bad { background: #b3261e; }
 
+.log { flex: 1; min-height: 160px; margin: 0; padding: 10px 12px; overflow: auto; white-space: pre-wrap;
+  background: var(--field); border-top: 1px solid var(--line); font: 12px/1.5 ui-monospace, Consolas, monospace; }
+.log .bad { color: var(--danger); }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 5px; }
+.dot.on { background: var(--ok, #1c7a45); }
+.tools { display: flex; flex-wrap: wrap; gap: 4px 14px; }
 #welcome { max-width: 540px; margin: 12vh auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 28px; }
 #welcome h1 { margin: 0 0 6px; font-size: 22px; }
 #welcome p { color: var(--muted); margin: 0 0 18px; }
@@ -2509,6 +3322,7 @@ details.box .pad { max-width: none; }
     <span id="dirty" hidden>Unsaved changes</span>
     <span id="folder" title=""></span>
     <button data-act="theme" id="b-theme">Dark mode</button>
+    <button data-act="publish">Publish</button>
     <button data-act="switch">Switch folder</button>
     <button data-act="quit">Quit</button>
   </div>
@@ -2728,6 +3542,185 @@ function countWords() {
   if (!el || !ta) return;
   const n = (ta.value.replace(/[#*_>`\[\]()~-]/g, " ").match(/\S+/g) || []).length;
   el.textContent = fmt(n) + " words";
+}
+
+const PUB_TPL = `
+<div class="fill">
+  <div class="bar">
+    <strong>Publish to a server</strong>
+    <span class="grow"></span>
+    <button id="d-test">Test connection</button>
+    <button id="d-dry">Dry run</button>
+    <button id="d-save">Save settings</button>
+    <button id="d-go" class="primary">Build and publish</button>
+    <button id="d-stop" class="danger" hidden>Stop</button>
+  </div>
+  <div class="pad">
+    <label class="field">Method
+      <select id="d-method">
+        <option value="rsync">rsync over SSH (fastest, only sends what changed)</option>
+        <option value="sftp">SFTP (OpenSSH)</option>
+        <option value="ftps">FTPS (FTP with TLS)</option>
+        <option value="ftp">FTP (unencrypted)</option>
+        <option value="git">git push</option>
+        <option value="folder">Copy to a local folder or mount</option>
+      </select>
+    </label>
+    <div class="two" id="d-hostrow">
+      <label class="field">Host <input id="d-host" placeholder="vps.example.com"></label>
+      <label class="field">Port <input id="d-port" placeholder="22"></label>
+    </div>
+    <div class="two" id="d-userrow">
+      <label class="field">User <input id="d-user" placeholder="deploy"></label>
+      <label class="field">Password <input type="password" id="d-pass" placeholder="Leave blank to use an SSH key"></label>
+    </div>
+    <label id="d-remember"><input type="checkbox" id="d-save_password"> Remember the password in <span class="mono" id="d-secret-path"></span> (plain text, readable by your user only)</label>
+    <label class="field" id="d-pathrow">Path <input id="d-path" placeholder="/var/www/example.com"><span class="hint">The folder on the server that the web server serves. Its contents are replaced by your site.</span></label>
+    <label class="field" id="d-keyrow">SSH key file <input id="d-key" placeholder="Optional, for example ~/.ssh/id_ed25519"></label>
+    <div class="two" id="d-gitrow">
+      <label class="field">Git remote URL <input id="d-remote" placeholder="git@github.com:you/site.git"></label>
+      <label class="field">Branch <input id="d-branch" placeholder="main"></label>
+    </div>
+    <label id="d-mirrorrow"><input type="checkbox" id="d-mirror"> Remove files on the server that are no longer part of the site</label>
+    <p class="hint" id="d-mirrorhint"></p>
+    <label id="d-srcrow"><input type="checkbox" id="d-include_sources"> Include the hidden source folder</label>
+    <label id="d-passiverow"><input type="checkbox" id="d-passive"> Passive mode (leave this on unless the server says otherwise)</label>
+    <label id="d-tlsrow"><input type="checkbox" id="d-insecure_tls"> Trust a self-signed certificate (FTPS only, weaker)</label>
+    <p class="hint" id="d-tools"></p>
+    <p class="hint" id="d-note"></p>
+  </div>
+  <pre class="log" id="d-log" aria-live="polite" aria-label="Publish log"></pre>
+</div>`;
+
+let pubTimer = null, pubSeen = 0;
+const DEPLOY_BOOLS = ["mirror", "include_sources", "save_password", "passive", "insecure_tls"];
+
+function readDeploy() {
+  const o = { method: $("#d-method").value };
+  ["host", "port", "user", "path", "key", "remote", "branch"].forEach((k) => { o[k] = $("#d-" + k).value.trim(); });
+  DEPLOY_BOOLS.forEach((k) => { o[k] = $("#d-" + k).checked; });
+  return o;
+}
+
+function pubSync(info) {
+  const m = $("#d-method").value;
+  const ssh = m === "rsync" || m === "sftp";
+  const ftp = m === "ftp" || m === "ftps";
+  $("#d-hostrow").hidden = !(ssh || ftp);
+  $("#d-userrow").hidden = m === "folder";
+  $("#d-remember").hidden = m === "folder";
+  $("#d-keyrow").hidden = !(ssh || m === "git");
+  $("#d-gitrow").hidden = m !== "git";
+  $("#d-pathrow").hidden = m === "git";
+  $("#d-srcrow").hidden = m !== "git";
+  $("#d-passiverow").hidden = !ftp;
+  $("#d-tlsrow").hidden = m !== "ftps";
+  $("#d-mirrorrow").hidden = m === "git";
+  $("#d-mirrorhint").hidden = m === "git";
+  $("#d-mirrorhint").textContent = m === "rsync"
+    ? "rsync mirrors the folder: anything there that is not part of the site is deleted, apart from hidden files. The first publish to a new folder asks before doing that."
+    : "Only files that an earlier publish sent are removed. Nothing else on the server is touched.";
+  const t = info.tools || {};
+  const notes = [];
+  if (ssh && !t[m === "rsync" ? "rsync" : "sftp"]) notes.push((m === "rsync" ? "rsync" : "sftp") + " is not installed on this machine, so this method will not work yet.");
+  if (ssh && !t.sshpass) notes.push("sshpass is not installed, so a password cannot be handed to ssh. Use an SSH key, or install sshpass.");
+  if (m === "git" && !t.git) notes.push("git is not installed on this machine.");
+  if (m === "ftp") notes.push("Plain FTP sends your password and files in the clear. Prefer FTPS or SFTP.");
+  if (m === "rsync") notes.push("rsync only transfers what changed, so repeat publishes are quick.");
+  if (m === "git") notes.push("For GitHub or GitLab pages, or a bare repo on your VPS with a post-receive hook that checks the files out into the web root.");
+  $("#d-note").textContent = notes.join(" ");
+  $("#d-tools").textContent = "On this machine: " + ["rsync", "ssh", "sftp", "sshpass", "git"]
+    .map((x) => x + (t[x] ? " yes" : " no")).join(", ") + ". The password can also come from the "
+    + info.env_var + " environment variable.";
+}
+
+function pubLog(lines, clear) {
+  const el = $("#d-log");
+  if (!el) return;
+  if (clear) el.textContent = "";
+  lines.forEach((l) => { el.textContent += l + "\n"; });
+  el.scrollTop = el.scrollHeight;
+}
+
+async function pollJob() {
+  try {
+    const r = await api("GET", "publish/status?since=" + pubSeen);
+    if (r.lines.length) { pubLog(r.lines); pubSeen = r.total; }
+    if (r.running) { pubTimer = setTimeout(pollJob, 600); return; }
+    pubTimer = null;
+    pubBusy(false);
+    if (r.ok === true) toast(r.what + " finished");
+    else if (r.ok === false) toast(r.what + " failed. See the log.", "bad");
+  } catch (e) { pubTimer = null; toast(e.message, "bad"); }
+}
+
+function pubBusy(on) {
+  $$("#left .bar button").forEach((b) => { b.disabled = on; });
+  const stop = $("#d-stop");
+  if (stop) { stop.hidden = !on; stop.disabled = false; }
+}
+
+async function pubRun(kind, confirmed) {
+  if (pubTimer) return;
+  const body = readDeploy();
+  body.password = $("#d-pass").value;
+  body.dry = kind === "dry";
+  body.test = kind === "test";
+  if (confirmed) body.confirm_mirror = true;
+  try {
+    const r = await api("POST", "publish", body);
+    if (r.needs_confirm) {
+      if (window.confirm(r.message)) return pubRun(kind, true);
+      return;
+    }
+    pubSeen = 0;
+    pubLog([], true);
+    pubBusy(true);
+    setDirty(false);
+    pollJob();
+  } catch (e) {
+    pubBusy(false);
+    toast(e.message, "bad");
+  }
+}
+
+async function pubStop() {
+  try { $("#d-stop").disabled = true; await api("POST", "publish/cancel"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+async function saveDeploy() {
+  try {
+    const body = readDeploy();
+    body.password = $("#d-pass").value;
+    const r = await api("PUT", "deploy", body);
+    setDirty(false);
+    $("#d-pass").value = "";
+    $("#d-pass").placeholder = r.has_password ? "Saved password in use. Type to change it." : "Leave blank to use an SSH key";
+    toast("Publish settings saved");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+async function openPublish() {
+  const info = await api("GET", "deploy");
+  view = { type: "publish" };
+  $("#left").innerHTML = PUB_TPL;
+  const d = info.deploy;
+  $("#d-method").value = d.method;
+  ["host", "port", "user", "path", "key", "remote", "branch"].forEach((k) => { $("#d-" + k).value = d[k] || ""; });
+  DEPLOY_BOOLS.forEach((k) => { $("#d-" + k).checked = !!d[k]; });
+  $("#d-secret-path").textContent = info.secret_path;
+  if (info.has_password) $("#d-pass").placeholder = "Saved password in use. Type to change it.";
+  $("#d-method").addEventListener("change", () => { pubSync(info); markDirty(); });
+  $$("#left input").forEach((i) => i.addEventListener(i.type === "checkbox" ? "change" : "input", markDirty));
+  $("#d-save").addEventListener("click", saveDeploy);
+  $("#d-go").addEventListener("click", () => pubRun("publish"));
+  $("#d-dry").addEventListener("click", () => pubRun("dry"));
+  $("#d-test").addEventListener("click", () => pubRun("test"));
+  $("#d-stop").addEventListener("click", pubStop);
+  pubSync(info);
+  renderSide();
+  if (info.running) { pubSeen = 0; pubBusy(true); pollJob(); }
 }
 
 /* ---------- preview ---------- */
@@ -3338,6 +4331,7 @@ async function act(name) {
     else if (name === "css") await openCss();
     else if (name === "settings") await openSettings();
     else if (name === "rescan") await rescan();
+    else if (name === "publish") await openPublish();
     else if (name === "switch") await chooseFolder();
   });
 }

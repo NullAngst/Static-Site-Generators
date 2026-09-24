@@ -264,6 +264,57 @@ All three tools use the same renderer, covering a practical subset rather than t
 
 Raw HTML in Markdown passes through an allowlist sanitizer. It keeps common layout and formatting tags, removes `<script>`, `<style>` and other unsafe elements, strips event handler attributes, and rejects `javascript:` and similar URLs, including entity-encoded ones. Embedded HTML outside that allowlist will not render.
 
+## Publishing to a server
+
+All three tools can build and upload in one step. The **Publish** button in the top bar opens a panel with the connection details, a **Test connection** button, a **Dry run** that reports what would be sent without sending it, **Build and publish**, and a **Stop** button while a transfer is running. Progress streams into a log in the panel.
+
+Fill in User, Password, Host, Port and Path, pick a method, and publish. Settings are stored per site in the hidden source folder, so each site remembers its own server.
+
+### Methods
+
+- **rsync over SSH** (default, recommended). Only sends what changed, so repeat publishes take a second or two. Needs `rsync` and `ssh` on your machine.
+- **SFTP**, using the OpenSSH `sftp` client. Uploads every file each time.
+- **FTPS** and **FTP**, handled by Python itself with no external programs. FTPS checks the server certificate by default; a tick box accepts a self-signed one. Plain FTP sends your password and files in the clear and is there only for hosts that offer nothing better.
+- **git push**, for GitHub Pages, GitLab Pages, or a bare repo on your VPS with a `post-receive` hook that checks the files out into the web root. The repository is created in the site folder on first use.
+- **Copy to a local folder**, for a path on this machine, an NFS or SMB mount, or an sshfs mount.
+
+### What gets published
+
+Everything in the site folder except hidden files and folders, which covers the markdown sources and any `.git` folder. `.htaccess` and `.well-known/` are the exceptions and are published if you have them. **Symlinks are never published**: they are skipped and listed in the log, so a link inside the site folder cannot upload the file it points at.
+
+Files are copied to a private temporary folder before the transfer starts, so saving in the editor during a long upload cannot change what is sent halfway through.
+
+### Passwords
+
+Password logins for rsync and SFTP are handed to `ssh` by the `sshpass` program, because OpenSSH will not read a password from anywhere else. If `sshpass` is not installed, the panel says so. An **SSH key** needs no extra program and is the better option: leave Password blank and point the SSH key file box at your private key, or let your agent handle it.
+
+Passwords and tokens never appear on a command line or in the log. `sshpass` reads the password from its environment, and git gets it from a credential helper that also reads the environment, which only your user can read. Three ways to supply one:
+
+- Type it into the panel. It is used for that run and not kept.
+- Tick **Remember the password**, which writes it to `<source folder>/secret.json`. The file is created with permissions `600` from the start, is plain text readable by your user, and is kept out of git pushes. The saved password is tied to the method, host, port and user it was saved for, and is not offered to any other server.
+- Set `SITEGEN_PASSWORD`, `WIKIGEN_PASSWORD` or `STORYGEN_PASSWORD` before starting the tool, which suits a password manager that can inject secrets.
+
+For git over HTTPS, put the access token in the Password box, not in the URL. The tool refuses URLs with a password in them.
+
+### Removing old files
+
+**Remove files on the server that are no longer part of the site** behaves differently per method:
+
+- **rsync** mirrors the folder with `--delete`: anything in the target that is not part of the site is removed. Hidden files on the server, such as `.htaccess` and `.well-known/` (which certbot uses), are always protected. The first publish to a new target with this turned on asks for confirmation first. Mirroring into `/`, a top-level system folder, `/var/www` itself, or a bare home folder is refused outright, since a typo there would be destructive.
+- **SFTP, FTP and folder copies** only delete files that the previous publish to the same target uploaded, recorded in `published.json`. They never touch anything else, which also means an emptied folder can be left behind on the server.
+
+### Checks on the settings
+
+Publish settings are stored in `config.json`, which can arrive inside a site folder someone else made, so they are checked before any program runs. Hosts must be a plain hostname or IP address, user names and paths cannot start with a dash or contain shell characters, ports must be 1 to 65535, git remotes cannot use `transport::` helpers, and paths cannot contain `..`. Entries in `published.json` that are not plain relative paths are ignored.
+
+### Host keys and first connections
+
+SSH connections use `StrictHostKeyChecking=accept-new`: an unknown server's key is recorded in your `known_hosts` on first connection, and a later change of key is refused, as it should be. Connect once by hand first if you want to check the fingerprint yourself. This needs OpenSSH 7.6 or newer.
+
+### Paths
+
+For rsync, the path is passed to the server's shell, so `~/public_html` works. For SFTP and FTP, a leading `~/` is treated as your login folder, where relative paths start anyway. Server paths may contain letters, digits and `. _ - / ~ @ +`, but no spaces.
+
 ## Security notes
 
 All three editors are local authoring tools, not public web services. The server binds to `127.0.0.1` only and is meant to run on the machine you are working on.
