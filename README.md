@@ -1,338 +1,310 @@
 # Static Site Generators
 
-Two single-file static site generators, each with a local markdown editor and live preview. You write in your browser, and the tool builds a static website you can host anywhere.
+Four single-file static site generators written in Python. Each has a local editor that runs in your browser, with Markdown on one side and a live preview on the other, and each builds a static website you can host anywhere or publish straight to a server.
 
-- **SiteGen** (`sitegen.py`) builds general sites and blogs: pages, a post feed, tags, RSS and SEO fields.
-- **WikiGen** (`wikigen.py`) builds wiki-style sites: sections, articles, a sidebar with dropdown sections, search, and links between articles.
-- **StoryGen** (`storygen.py`) builds fiction sites: short stories, novellas and serials, with the chapter list down the left side.
+- **SiteForge** (`siteforge.py`) is the main tool. One site with pages plus any combination of a blog, a wiki and a story library, all of which can be added or removed later.
+- **SiteGen** (`sitegen.py`) builds general sites and blogs.
+- **WikiGen** (`wikigen.py`) builds wiki-style sites.
+- **StoryGen** (`storygen.py`) builds sites for short stories and serials.
 
-All three are plain Python with no third-party packages. Each is one file, and that file is the whole program.
+SiteForge does everything the other three do, keeps all of their themes, and can import sites made with them. The three standalone tools remain in the repository so existing sites keep working and for anyone who only needs one kind of site.
+
+None of them needs anything beyond Python itself. Each file is the whole program.
+
+## Which one to use
+
+| Program | Builds | JavaScript in the built site | Default port | Sources kept in |
+|---|---|---|---|---|
+| SiteForge | Pages plus any mix of blog, wiki and library | None, unless the wiki's built-in search is on | 8768 | `.siteforge/` |
+| SiteGen | Pages and a blog | None | 8765 | `.sitegen/` |
+| WikiGen | A wiki | None, unless built-in search is on | 8766 | `.wikigen/` |
+| StoryGen | A story library | None | 8767 | `.storygen/` |
+
+For a new site, use SiteForge. The different default ports let every tool run at the same time.
 
 ## Requirements
 
 - Python 3.8 or newer
 - A web browser
 
-Nothing to install beyond Python. Both tools run on Linux, macOS, and Windows.
+They run on Linux, macOS and Windows. Publishing to a server over SSH uses programs you may already have, covered under [Publishing to a server](#publishing-to-a-server).
 
 ## Getting started
 
 ```sh
 git clone https://github.com/NullAngst/Static-Site-Generators.git
 cd Static-Site-Generators
-python3 sitegen.py ~/my-site       # a site or blog
-python3 wikigen.py ~/my-wiki       # a wiki
-python3 storygen.py ~/my-stories   # short stories and serials
+python3 siteforge.py ~/my-site
 ```
 
-Each command creates the folder if it does not exist, starts a local server on `127.0.0.1`, and opens the editor in your browser. When you are done, the folder holds the finished website. Upload its contents (everything except the hidden `.sitegen/`, `.wikigen/` or `.storygen/` folder) to any static host or web server.
-
-Common options, the same for all three:
+The standalone tools start the same way:
 
 ```sh
-python3 sitegen.py                    # reopen the last site you used
-python3 sitegen.py ~/my-site --port 9000
-python3 sitegen.py ~/my-site --no-browser
-python3 sitegen.py --help
+python3 sitegen.py ~/my-blog
+python3 wikigen.py ~/my-wiki
+python3 storygen.py ~/my-stories
 ```
 
-The default ports are 8765 for SiteGen, 8766 for WikiGen and 8767 for StoryGen, so they can all run at the same time.
+Each command creates the folder if needed, starts a local server on `127.0.0.1`, and opens the editor in your browser. Options, the same for all four:
+
+```sh
+python3 siteforge.py                    # reopen the last site you used
+python3 siteforge.py ~/my-site --port 9000
+python3 siteforge.py ~/my-site --no-browser
+python3 siteforge.py --help
+```
+
+When you are done, the site folder holds the finished website. Upload everything except the hidden sources folder (`.siteforge/`, `.sitegen/`, `.wikigen/` or `.storygen/`), or use the built-in **Publish** button.
 
 ---
 
-# SiteGen
+# SiteForge
 
-SiteGen produces sites with no JavaScript. The editor runs in the browser and uses JavaScript, but nothing it generates does. The output is HTML, one CSS stylesheet, your images, and optional feed and sitemap files.
+## First run
 
-## Features
+A new folder opens a setup screen, where you choose:
 
-- Pages (home, about, privacy, and custom pages) and a blog with a post feed
-- Drafts and publishing, with drafts kept separate from the built site
-- Tags, tag pages, and an optional RSS feed
-- Per-page and per-post SEO fields, plus site-wide defaults, sitemap.xml and robots.txt
-- Eight built-in themes and a CSS editor for anything the themes do not cover
-- Image uploads into an `assets/` folder
-- Menu editor for showing, hiding, reordering, and adding custom links
+- **What the homepage is:** a page you write, a blog feed, a wiki, or a book list.
+- **What else to switch on:** any of Blog, Wiki and Library.
+- **A theme**, from 26 in three groups.
+- **Optionally, an existing SiteGen, WikiGen or StoryGen site to import.**
 
-## Using it
+All of it can be changed later in **Site structure**.
 
-- **Add page / Blog feed / About page / Define privacy policy** create pages. About and privacy pages start from a template you then edit.
-- **Add blog post** opens the post editor. **Save** keeps it as a draft. **Publish** writes it into the blog feed, sorted by date, and creates the feed page if you do not have one. **Unpublish** moves a post back to drafts.
-- **Tags** on a post are comma separated. Existing tags appear as one-click chips. On the built site, clicking a tag opens a page listing every post with that tag.
-- **Edit CSS** shows global variables at the top and page-specific rules at the bottom, with a theme picker.
-- **Edit menu** lists your pages so you can hide any of them from the navigation without deleting the page, and lets you add custom links.
-- **Site settings** holds the title, tagline, footer, author, language, site URL, and the RSS and SEO options.
+## How a site is put together
 
-## Output structure
+Every site has **pages**. On top of that, three **modules** can be switched on:
+
+| Module | What it gives you | Where it lives |
+|---|---|---|
+| Blog | Posts with drafts, dates, tags, tag pages, a feed page and RSS | `blog/` |
+| Wiki | Sections of articles, a left sidebar with dropdown sections, search, `[[wiki links]]`, callouts, tables of contents | `wiki/` |
+| Library | Short stories and serials, chapters listed down the left, covers, blurbs, genres, word counts, reading typography | `stories/` |
+
+The **homepage** is either a normal page or the landing page of one module: the blog feed, the wiki home, or the book list.
+
+The top menu lists pages and modules automatically. The **Menu** view reorders them, hides any without deleting it, and adds your own links. Each module's name in the menu and headings can be changed, so the Library can appear as Fiction and the Wiki as Docs.
+
+**Switching a module off** removes its pages from the built site but keeps everything you wrote, so switching it back on restores it. Site structure also has a button that moves a switched-off module's content to the trash folder.
+
+### Serving a module from the site root
+
+When the wiki or the library is the homepage, it can be served from the root of the site instead of its folder. A wiki article then lives at `/linux/portainer.html` instead of `/wiki/linux/portainer.html`. That is the layout WikiGen and StoryGen produce, so an imported site keeps its addresses. The blog always lives in `blog/`, which is where SiteGen puts it.
+
+Changing the homepage or where a module is served from changes addresses. SiteForge removes pages it no longer generates, so links to the old addresses from elsewhere will break.
+
+## Writing
+
+The preview can be shown at desktop width, phone width, or the width of the editor pane. Everything supports the shared Markdown described under [Markdown](#markdown), plus callouts and `* * *` scene breaks.
+
+When the wiki is on, `[[Title]]` links to anything on the site by its title. Wiki articles are matched first, then wiki sections, then pages, posts and stories. `[[Section/Article]]` picks between two articles with the same name, `[[Title|text]]` changes the link text, and `[[Title#heading]]` jumps to a heading. A link to something that does not exist yet shows in red, and the editor lists it.
+
+**Pages.** Add them from the Pages heading in the sidebar. Typing About or Privacy policy as the title starts from a template. Each page and each post has an SEO panel: title tag, meta description, social image, canonical URL and noindex.
+
+**Blog.** **Save draft** keeps a post off the site, **Publish** adds it to the feed (sorted by date), and **Unpublish** moves it back to drafts. Tags are comma separated, existing tags show as one-click chips, and each tag gets a page listing its posts.
+
+**Wiki.** Sections contain articles. Articles can move between sections, be reordered, or be marked as drafts. Each gets breadcrumbs, a table of contents when it has three or more headings, a last-updated date, and previous and next links. The wiki home shows your introduction, section cards and recently updated articles, and Settings can switch the last two off.
+
+**Library.** A story is either a **single piece** (the story page holds the text) or has **chapters** (the story page lists them, and each chapter keeps the list in a sidebar). Stories have:
+
+- a subtitle, author, cover and blurb
+- genres, each with its own listing page
+- content notes
+- a series name and number
+- start and completion dates
+- a status: Draft, Ongoing, On hiatus or Complete
+
+Chapters have a date and an optional author's note; word counts and reading time are worked out at build time. Settings chooses indented or spaced paragraphs and whether chapters open with a drop capital.
+
+**Writing outside the editor.** Wiki articles and chapters are plain Markdown files under `.siteforge/wiki/sections/` and `.siteforge/library/stories/`. Add `.md` files or folders there and press **Rescan files**: new folders become sections or stories, new files become articles or chapters, and a leading `# Title` becomes the title. The article, chapter and post editors also have an Import button for a single file.
+
+## Importing SiteGen, WikiGen and StoryGen sites
+
+Use the import box on the setup screen to start a new site from an old one, or **Site structure** to add an old site into an existing one. Point it at the folder that contains the hidden `.sitegen`, `.wikigen` or `.storygen` folder. Several old sites can be imported into one SiteForge site.
+
+| From | What is imported |
+|---|---|
+| SiteGen | Pages with their SEO fields, the blog feed page's text and name, posts and drafts with tags, dates, summaries and SEO fields, custom menu links, and the RSS setting |
+| WikiGen | Sections, articles and drafts, the wiki home, and the search, contents and sidebar settings |
+| StoryGen | Stories, chapters and drafts, the library page, extra pages, and the reading settings |
+
+From all three, images in `assets/` are copied. The site title, URL and similar settings also come across when importing into a new site, or when you tick that option in Site structure.
+
+**URLs.** Imported into a new site with **Serve it from the site root** ticked, a WikiGen or StoryGen site keeps every URL it had. A SiteGen site keeps its URLs without that option, including the `/rss` and `/rss.xml` feed addresses.
+
+**What does not come across as-is:**
+
+- **The source folder is only read,** never changed.
+- **Your old stylesheet** is saved into `.siteforge/imported/` for reference but not applied, because class names changed. Pick one of the retained themes instead.
+- **Clashing names:** anything whose name is already taken gets a new address, and the import summary lists each rename.
+- **Symlinks** in the source are ignored.
+
+## Themes
+
+All 26 themes from the standalone tools are included, in three groups:
+
+- **Site themes:** Clean light, Midnight, Terminal, Paper, Nord, Neon night, Solarized light, Minimal serif.
+- **Wiki themes:** Clean light, Classic wiki, Slate dark, Nord, Gruvbox dark, Dracula, Solarized light, Paper, Terminal.
+- **Reading themes:** Paperback, Night reading, Parchment, Manuscript, Ink on white, Midnight blue, Sepia, Noir, Pulp.
+
+The standalone tools each used their own set of CSS variables, so SiteForge converts every theme to one shared set. Each theme's colours and fonts carry over exactly, and anything a theme never defined is derived from its own palette, such as a sidebar colour for a blog theme. Any theme therefore styles every module.
+
+## Output
 
 ```
 my-site/
-  index.html              home page
-  about.html              and any other pages at the root
-  blog/
-    index.html            the post feed
-    posts/<slug>.html     one file per published post
-    tag/<slug>.html       one file per tag in use
-  assets/                 uploaded images
-  style.css               your stylesheet
-  rss, rss.xml            when the RSS feed is enabled
-  sitemap.xml             when the sitemap is enabled
-  robots.txt              when the sitemap or noindex option is set
-  .sitegen/               markdown sources, drafts, and config
+  index.html                 the homepage
+  about.html, ...            pages
+  blog/                      feed, posts/, tag/, rss.xml
+  wiki/                      home, one folder per section, search.js
+  stories/                   book list, one folder per story, genre/, rss.xml
+  rss, rss.xml               site-wide feed of new posts and chapters
+  sitemap.xml, robots.txt    when enabled
+  style.css                  your stylesheet
+  assets/                    images
+  .siteforge/                markdown sources, settings, trash
 ```
 
-`style.css` is treated as yours. SiteGen appends starter rules for new pages but never overwrites what is already there.
-
-## SEO
-
-Site-wide settings provide the defaults: a meta description, a default social image, a Twitter/X handle, a toggle to generate `sitemap.xml` and `robots.txt`, and a toggle to discourage indexing for staging.
-
-Each page and post has its own SEO panel with a title-tag override, meta description, social image, canonical URL, and a per-item noindex checkbox. A live search-result preview shows how the entry will look.
-
-Fields fall back so you do not have to fill in every one. A post's meta description uses its own field, then its summary, then its first paragraph. A page's uses its own field, then the site description, then the tagline.
-
-Absolute URLs (canonical, Open Graph, sitemap entries) require the site URL to be set. Without it those tags are left out rather than emitted with a wrong value. SiteGen never overwrites a `robots.txt` or `sitemap.xml` it did not generate.
-
-## Themes
-
-Clean light, Midnight, Terminal, Paper, Nord, Neon night, Solarized light, and Minimal serif.
+The feeds and the sitemap need the site URL set in Settings. SiteForge keeps a list of the files it generated and removes the ones it no longer produces; files you put in the folder yourself are never touched.
 
 ---
 
-# WikiGen
+# The standalone tools
 
-WikiGen builds a classic wiki layout: the site title across the top, a left sidebar with a search box and one dropdown per section, and the content on the right.
+These are the programs SiteForge grew out of. They work on their own, and each has its own publishing panel.
 
-## Features
+## SiteGen
 
-- Sections (for example "Fun stuff" or "Linux - Technical") holding any number of articles
-- A home page with your own text, plus optional section cards and a "Recently updated" list
-- A section overview page for each section, with an optional introduction
-- Article pages with breadcrumbs, an automatic table of contents, a last-updated date, and previous and next links within the section
-- Links between articles: `[[Article title]]`, with missing targets shown in red
-- Callout boxes for notes, tips and warnings, which suit step-by-step guides
-- Search, with a choice of how it works (see below)
-- Drafts, which are saved but left out of the built wiki
-- Nine built-in themes and a CSS editor
-- A mobile layout where the sidebar folds behind a Menu button
-- Meta descriptions, canonical links, sitemap.xml and robots.txt
+Pages and a blog, with no JavaScript in the output.
 
-## Using it
+- **Pages:** home, about and privacy templates, and custom pages.
+- **Blog:** a feed page, posts with drafts and publishing, tags with tag pages, and an RSS feed at `/rss` and `/rss.xml`.
+- **SEO:** per-page and per-post fields with a live search-result preview, site-wide defaults, `sitemap.xml` and `robots.txt`.
+- **Menu:** an editor that hides pages without deleting them and adds custom links.
+- **Themes:** eight (the Site group above) and a CSS editor.
 
-- **New section** creates a section. Its editor sets the name, address, description, and introduction, and lists the section's articles with Up, Down and Sort A to Z controls.
-- **New article** opens the article editor. Pick the section, write the title and body, and press **Save** (or Ctrl+S). Changing the section moves the article. Tick **Draft** to keep it out of the built wiki.
-- **Import .md** in the article editor loads a Markdown file from your computer. A leading `# Title` line becomes the article title.
-- **Home page** edits the front page text.
-- **Edit CSS** has a theme picker and the full stylesheet.
-- **Settings** holds the title, tagline, footer, URL, search mode, and page options.
-- **Rescan files** picks up Markdown written outside the editor (see below).
+Output: pages at the root, and posts and tag pages under `blog/`. Sources are in `.sitegen/`.
 
-The preview can be shown at desktop width, phone width, or the width of the pane, so you can check both layouts while you write.
+## WikiGen
 
-## Writing in your own editor
+A wiki: the site title across the top, a left sidebar with search and one dropdown per section, and content on the right.
 
-Articles are ordinary Markdown files, so you can write them in any editor you like:
+- **Pages:** sections of articles, section overview pages, and a home page with section cards and recent changes.
+- **Articles:** breadcrumbs, an automatic table of contents, and previous and next links.
+- **Markdown extras:** `[[wiki links]]` between articles and callout boxes.
+- **Workflow:** drafts, plus rescanning Markdown written in another editor.
+- **Search:** three modes, set in Settings. **Built-in** is instant, via one generated `search.js`. **Web** is a DuckDuckGo form limited to your domain, with no JavaScript. **Off** means the site contains no JavaScript at all. Built-in search indexes the first 8,000 characters of each article.
+- **Themes:** nine (the Wiki group above).
 
-```
-.wikigen/sections/
-  fun-stuff/
-    _index.md                      section introduction (optional)
-    diablo-ii-on-linux.md
-  linux-technical/
-    portainer-setup.md
-```
+Output: `index.html`, then `<section>/index.html` and `<section>/<article>.html`. Sources are in `.wikigen/`.
 
-Drop `.md` files into a section folder, or create a new folder for a new section, then press **Rescan files**. New folders become sections, and new files become articles. Files with spaces or capitals in their names are renamed to web-safe addresses. An article whose file you delete disappears from the wiki on the next rescan.
+## StoryGen
 
-## Markdown extras
+Fiction sites, with no JavaScript in the output.
 
-Everything SiteGen supports works here too. On top of that:
+- **Library page:** covers, blurbs, status, genres and word counts.
+- **Story pages:** a chapter list, or the full text for a single piece.
+- **Chapter pages:** the chapter list in a sidebar, numbering, previous and next links, and author's notes.
+- **Typography:** indented or spaced paragraphs, optional drop capitals, `* * *` scene breaks, and reading time estimates.
+- **Also:** genre pages, drafts, extra pages, and an RSS feed of new chapters.
+- **Themes:** nine (the Reading group above).
 
-```markdown
-See [[Portainer setup]] for the container side.
-[[Linux - Technical/Backups]]       pick an article when two share a name
-[[Portainer setup|this guide]]      change the link text
-[[Portainer setup#backups]]         jump to a heading
-
-> [!NOTE]
-> Useful information.
-
-> [!WARNING]
-> Something that can go wrong.
-```
-
-The supported callout types are NOTE, TIP, IMPORTANT, WARNING and CAUTION. Wiki links match on article title or address, and draft articles are not linkable. The editor lists any wiki links on the current article that do not match an article.
-
-## Search and JavaScript
-
-The sidebar dropdowns are plain HTML `<details>` elements, and the mobile menu is a CSS toggle, so navigation works with JavaScript turned off. A search box that searches a static site needs JavaScript, so Settings offers three modes:
-
-- **Built-in** (default). Instant results with highlighted matches and keyboard navigation (press `/` to focus the box). It adds one generated file, `search.js`, which contains the search index. It works offline and from `file://`. With JavaScript disabled, the box hides itself.
-- **Web search form.** No JavaScript. The query goes to DuckDuckGo, limited to your wiki's domain. It only finds pages the search engine has already indexed, and it needs the wiki URL set.
-- **Off.** No search box, and the generated wiki contains no JavaScript at all.
-
-Built-in search indexes the first 8,000 characters of each article, which keeps `search.js` small on large wikis.
-
-## Output structure
-
-```
-my-wiki/
-  index.html                    home page
-  <section>/index.html          section overview
-  <section>/<article>.html      articles
-  style.css                     your stylesheet
-  search.js                     built-in search only
-  assets/                       uploaded images
-  sitemap.xml, robots.txt       when enabled
-  .wikigen/                     markdown sources, settings, trash
-```
-
-WikiGen keeps a list of the files it generated. When an article is renamed, moved, deleted or made a draft, its old page is removed on the next build. Files you placed in the folder yourself are never removed. Deleted sections and articles are moved to `.wikigen/trash` instead of being destroyed.
-
-## Themes
-
-Clean light, Classic wiki, Slate dark, Nord, Gruvbox dark, Dracula, Solarized light, Paper, and Terminal.
-
----
-
-# StoryGen
-
-StoryGen is built for fiction. The library page lists your stories, each story has its own page with a cover, blurb and chapter list, and every chapter page keeps the chapter list down the left so readers can move through a serial without going back and forth.
-
-Its output has no JavaScript.
-
-## Features
-
-- Stories in two forms: a **single piece** for a standalone short story, or **chapters** for a novella or serial
-- A library page with cover, blurb, status, genres, word count and reading time per story
-- Chapter pages with the chapter list in a sidebar, chapter numbering, previous and next links, and an optional author's note
-- Story details: subtitle, author, cover image, blurb, genres, content notes, series name and number, start and completion dates
-- Status per story: Draft, Ongoing, On hiatus, Complete. Completed stories end with "The end"
-- Genre pages, so `genre/horror.html` lists everything tagged Horror
-- Drafts at both levels: a draft story or a draft chapter is saved but left out of the built site
-- Word counts and reading-time estimates, calculated at build time, with an adjustable words-per-minute figure
-- Book typography: indented or spaced paragraphs, optional drop capital, and `* * *` scene breaks
-- Extra pages (an About page is created for you) that appear in the top navigation
-- An optional RSS feed of new chapters, plus meta descriptions, canonical links, sitemap.xml and robots.txt
-- Nine themes aimed at reading, and a CSS editor
-
-## Using it
-
-- **New story** asks for a title and whether it is a single piece or has chapters. Its editor holds everything about the story, and for a single piece the same editor holds the story text.
-- **New chapter** opens the chapter editor. Pick the story, write, and press **Save** (or Ctrl+S). Changing the story moves the chapter. A live word count sits in the toolbar.
-- Chapters are ordered by hand with Up and Down, in the story editor or the chapter editor, so posting order and reading order can differ.
-- **Import file** loads a `.md` or `.txt` file from your computer into the chapter editor, which suits drafts written elsewhere.
-- **Add page** creates an About, Contact or similar page.
-- **Rescan files** picks up stories and chapters written outside the editor, the same way WikiGen does. A folder under `.storygen/stories/` becomes a story and each `.md` file in it becomes a chapter.
-- **Settings** holds the site title, author name, paragraph style, drop capital, word count and reading time options, the feed, and the sitemap.
-
-The preview can be shown at desktop width, phone width, or the width of the pane.
-
-## Scene breaks and formatting
-
-A line containing `* * *` (or `***`) becomes a centred scene break. Emphasis is the usual Markdown: `*italic*` and `**bold**`. A blockquote makes an epigraph. If a chapter file starts with a `# Heading` that matches the chapter title, it is dropped, since the page prints the title itself.
-
-## Output structure
-
-```
-my-stories/
-  index.html                    library page
-  about.html                    extra pages
-  <story>/index.html            story page: cover, blurb, chapter list
-  <story>/<chapter>.html        chapters
-  genre/<genre>.html            genre listings
-  style.css                     your stylesheet
-  assets/                       covers and images
-  rss, rss.xml                  when the feed is enabled
-  sitemap.xml, robots.txt       when enabled
-  .storygen/                    markdown sources, settings, trash
-```
-
-Deleted stories and chapters are moved to `.storygen/trash` rather than destroyed, and pages for chapters you delete, rename or turn into drafts are removed from the output on the next build.
-
-## Themes
-
-Paperback, Night reading, Parchment, Manuscript, Ink on white, Midnight blue, Sepia, Noir, and Pulp.
+Output: `index.html`, then `<story>/index.html` and `<story>/<chapter>.html`, plus `genre/`. Sources are in `.storygen/`.
 
 ---
 
 # Shared details
 
-## Markdown support
+## Markdown
 
-All three tools use the same renderer, covering a practical subset rather than the full CommonMark specification: headings, bold, italic, strikethrough, inline code, links, images, ordered and unordered lists, task lists, blockquotes, tables, and fenced code blocks. Links and images use paths from the site root, for example `about.html` or `assets/photo.png`, and are adjusted automatically for pages in subfolders.
+All four use the same Markdown renderer. It covers a practical subset of CommonMark:
 
-Raw HTML in Markdown passes through an allowlist sanitizer. It keeps common layout and formatting tags, removes `<script>`, `<style>` and other unsafe elements, strips event handler attributes, and rejects `javascript:` and similar URLs, including entity-encoded ones. Embedded HTML outside that allowlist will not render.
+- **Text:** headings, bold, italic, strikethrough, inline code, links and images.
+- **Blocks:** ordered and unordered lists, task lists, blockquotes, tables and fenced code blocks.
+
+WikiGen and SiteForge add `[[wiki links]]` and callouts (`> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`).
+
+Links and images use paths from the site root, such as `about.html` or `assets/photo.png`, and are adjusted automatically for pages in subfolders. Raw HTML passes through an allowlist sanitizer that keeps common layout and formatting tags and removes anything unsafe (see [Security](#security)).
+
+## Themes and CSS
+
+**Edit CSS** shows the theme variables at the top of `style.css` and your own rules at the bottom, with a list of the body classes you can target to style one page or one section. None of the tools overwrites `style.css`; **Apply theme** only replaces the variables block.
 
 ## Publishing to a server
 
-All three tools can build and upload in one step. The **Publish** button in the top bar opens a panel with the connection details, a **Test connection** button, a **Dry run** that reports what would be sent without sending it, **Build and publish**, and a **Stop** button while a transfer is running. Progress streams into a log in the panel.
-
-Fill in User, Password, Host, Port and Path, pick a method, and publish. Settings are stored per site in the hidden source folder, so each site remembers its own server.
+Every tool has a **Publish** button that builds the site and uploads it in one step. The panel takes User, Password, Host, Port and Path, and has **Test connection**, **Dry run** (reports what would be sent without sending it), **Build and publish**, and **Stop** while a transfer runs. Progress streams into a log in the panel. Settings are stored per site.
 
 ### Methods
 
 - **rsync over SSH** (default, recommended). Only sends what changed, so repeat publishes take a second or two. Needs `rsync` and `ssh` on your machine.
 - **SFTP**, using the OpenSSH `sftp` client. Uploads every file each time.
-- **FTPS** and **FTP**, handled by Python itself with no external programs. FTPS checks the server certificate by default; a tick box accepts a self-signed one. Plain FTP sends your password and files in the clear and is there only for hosts that offer nothing better.
-- **git push**, for GitHub Pages, GitLab Pages, or a bare repo on your VPS with a `post-receive` hook that checks the files out into the web root. The repository is created in the site folder on first use.
-- **Copy to a local folder**, for a path on this machine, an NFS or SMB mount, or an sshfs mount.
+- **FTPS and FTP**, handled by Python itself. FTPS checks the server certificate by default, with an option to accept a self-signed one. Plain FTP sends your password and files in the clear.
+- **git push**, for GitHub Pages, GitLab Pages, or a bare repository on your server with a `post-receive` hook that checks the files out into the web root.
+- **Copy to a local folder**, for a path on this machine or a mounted share.
 
 ### What gets published
 
-Everything in the site folder except hidden files and folders, which covers the markdown sources and any `.git` folder. `.htaccess` and `.well-known/` are the exceptions and are published if you have them. **Symlinks are never published**: they are skipped and listed in the log, so a link inside the site folder cannot upload the file it points at.
+Everything in the site folder except hidden files and folders, which covers the sources and any `.git` folder. `.htaccess` and `.well-known/` are published if you have them. **Symlinks are never published**; they are skipped and listed in the log.
 
-Files are copied to a private temporary folder before the transfer starts, so saving in the editor during a long upload cannot change what is sent halfway through.
+Files are copied to a private temporary folder before the transfer, so saving in the editor during an upload cannot change what is sent.
 
 ### Passwords
 
-Password logins for rsync and SFTP are handed to `ssh` by the `sshpass` program, because OpenSSH will not read a password from anywhere else. If `sshpass` is not installed, the panel says so. An **SSH key** needs no extra program and is the better option: leave Password blank and point the SSH key file box at your private key, or let your agent handle it.
+Password logins for rsync and SFTP are handed to `ssh` by the `sshpass` program (openSUSE: `sudo zypper install sshpass`), because OpenSSH will not read a password from anywhere else. An **SSH key** needs no extra program and is the better option: leave Password blank and point the key file box at your private key, or let your agent handle it.
 
-Passwords and tokens never appear on a command line or in the log. `sshpass` reads the password from its environment, and git gets it from a credential helper that also reads the environment, which only your user can read. Three ways to supply one:
+Passwords and tokens never appear on a command line or in the log. There are three ways to supply one:
 
-- Type it into the panel. It is used for that run and not kept.
-- Tick **Remember the password**, which writes it to `<source folder>/secret.json`. The file is created with permissions `600` from the start, is plain text readable by your user, and is kept out of git pushes. The saved password is tied to the method, host, port and user it was saved for, and is not offered to any other server.
-- Set `SITEGEN_PASSWORD`, `WIKIGEN_PASSWORD` or `STORYGEN_PASSWORD` before starting the tool, which suits a password manager that can inject secrets.
+- **Type it into the panel.** It is used for that run and not kept.
+- **Tick Remember the password.** This writes it to `secret.json` in the sources folder, created with permissions `600`. The file is plain text, readable by your user, and kept out of git pushes. A saved password is tied to the method, host, port and user it was saved for, and is never offered to another server.
+- **Set an environment variable** before starting the tool: `SITEFORGE_PASSWORD`, `SITEGEN_PASSWORD`, `WIKIGEN_PASSWORD` or `STORYGEN_PASSWORD`.
 
-For git over HTTPS, put the access token in the Password box, not in the URL. The tool refuses URLs with a password in them.
+For git over HTTPS, put the access token in the Password box. URLs with a password in them are refused.
 
 ### Removing old files
 
-**Remove files on the server that are no longer part of the site** behaves differently per method:
+**Remove files on the server that are no longer part of the site** works differently per method:
 
-- **rsync** mirrors the folder with `--delete`: anything in the target that is not part of the site is removed. Hidden files on the server, such as `.htaccess` and `.well-known/` (which certbot uses), are always protected. The first publish to a new target with this turned on asks for confirmation first. Mirroring into `/`, a top-level system folder, `/var/www` itself, or a bare home folder is refused outright, since a typo there would be destructive.
-- **SFTP, FTP and folder copies** only delete files that the previous publish to the same target uploaded, recorded in `published.json`. They never touch anything else, which also means an emptied folder can be left behind on the server.
+- **rsync** mirrors the folder with `--delete`. Hidden files on the server, such as `.htaccess` and `.well-known/` (which certbot uses), are always protected. The first publish to a new target with this turned on asks for confirmation first. Mirroring into `/`, a top-level system folder, `/var/www` itself, or a bare home folder is refused.
+- **SFTP, FTP and folder copies** delete only files that the previous publish to the same target uploaded, so they never touch anything else. An emptied folder can be left behind on the server.
 
-### Checks on the settings
+### Checks and connections
 
-Publish settings are stored in `config.json`, which can arrive inside a site folder someone else made, so they are checked before any program runs. Hosts must be a plain hostname or IP address, user names and paths cannot start with a dash or contain shell characters, ports must be 1 to 65535, git remotes cannot use `transport::` helpers, and paths cannot contain `..`. Entries in `published.json` that are not plain relative paths are ignored.
+Publish settings live in the sources folder, which can arrive inside a site someone else made, so they are validated before any program runs:
 
-### Host keys and first connections
+- Hosts must be a plain hostname or IP address.
+- User names and paths cannot start with a dash or contain shell characters.
+- Ports must be 1 to 65535.
+- Paths cannot contain `..`.
+- Git remotes cannot use `transport::` helpers.
 
-SSH connections use `StrictHostKeyChecking=accept-new`: an unknown server's key is recorded in your `known_hosts` on first connection, and a later change of key is refused, as it should be. Connect once by hand first if you want to check the fingerprint yourself. This needs OpenSSH 7.6 or newer.
+SSH connections use `StrictHostKeyChecking=accept-new`: an unknown server's key is recorded on first connection, and a changed key is refused. This needs OpenSSH 7.6 or newer.
 
-### Paths
+For rsync, `~/public_html` style paths work. For SFTP and FTP, a leading `~/` means your login folder. Server paths may contain letters, digits and `. _ - / ~ @ +`, but no spaces.
 
-For rsync, the path is passed to the server's shell, so `~/public_html` works. For SFTP and FTP, a leading `~/` is treated as your login folder, where relative paths start anyway. Server paths may contain letters, digits and `. _ - / ~ @ +`, but no spaces.
+## Security
 
-## Security notes
+The editors are local authoring tools. Each binds to `127.0.0.1` only and is meant to run on the machine you are working on; do not expose its port to a network.
 
-All three editors are local authoring tools, not public web services. The server binds to `127.0.0.1` only and is meant to run on the machine you are working on.
+- **API access:** every run creates a random token that each API request must carry, and requests with an unexpected Host header are refused.
+- **Previews:** file serving is confined to the site folder. Built pages opened from the editor get a Content-Security-Policy that blocks inline script, so a hostile SVG or pasted HTML cannot reach the editor's API.
+- **Raw HTML in Markdown** goes through an allowlist sanitizer that removes script and style elements and event handlers, and rejects `javascript:` URLs, including entity-encoded ones.
 
-Each run creates a random token that every API request must carry, requests with an unexpected Host header are refused, and file serving for previews is confined to the site folder. Built pages opened from the editor are served with a Content-Security-Policy that blocks inline script, so a hostile SVG or pasted HTML cannot reach the editor's API. These measures reduce risk from other local processes and stray requests. They do not make it safe to expose the editor port to a network, so do not do that. The built sites are static files with no server-side component.
+The built sites are static files with no server-side component.
 
 ## Scope and limitations
 
 Stated plainly so you can decide whether these fit:
 
-- Single author. There are no accounts, no multi-user editing, and no page history beyond the trash folder. Keeping the site folder in git gives you history.
-- No plugins, shortcodes or templating language beyond Markdown, themes, and direct CSS.
-- Every save rebuilds the whole site. WikiGen and StoryGen skip rewriting unchanged files, which keeps deploys through rsync or git small. Very large sites will rebuild more slowly.
-- WikiGen sections are one level deep. There are no sub-sections.
-- StoryGen has no reader accounts, comments or view counts, and no EPUB export. Word counts are computed from the rendered text, so they differ slightly from what a word processor reports.
-- The Markdown renderer is a subset, as described above.
-- Keep the hidden `.sitegen/`, `.wikigen/` or `.storygen/` folder if you want to keep editing. Everything else in the site folder is generated output.
+- **Single author.** No accounts, multi-user editing or page history beyond the trash folder. Keeping the site folder in git gives you history.
+- **One of each module.** SiteForge has one blog, one wiki and one library per site, in the fixed folders `blog/`, `wiki/` and `stories/` (apart from the root option described above). Only the names readers see can be changed.
+- **Shallow wikis.** Sections are one level deep, in both SiteForge and WikiGen.
+- **Deleting is permanent in SiteGen.** SiteForge, WikiGen and StoryGen move anything you delete into a trash folder inside the sources folder. SiteGen removes deleted pages and posts outright.
+- **Full rebuilds.** Every save rebuilds the whole site. SiteForge, WikiGen and StoryGen skip rewriting unchanged files, which keeps rsync and git publishes small, but very large sites rebuild more slowly.
+- **Markdown subset.** The renderer does not cover everything in CommonMark.
+- **SEO preview.** SiteForge does not have SiteGen's search-result preview in the SEO panel; it keeps the description character counter.
+- **Word counts.** They are calculated from the rendered text, so they differ slightly from a word processor's.
+- **SSH passwords need `sshpass`**, and saved passwords are plain text readable by your user.
 
 ## License
 
-Released under the GNU General Public License version 3. See the [LICENSE](LICENSE) file for the full text. You may use, study, share, and modify these programs, and any distributed derivative work must also be licensed under the GPLv3.
+Released under the GNU General Public License version 3. See the [LICENSE](LICENSE) file for the full text. You may use, study, share and modify these programs, and any distributed derivative work must also be licensed under the GPLv3.
