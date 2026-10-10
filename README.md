@@ -135,6 +135,7 @@ From all three, images in `assets/` are copied. The site title, URL and similar 
 **What does not come across as-is:**
 
 - **The source folder is only read,** never changed.
+- **The layout** the old tool used is matched to the nearest SiteForge layout when you import settings.
 - **Your old stylesheet** is saved into `.siteforge/imported/` for reference but not applied, because class names changed. Pick one of the retained themes instead.
 - **Clashing names:** anything whose name is already taken gets a new address, and the import summary lists each rename.
 - **Symlinks** in the source are ignored.
@@ -149,6 +150,27 @@ All 26 themes from the standalone tools are included, in three groups:
 
 The standalone tools each used their own set of CSS variables, so SiteForge converts every theme to one shared set. Each theme's colours and fonts carry over exactly, and anything a theme never defined is derived from its own palette, such as a sidebar colour for a blog theme. Any theme therefore styles every module.
 
+SiteGen, WikiGen and StoryGen now ship the same 26 themes too, with the same values, so a palette looks the same whichever tool you use. Each tool lists its own group first and keeps the short theme names it always had.
+
+## Layouts
+
+A theme sets colours and fonts. A layout changes how the site is put together: where the title and menu sit, whether pages sit in a panel, how the blog feed, the wiki sidebar and the story library are laid out. Any theme works with any layout.
+
+Pick layouts under **Layout and CSS**. The preview updates as you change the dropdowns, and **Use these layouts** saves them. SiteForge has one choice for the site and one per module:
+
+| Choice | Layouts |
+|---|---|
+| Site | **Classic**, **Sidebar** (title and menu in a fixed left column), **Magazine** (big centered masthead over a ruled menu bar), **Journal** (no panels, narrow column, small header), **Landing** (tinted hero with the menu on top, raised panels) |
+| Blog | **List**, **Cards** (grid with each post's image), **Magazine** (cards with the newest post featured, post pages open with their image), **Archive** (one line per post, grouped by year) |
+| Wiki | **Classic**, **Docs** (quiet sidebar, open articles, table of contents in a right-hand rail), **Handbook** (search and sections as a menu bar of dropdowns), **Right sidebar** |
+| Stories | **Classic**, **Book** (paper pages with a Contents dropdown, no sidebar), **Bookshelf** (cover wall, chapters as tiles), **Serial** (latest chapters first, navigation above and below each chapter), **Spotlight** (first story featured, story pages open on a blurred cover) |
+
+The post image for cards and the post hero is the post's social image field, so set it in the SEO panel. Posts without one get an accent stripe instead.
+
+How it works: the layout's rules are written to `layout.css` on every build, and every page loads it before `style.css`. Layout rules start with a body class such as `body.layout-magazine` or `body.wiki-layout-docs`, so they outrank the base styles in your `style.css`, while a rule you write in `style.css` with the same weight still wins because it loads later. Do not edit `layout.css`; it is rewritten every build.
+
+Classic is the default, and an existing site keeps its old look until you pick something else. The only change to its pages is the extra `layout.css` link and a few body classes.
+
 ## Output
 
 ```
@@ -161,6 +183,7 @@ my-site/
   rss, rss.xml               site-wide feed of new posts and chapters
   sitemap.xml, robots.txt    when enabled
   style.css                  your stylesheet
+  layout.css                 the chosen layouts, rewritten on every build
   assets/                    images
   .siteforge/                markdown sources, settings, trash
 ```
@@ -181,7 +204,8 @@ Pages and a blog, with no JavaScript in the output.
 - **Blog:** a feed page, posts with drafts and publishing, tags with tag pages, and an RSS feed at `/rss` and `/rss.xml`.
 - **SEO:** per-page and per-post fields with a live search-result preview, site-wide defaults, `sitemap.xml` and `robots.txt`.
 - **Menu:** an editor that hides pages without deleting them and adds custom links.
-- **Themes:** eight (the Site group above) and a CSS editor.
+- **Themes:** all 26 (Site group first) and a CSS editor.
+- **Layouts:** Classic, Sidebar, Magazine (card feed with a featured post and post images), Journal (dated archive by year) and Landing (hero band, raised panels, card feed).
 
 Output: pages at the root, and posts and tag pages under `blog/`. Sources are in `.sitegen/`.
 
@@ -194,7 +218,8 @@ A wiki: the site title across the top, a left sidebar with search and one dropdo
 - **Markdown extras:** `[[wiki links]]` between articles and callout boxes.
 - **Workflow:** drafts, plus rescanning Markdown written in another editor.
 - **Search:** three modes, set in Settings. **Built-in** is instant, via one generated `search.js`. **Web** is a DuckDuckGo form limited to your domain, with no JavaScript. **Off** means the site contains no JavaScript at all. Built-in search indexes the first 8,000 characters of each article.
-- **Themes:** nine (the Wiki group above).
+- **Themes:** all 26 (Wiki group first).
+- **Layouts:** Classic, Docs (search in the top bar, contents in a right rail), Handbook (sections as a dropdown menu bar, centered column), Rail (no top bar, dark full-height rail) and Portal (home page hero with a big search box, sections on the right).
 
 Output: `index.html`, then `<section>/index.html` and `<section>/<article>.html`. Sources are in `.wikigen/`.
 
@@ -207,7 +232,8 @@ Fiction sites, with no JavaScript in the output.
 - **Chapter pages:** the chapter list in a sidebar, numbering, previous and next links, and author's notes.
 - **Typography:** indented or spaced paragraphs, optional drop capitals, `* * *` scene breaks, and reading time estimates.
 - **Also:** genre pages, drafts, extra pages, and an RSS feed of new chapters.
-- **Themes:** nine (the Reading group above).
+- **Themes:** all 26 (Reading group first).
+- **Layouts:** Classic, Book, Bookshelf, Serial and Spotlight, the same set as SiteForge's Stories layouts.
 
 Output: `index.html`, then `<story>/index.html` and `<story>/<chapter>.html`, plus `genre/`. Sources are in `.storygen/`.
 
@@ -226,9 +252,9 @@ WikiGen and SiteForge add `[[wiki links]]` and callouts (`> [!NOTE]`, `[!TIP]`, 
 
 Links and images use paths from the site root, such as `about.html` or `assets/photo.png`, and are adjusted automatically for pages in subfolders. Raw HTML passes through an allowlist sanitizer that keeps common layout and formatting tags and removes anything unsafe (see [Security](#security)).
 
-## Themes and CSS
+## Layout and CSS
 
-**Edit CSS** shows the theme variables at the top of `style.css` and your own rules at the bottom, with a list of the body classes you can target to style one page or one section. None of the tools overwrites `style.css`; **Apply theme** only replaces the variables block.
+**Layout and CSS** (formerly Edit CSS) has the layout picker at the top, then the theme variables at the top of `style.css` and your own rules at the bottom, with a list of the body classes you can target to style one page or one section. None of the tools overwrites `style.css`; **Apply theme** only replaces the variables block. `layout.css` belongs to the tool and is rewritten on every build, see [Layouts](#layouts).
 
 ## Publishing to a server
 

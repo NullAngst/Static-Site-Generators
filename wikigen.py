@@ -629,87 +629,66 @@ FONT_SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Ari
 FONT_SERIF = 'Georgia, "Iowan Old Style", "Palatino Linotype", Palatino, "Times New Roman", serif'
 FONT_MONO = 'ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, "DejaVu Sans Mono", monospace'
 
-THEME_DEFAULTS = {
-    "bg": "#f6f7f9",
-    "surface": "#ffffff",
-    "text": "#1f2328",
-    "muted": "#5b6470",
-    "accent": "#0b5fd6",
-    "border": "#d8dde4",
-    "header-bg": "#ffffff",
-    "header-text": "#1f2328",
-    "sidebar-bg": "#f0f2f5",
-    "sidebar-text": "#1f2328",
-    "sidebar-active": "#e1e7f0",
-    "code-bg": "#f2f4f7",
-    "font-body": FONT_SANS,
-    "font-heading": FONT_SANS,
-    "font-mono": FONT_MONO,
-    "base-size": "16px",
-    "line-height": "1.65",
-    "content-width": "54rem",
-    "sidebar-width": "17rem",
-    "radius": "6px",
+# Every palette from SiteForge: the Site, Wiki and Reading groups. Values are the same ones
+# SiteForge uses, so a palette looks the same in all four tools. This tool's own group keeps its
+# short ids (the ones older versions used); the other groups keep SiteForge's ids.
+# font-ui, heading-transform and letter-spacing are applied by layout.css.
+ALL_THEMES = {
+    "site-clean": ("Clean light", "Site", {"bg": "#f6f7f9", "bg-image": "none", "surface": "#ffffff", "surface-opacity": "1", "text": "#1f2328", "muted": "#59636e", "accent": "#0b5fd6", "border": "#d5dbe3", "code-bg": "#f6f7f9", "header-bg": "#ffffff", "header-text": "#1f2328", "sidebar-bg": "#f6f7f9", "sidebar-text": "#1f2328", "sidebar-active": "#d5dbe3", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "17px", "line-height": "1.65", "max-width": "46rem", "measure": "46rem", "sidebar-width": "16rem", "radius": "8px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "site-midnight": ("Midnight", "Site", {"bg": "#0e1116", "bg-image": "none", "surface": "#161b22", "surface-opacity": "1", "text": "#e6edf3", "muted": "#9aa4b2", "accent": "#6cb0ff", "border": "#2b3340", "code-bg": "#0e1116", "header-bg": "#161b22", "header-text": "#e6edf3", "sidebar-bg": "#0e1116", "sidebar-text": "#e6edf3", "sidebar-active": "#2b3340", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "17px", "line-height": "1.65", "max-width": "46rem", "measure": "46rem", "sidebar-width": "16rem", "radius": "8px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "site-terminal": ("Terminal", "Site", {"bg": "#020403", "bg-image": "none", "surface": "#06100a", "surface-opacity": "0.88", "text": "#3dff7a", "muted": "#22b555", "accent": "#b6ffcb", "border": "#146b31", "code-bg": "#020403", "header-bg": "#06100a", "header-text": "#3dff7a", "sidebar-bg": "#020403", "sidebar-text": "#3dff7a", "sidebar-active": "#146b31", "font-body": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-heading": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-ui": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "1.7", "max-width": "52rem", "measure": "52rem", "sidebar-width": "16rem", "radius": "0px", "heading-weight": "700", "heading-transform": "uppercase", "letter-spacing": "0.05em", "dropcap-size": "3.1em"}),
+    "site-paper": ("Paper", "Site", {"bg": "#e9e6dc", "bg-image": "none", "surface": "#f7f4ea", "surface-opacity": "1", "text": "#2b2a26", "muted": "#6d6a5e", "accent": "#1d5c63", "border": "#cfcabb", "code-bg": "#e9e6dc", "header-bg": "#f7f4ea", "header-text": "#2b2a26", "sidebar-bg": "#e9e6dc", "sidebar-text": "#2b2a26", "sidebar-active": "#cfcabb", "font-body": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "19px", "line-height": "1.75", "max-width": "42rem", "measure": "42rem", "sidebar-width": "16rem", "radius": "3px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "site-nord": ("Nord", "Site", {"bg": "#2e3440", "bg-image": "none", "surface": "#3b4252", "surface-opacity": "1", "text": "#eceff4", "muted": "#a7b1c4", "accent": "#88c0d0", "border": "#4c566a", "code-bg": "#2e3440", "header-bg": "#3b4252", "header-text": "#eceff4", "sidebar-bg": "#2e3440", "sidebar-text": "#eceff4", "sidebar-active": "#4c566a", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "17px", "line-height": "1.65", "max-width": "46rem", "measure": "46rem", "sidebar-width": "16rem", "radius": "6px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "site-neon": ("Neon night", "Site", {"bg": "#0b0016", "bg-image": "none", "surface": "#150029", "surface-opacity": "0.9", "text": "#f3e8ff", "muted": "#b491ff", "accent": "#19f0ff", "border": "#6a1fd0", "code-bg": "#0b0016", "header-bg": "#150029", "header-text": "#f3e8ff", "sidebar-bg": "#0b0016", "sidebar-text": "#f3e8ff", "sidebar-active": "#6a1fd0", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "17px", "line-height": "1.65", "max-width": "46rem", "measure": "46rem", "sidebar-width": "16rem", "radius": "2px", "heading-weight": "700", "heading-transform": "uppercase", "letter-spacing": "0.06em", "dropcap-size": "3.1em"}),
+    "site-solarized": ("Solarized light", "Site", {"bg": "#fdf6e3", "bg-image": "none", "surface": "#fffbee", "surface-opacity": "1", "text": "#4b5f66", "muted": "#7a8b90", "accent": "#1f78b4", "border": "#e6dcbc", "code-bg": "#fdf6e3", "header-bg": "#fffbee", "header-text": "#4b5f66", "sidebar-bg": "#fdf6e3", "sidebar-text": "#4b5f66", "sidebar-active": "#e6dcbc", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "17px", "line-height": "1.65", "max-width": "46rem", "measure": "46rem", "sidebar-width": "16rem", "radius": "8px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "site-minimal": ("Minimal serif", "Site", {"bg": "#ffffff", "bg-image": "none", "surface": "#ffffff", "surface-opacity": "1", "text": "#151515", "muted": "#666666", "accent": "#151515", "border": "#e2e2e2", "code-bg": "#ffffff", "header-bg": "#ffffff", "header-text": "#151515", "sidebar-bg": "#ffffff", "sidebar-text": "#151515", "sidebar-active": "#e2e2e2", "font-body": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "19px", "line-height": "1.75", "max-width": "38rem", "measure": "38rem", "sidebar-width": "16rem", "radius": "0px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-clean": ("Clean light", "Wiki", {"bg": "#f6f7f9", "bg-image": "none", "surface": "#ffffff", "surface-opacity": "1", "text": "#1f2328", "muted": "#5b6470", "accent": "#0b5fd6", "border": "#d8dde4", "code-bg": "#f2f4f7", "header-bg": "#ffffff", "header-text": "#1f2328", "sidebar-bg": "#f0f2f5", "sidebar-text": "#1f2328", "sidebar-active": "#e1e7f0", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "1.65", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "6px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-classic": ("Classic wiki", "Wiki", {"bg": "#f8f9fa", "bg-image": "none", "surface": "#ffffff", "surface-opacity": "1", "text": "#202122", "muted": "#54595d", "accent": "#3366cc", "border": "#c8ccd1", "code-bg": "#f8f9fa", "header-bg": "#ffffff", "header-text": "#202122", "sidebar-bg": "#f8f9fa", "sidebar-text": "#202122", "sidebar-active": "#eaecf0", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "1.65", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "2px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-slate": ("Slate dark", "Wiki", {"bg": "#0f141b", "bg-image": "none", "surface": "#151b24", "surface-opacity": "1", "text": "#dde3ea", "muted": "#95a1b1", "accent": "#7aa7ff", "border": "#263041", "code-bg": "#0b1017", "header-bg": "#111720", "header-text": "#e8edf3", "sidebar-bg": "#111720", "sidebar-text": "#cfd7e2", "sidebar-active": "#1d2635", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "1.65", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "6px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-nord": ("Nord", "Wiki", {"bg": "#2e3440", "bg-image": "none", "surface": "#3b4252", "surface-opacity": "1", "text": "#eceff4", "muted": "#b0b8c8", "accent": "#88c0d0", "border": "#4c566a", "code-bg": "#2e3440", "header-bg": "#2e3440", "header-text": "#eceff4", "sidebar-bg": "#353c4a", "sidebar-text": "#e5e9f0", "sidebar-active": "#434c5e", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "1.65", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "6px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-gruvbox": ("Gruvbox dark", "Wiki", {"bg": "#1d2021", "bg-image": "none", "surface": "#282828", "surface-opacity": "1", "text": "#ebdbb2", "muted": "#b0a391", "accent": "#fabd2f", "border": "#3c3836", "code-bg": "#1d2021", "header-bg": "#1d2021", "header-text": "#ebdbb2", "sidebar-bg": "#202324", "sidebar-text": "#d5c4a1", "sidebar-active": "#3c3836", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "1.65", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "3px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-dracula": ("Dracula", "Wiki", {"bg": "#21222c", "bg-image": "none", "surface": "#282a36", "surface-opacity": "1", "text": "#f8f8f2", "muted": "#a4abcc", "accent": "#bd93f9", "border": "#3a3d4e", "code-bg": "#1e1f29", "header-bg": "#21222c", "header-text": "#f8f8f2", "sidebar-bg": "#242631", "sidebar-text": "#e6e6f0", "sidebar-active": "#363949", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "1.65", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "6px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-solarized": ("Solarized light", "Wiki", {"bg": "#fdf6e3", "bg-image": "none", "surface": "#fffbef", "surface-opacity": "1", "text": "#3c4d54", "muted": "#687b82", "accent": "#1f6fb2", "border": "#e4dcc2", "code-bg": "#f5eed8", "header-bg": "#fdf6e3", "header-text": "#3c4d54", "sidebar-bg": "#f6efd9", "sidebar-text": "#3c4d54", "sidebar-active": "#ebe2c4", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "1.65", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "6px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-paper": ("Paper", "Wiki", {"bg": "#ebe7dc", "bg-image": "none", "surface": "#f8f5ec", "surface-opacity": "1", "text": "#2b2a26", "muted": "#66635a", "accent": "#1d5c63", "border": "#d3cdbd", "code-bg": "#efeadf", "header-bg": "#f8f5ec", "header-text": "#2b2a26", "sidebar-bg": "#efeadf", "sidebar-text": "#2b2a26", "sidebar-active": "#e1dbc9", "font-body": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "17px", "line-height": "1.7", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "6px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-terminal": ("Terminal", "Wiki", {"bg": "#050805", "bg-image": "none", "surface": "#0a100a", "surface-opacity": "1", "text": "#3dff7a", "muted": "#2fc862", "accent": "#b6ffcb", "border": "#145c2c", "code-bg": "#030503", "header-bg": "#050805", "header-text": "#3dff7a", "sidebar-bg": "#070b07", "sidebar-text": "#3dff7a", "sidebar-active": "#0f2414", "font-body": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-heading": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-ui": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "15px", "line-height": "1.65", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "0px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "book-paperback": ("Paperback", "Reading", {"bg": "#f3f1ec", "bg-image": "none", "surface": "#fffdf8", "surface-opacity": "1", "text": "#23201b", "muted": "#6b655c", "accent": "#8a5a2b", "border": "#ddd6c8", "code-bg": "#efeadf", "header-bg": "#fffdf8", "header-text": "#23201b", "sidebar-bg": "#f3f1ec", "sidebar-text": "#3a352d", "sidebar-active": "#e6e0d2", "font-body": "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "4px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "book-night": ("Night reading", "Reading", {"bg": "#14161a", "bg-image": "none", "surface": "#1a1d22", "surface-opacity": "1", "text": "#ddd8cf", "muted": "#9a948a", "accent": "#d3a06a", "border": "#2c3139", "code-bg": "#101317", "header-bg": "#14161a", "header-text": "#ddd8cf", "sidebar-bg": "#171a1f", "sidebar-text": "#c9c3ba", "sidebar-active": "#232830", "font-body": "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "4px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "book-parchment": ("Parchment", "Reading", {"bg": "#e7dec7", "bg-image": "none", "surface": "#f6efdc", "surface-opacity": "1", "text": "#2f2a20", "muted": "#6d6552", "accent": "#7a5230", "border": "#d0c4a4", "code-bg": "#e9e0c6", "header-bg": "#f6efdc", "header-text": "#2f2a20", "sidebar-bg": "#ebe2cc", "sidebar-text": "#3a3427", "sidebar-active": "#ded3b6", "font-body": "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "19px", "line-height": "1.8", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "4px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "book-manuscript": ("Manuscript", "Reading", {"bg": "#ffffff", "bg-image": "none", "surface": "#ffffff", "surface-opacity": "1", "text": "#111111", "muted": "#555555", "accent": "#222222", "border": "#cccccc", "code-bg": "#f4f4f4", "header-bg": "#ffffff", "header-text": "#111111", "sidebar-bg": "#f4f4f4", "sidebar-text": "#222222", "sidebar-active": "#e6e6e6", "font-body": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-heading": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "2", "max-width": "44rem", "measure": "36rem", "sidebar-width": "16rem", "radius": "0px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "1em"}),
+    "book-ink": ("Ink on white", "Reading", {"bg": "#ffffff", "bg-image": "none", "surface": "#ffffff", "surface-opacity": "1", "text": "#16181d", "muted": "#5f646e", "accent": "#1b3f8b", "border": "#e2e4e8", "code-bg": "#f4f5f7", "header-bg": "#ffffff", "header-text": "#16181d", "sidebar-bg": "#f7f8fa", "sidebar-text": "#31353d", "sidebar-active": "#eaecf1", "font-body": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "2px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "book-midnight": ("Midnight blue", "Reading", {"bg": "#0f1420", "bg-image": "none", "surface": "#161d2b", "surface-opacity": "1", "text": "#e3e8f2", "muted": "#98a2b6", "accent": "#8fb3ff", "border": "#27324a", "code-bg": "#0b101a", "header-bg": "#0f1420", "header-text": "#e3e8f2", "sidebar-bg": "#131a28", "sidebar-text": "#ccd4e3", "sidebar-active": "#1f2839", "font-body": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "4px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "book-sepia": ("Sepia", "Reading", {"bg": "#efe3d0", "bg-image": "none", "surface": "#f9f0e1", "surface-opacity": "1", "text": "#3b2f22", "muted": "#7b6a55", "accent": "#9a4f24", "border": "#dac9ae", "code-bg": "#eadcc4", "header-bg": "#f9f0e1", "header-text": "#3b2f22", "sidebar-bg": "#ecdfca", "sidebar-text": "#453726", "sidebar-active": "#e0cfb2", "font-body": "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "4px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "book-noir": ("Noir", "Reading", {"bg": "#0c0c0d", "bg-image": "none", "surface": "#141415", "surface-opacity": "1", "text": "#e8e6e3", "muted": "#8e8b86", "accent": "#c3453b", "border": "#27272a", "code-bg": "#0a0a0b", "header-bg": "#0c0c0d", "header-text": "#e8e6e3", "sidebar-bg": "#0f0f10", "sidebar-text": "#cfcdc9", "sidebar-active": "#1d1d20", "font-body": "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "0px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "book-pulp": ("Pulp", "Reading", {"bg": "#1b1712", "bg-image": "none", "surface": "#241e17", "surface-opacity": "1", "text": "#f2e6d2", "muted": "#b3a48c", "accent": "#e0a63c", "border": "#3a3126", "code-bg": "#171310", "header-bg": "#1b1712", "header-text": "#f2e6d2", "sidebar-bg": "#1f1a14", "sidebar-text": "#e2d6c0", "sidebar-active": "#312819", "font-body": "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "4px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.4em"}),
 }
-VAR_ORDER = list(THEME_DEFAULTS.keys())
+OWN_GROUP = 'Wiki'
+GROUP_ORDER = [OWN_GROUP] + [g for g in ("Site", "Wiki", "Reading") if g != OWN_GROUP]
+VAR_ORDER = ['bg', 'surface', 'text', 'muted', 'accent', 'border', 'header-bg', 'header-text', 'sidebar-bg', 'sidebar-text', 'sidebar-active', 'code-bg', 'font-body', 'font-heading', 'font-ui', 'font-mono', 'base-size', 'line-height', 'content-width', 'sidebar-width', 'radius', 'heading-transform', 'letter-spacing']
+VAR_CONSTS = {'content-width': '54rem'}
 
-THEMES = {
-    "clean": ("Clean light", {}),
-    "classic": ("Classic wiki", {
-        "bg": "#f8f9fa", "surface": "#ffffff", "text": "#202122", "muted": "#54595d", "accent": "#3366cc",
-        "border": "#c8ccd1", "header-bg": "#ffffff", "header-text": "#202122", "sidebar-bg": "#f8f9fa",
-        "sidebar-text": "#202122", "sidebar-active": "#eaecf0", "code-bg": "#f8f9fa",
-        "font-heading": FONT_SERIF, "radius": "2px",
-    }),
-    "slate": ("Slate dark", {
-        "bg": "#0f141b", "surface": "#151b24", "text": "#dde3ea", "muted": "#95a1b1", "accent": "#7aa7ff",
-        "border": "#263041", "header-bg": "#111720", "header-text": "#e8edf3", "sidebar-bg": "#111720",
-        "sidebar-text": "#cfd7e2", "sidebar-active": "#1d2635", "code-bg": "#0b1017",
-    }),
-    "nord": ("Nord", {
-        "bg": "#2e3440", "surface": "#3b4252", "text": "#eceff4", "muted": "#b0b8c8", "accent": "#88c0d0",
-        "border": "#4c566a", "header-bg": "#2e3440", "header-text": "#eceff4", "sidebar-bg": "#353c4a",
-        "sidebar-text": "#e5e9f0", "sidebar-active": "#434c5e", "code-bg": "#2e3440",
-    }),
-    "gruvbox": ("Gruvbox dark", {
-        "bg": "#1d2021", "surface": "#282828", "text": "#ebdbb2", "muted": "#b0a391", "accent": "#fabd2f",
-        "border": "#3c3836", "header-bg": "#1d2021", "header-text": "#ebdbb2", "sidebar-bg": "#202324",
-        "sidebar-text": "#d5c4a1", "sidebar-active": "#3c3836", "code-bg": "#1d2021", "radius": "3px",
-    }),
-    "dracula": ("Dracula", {
-        "bg": "#21222c", "surface": "#282a36", "text": "#f8f8f2", "muted": "#a4abcc", "accent": "#bd93f9",
-        "border": "#3a3d4e", "header-bg": "#21222c", "header-text": "#f8f8f2", "sidebar-bg": "#242631",
-        "sidebar-text": "#e6e6f0", "sidebar-active": "#363949", "code-bg": "#1e1f29",
-    }),
-    "solarized": ("Solarized light", {
-        "bg": "#fdf6e3", "surface": "#fffbef", "text": "#3c4d54", "muted": "#687b82", "accent": "#1f6fb2",
-        "border": "#e4dcc2", "header-bg": "#fdf6e3", "header-text": "#3c4d54", "sidebar-bg": "#f6efd9",
-        "sidebar-text": "#3c4d54", "sidebar-active": "#ebe2c4", "code-bg": "#f5eed8",
-    }),
-    "paper": ("Paper", {
-        "bg": "#ebe7dc", "surface": "#f8f5ec", "text": "#2b2a26", "muted": "#66635a", "accent": "#1d5c63",
-        "border": "#d3cdbd", "header-bg": "#f8f5ec", "header-text": "#2b2a26", "sidebar-bg": "#efeadf",
-        "sidebar-text": "#2b2a26", "sidebar-active": "#e1dbc9", "code-bg": "#efeadf",
-        "font-body": FONT_SERIF, "font-heading": FONT_SERIF, "base-size": "17px", "line-height": "1.7",
-    }),
-    "terminal": ("Terminal", {
-        "bg": "#050805", "surface": "#0a100a", "text": "#3dff7a", "muted": "#2fc862", "accent": "#b6ffcb",
-        "border": "#145c2c", "header-bg": "#050805", "header-text": "#3dff7a", "sidebar-bg": "#070b07",
-        "sidebar-text": "#3dff7a", "sidebar-active": "#0f2414", "code-bg": "#030503",
-        "font-body": FONT_MONO, "font-heading": FONT_MONO, "base-size": "15px", "radius": "0px",
-    }),
-}
+
+def _theme_id(uid):
+    return uid[len('wiki-'):] if uid.startswith('wiki-') else uid
+
+
+THEMES = {}
+for _g in GROUP_ORDER:
+    for _uid, (_label, _group, _vals) in ALL_THEMES.items():
+        if _group == _g:
+            THEMES[_theme_id(_uid)] = (_label, _group, _vals)
 
 
 def root_block(theme_id):
-    label, over = THEMES[theme_id]
-    t = dict(THEME_DEFAULTS)
-    t.update(over)
-    lines = [":root {", "  /* Theme: %s. Change any value below. */" % label]
+    label, group, vals = THEMES[theme_id]
+    lines = [":root {", "  /* Theme: %s (%s). Change any value below. */" % (label, group)]
     for k in VAR_ORDER:
-        lines.append("  --%s: %s;" % (k, t[k]))
+        lines.append("  --%s: %s;" % (k, VAR_CONSTS.get(k) or vals[k]))
     lines.append("}")
     return "\n".join(lines)
+
+
+def theme_list():
+    return [{"id": k, "label": v[0], "group": v[1], "block": root_block(k)} for k, v in THEMES.items()]
 
 
 CSS_HEADER = """/*
@@ -920,6 +899,174 @@ def default_css(theme="clean"):
     )
 
 
+
+# ----------------------------------------------------------------------------
+# Layouts
+#
+# A layout changes how the wiki is put together: where the search box and the section menu
+# sit, whether articles sit in a panel, and where the table of contents goes. The theme in
+# style.css still sets colors and fonts, so any theme works with any layout.
+#
+# The rules go to layout.css, which WikiGen rewrites on every build. Pages load it before
+# style.css. Layout rules start with body.layout-NAME, which outranks the base styles in
+# style.css, while a rule you write in style.css with the same weight still wins.
+# ----------------------------------------------------------------------------
+
+LAYOUT_SHARED_CSS = """
+/* every layout: theme values the base styles in style.css do not use */
+.site-title, .content h1, .content h2, .content h3, .content h4 { text-transform: var(--heading-transform, none); letter-spacing: var(--letter-spacing, 0); }
+"""
+
+LAYOUT_TOPSEARCH_CSS = """
+/* search box in the top bar */
+.topbar .search { position: relative; flex: 0 1 22rem; margin: 0 0 0 auto; align-self: center; }
+.topbar .search input { padding: 0.4rem 0.75rem; }
+.topbar .search-results { position: absolute; left: 0; right: 0; z-index: 30; max-height: 70vh; overflow-y: auto; }
+.topbar .search-results a { display: block; padding: 0.4rem 0.5rem; border-radius: 4px; text-decoration: none; }
+.topbar .search-results a:hover, .topbar .search-results a.active { background: var(--sidebar-active); }
+@media (max-width: 820px) {
+  .topbar .search { order: 5; flex-basis: 100%; margin: 0.35rem 0 0; }
+}
+"""
+
+LAYOUT_DOCS_CSS = """
+/* Docs: search in the top bar, a quiet sidebar, open pages and an "on this page" rail */
+body.layout-docs .sidebar { background: var(--bg); padding-top: 1.5rem; }
+body.layout-docs .nav-section > summary { font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+body.layout-docs .nav-section ul { border-left: 0; margin-left: 0.3rem; }
+body.layout-docs .main { padding: 2.25rem clamp(1rem, 4vw, 3.5rem) 4rem; }
+body.layout-docs .content { max-width: var(--content-width); padding: 0; background: none; border: 0; border-radius: 0; }
+body.layout-docs .content h1 { font-size: 2.3rem; border-bottom: 0; padding-bottom: 0; }
+body.layout-docs .content h2 { border-bottom: 0; padding-bottom: 0; margin-top: 2.5rem; }
+body.layout-docs .toc-rail .toc { margin: 0 0 2rem; }
+@media (min-width: 1180px) {
+  body.layout-docs .main.has-rail { display: grid; grid-template-columns: minmax(0, var(--content-width)) 14rem; gap: 3rem; align-items: start; }
+  body.layout-docs .main.has-rail .content { grid-column: 1; grid-row: 1; }
+  body.layout-docs .toc-rail { grid-column: 2; grid-row: 1; position: sticky; top: 1.5rem; max-height: calc(100vh - 3rem); overflow-y: auto; }
+  body.layout-docs .toc-rail .toc { margin: 0; padding: 0 0 0 1rem; background: none; border: 0; border-left: 1px solid var(--border); border-radius: 0; font-size: 0.85rem; }
+  body.layout-docs .toc-rail .toc summary { list-style: none; margin-bottom: 0.4rem; font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+  body.layout-docs .toc-rail .toc summary::-webkit-details-marker { display: none; }
+  body.layout-docs .toc-rail .toc ol { list-style: none; margin: 0; padding: 0; }
+  body.layout-docs .toc-rail .toc ol ol { padding-left: 0.85rem; }
+  body.layout-docs .toc-rail .toc a { display: block; padding: 0.18rem 0; color: var(--muted); text-decoration: none; }
+  body.layout-docs .toc-rail .toc a:hover { color: var(--accent); }
+}
+""" + LAYOUT_TOPSEARCH_CSS
+
+LAYOUT_HANDBOOK_CSS = """
+/* Handbook: a centered title, the sections as a menu bar of dropdowns, one centered column */
+@media (min-width: 821px) {
+  body.layout-handbook .topbar { flex-direction: column; align-items: center; gap: 0.3rem; padding: 2rem 1.25rem 1.25rem; text-align: center; border-bottom: 0; }
+  body.layout-handbook .site-title { font-size: 2.1rem; }
+  body.layout-handbook .topbar .search { flex: none; width: min(30rem, 100%); margin: 0.9rem 0 0; }
+  body.layout-handbook .layout { display: block; }
+  body.layout-handbook .sidebar {
+    position: sticky; top: 0; z-index: 15; display: flex; flex-wrap: wrap; justify-content: center; align-items: center;
+    gap: 0.15rem 0.35rem; min-height: 0; max-height: none; overflow: visible; padding: 0.35rem 1rem;
+    border-right: 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+  }
+  body.layout-handbook .nav-home { margin: 0; }
+  body.layout-handbook .nav-section { position: relative; margin: 0; }
+  body.layout-handbook .nav-count { display: none; }
+  body.layout-handbook .nav-section.is-current > summary { color: var(--accent); box-shadow: inset 0 -2px 0 var(--accent); border-radius: 0; }
+  body.layout-handbook .nav-section > ul {
+    position: absolute; top: calc(100% + 0.45rem); left: 0; z-index: 20; min-width: 15rem; max-height: 60vh; overflow-y: auto;
+    margin: 0; padding: 0.4rem; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
+  }
+  body.layout-handbook .main { padding: 2.75rem 1.25rem 4rem; }
+  body.layout-handbook .content { max-width: var(--content-width); margin: 0 auto; padding: 0; background: none; border: 0; border-radius: 0; }
+  body.layout-handbook .breadcrumbs ol { justify-content: center; }
+  body.layout-handbook .content > article > h1 { text-align: center; font-size: 2.4rem; border-bottom: 0; }
+  body.layout-handbook .site-footer { text-align: center; }
+}
+""" + LAYOUT_TOPSEARCH_CSS
+
+LAYOUT_RAIL_CSS = """
+/* Rail: no top bar; title, search and sections in a dark full-height rail, open pages */
+.rail-brand { display: none; }
+@media (min-width: 821px) {
+  body.layout-rail .topbar { display: none; }
+  body.layout-rail .rail-brand { display: block; margin: 0 0.6rem 1.5rem; }
+  body.layout-rail .sidebar .rail-brand .site-title { display: block; padding: 0; font-size: 1.4rem; line-height: 1.2; color: var(--bg); background: none; }
+  body.layout-rail .rail-brand .tagline { display: block; margin-top: 0.35rem; color: color-mix(in srgb, var(--bg) 70%, transparent); }
+  body.layout-rail .sidebar { min-height: 100vh; padding: 2rem 0.9rem; background: var(--text); color: var(--bg); border-right: 0; }
+  body.layout-rail .sidebar a, body.layout-rail .nav-section > summary { color: var(--bg); }
+  body.layout-rail .sidebar a:hover, body.layout-rail .nav-section > summary:hover { background: color-mix(in srgb, var(--bg) 12%, transparent); }
+  body.layout-rail .sidebar a[aria-current="page"] { color: var(--bg); background: color-mix(in srgb, var(--bg) 20%, transparent); box-shadow: inset 3px 0 0 var(--accent); }
+  body.layout-rail .nav-count { color: color-mix(in srgb, var(--bg) 60%, transparent); }
+  body.layout-rail .nav-section ul { border-left-color: color-mix(in srgb, var(--bg) 25%, transparent); }
+  body.layout-rail .sidebar .search input { background: color-mix(in srgb, var(--bg) 10%, transparent); color: var(--bg); border-color: color-mix(in srgb, var(--bg) 30%, transparent); }
+  body.layout-rail .sidebar .search input::placeholder { color: color-mix(in srgb, var(--bg) 60%, transparent); }
+  body.layout-rail .sidebar .search-results a { color: var(--text); }
+  body.layout-rail .sidebar .search-results a:hover, body.layout-rail .sidebar .search-results a.active { background: var(--sidebar-active); }
+  body.layout-rail .main { padding: 3rem clamp(1.25rem, 5vw, 4.5rem) 4rem; }
+  body.layout-rail .content { max-width: var(--content-width); padding: 0; background: none; border: 0; border-radius: 0; }
+  body.layout-rail .content h1 { font-size: 2.5rem; border-bottom: 0; }
+  body.layout-rail .site-footer { margin-left: var(--sidebar-width); }
+}
+"""
+
+LAYOUT_PORTAL_CSS = """
+/* Portal: a hero with a big search box on the home page, sections on the right elsewhere */
+body.layout-portal .home-hero {
+  padding: 3.75rem 1.25rem 3.25rem; text-align: center; border-bottom: 1px solid var(--border);
+  background: linear-gradient(165deg, color-mix(in srgb, var(--accent) 22%, var(--bg)) 0%, var(--bg) 100%);
+}
+body.layout-portal .home-hero h1 { margin: 0; font-family: var(--font-heading); font-size: clamp(2rem, 6vw, 3.3rem); line-height: 1.1; text-transform: var(--heading-transform, none); letter-spacing: var(--letter-spacing, 0); }
+body.layout-portal .home-hero p { margin: 0.6rem 0 1.75rem; color: var(--muted); font-size: 1.1rem; }
+body.layout-portal .home-hero .search { position: relative; max-width: 36rem; margin: 0 auto; text-align: left; }
+body.layout-portal .home-hero .search input { padding: 0.85rem 1.2rem; font-size: 1.05rem; border-radius: 99px; box-shadow: 0 10px 30px -12px rgba(0, 0, 0, 0.35); }
+body.layout-portal .home-hero .search-results { position: absolute; left: 0; right: 0; z-index: 30; max-height: 60vh; overflow-y: auto; }
+body.layout-portal .home-hero .search-results a { display: block; padding: 0.45rem 0.6rem; border-radius: 4px; text-decoration: none; }
+body.layout-portal .home-hero .search-results a:hover, body.layout-portal .home-hero .search-results a.active { background: var(--sidebar-active); }
+body.layout-portal.page-home .topbar .tagline { display: none; }
+body.layout-portal.page-home .content { max-width: calc(var(--content-width) + 10rem); margin: 0 auto; padding: 0; background: none; border: 0; }
+body.layout-portal .card { background: var(--surface); border-top: 3px solid var(--accent); box-shadow: 0 8px 24px -16px rgba(0, 0, 0, 0.4); }
+@media (min-width: 821px) {
+  body.layout-portal .layout { grid-template-columns: minmax(0, 1fr) var(--sidebar-width); }
+  body.layout-portal .sidebar { grid-column: 2; grid-row: 1; border-right: 0; border-left: 1px solid var(--border); }
+  body.layout-portal .main { grid-column: 1; grid-row: 1; padding-top: 2rem; }
+  body.layout-portal .content { margin: 0 auto; }
+}
+""" + LAYOUT_TOPSEARCH_CSS
+
+# search: where the search box goes ("side" or "top"). toc: "inline" in the article or a "rail"
+# beside it. bar: sections become a menu bar, so none start open. brand: title inside the sidebar.
+# hero: the home page opens with a hero holding the search box.
+LAYOUTS = {
+    "classic": {"label": "Classic", "search": "side", "css": "",
+                "desc": "A top bar, the search box and sections in a sidebar on the left, articles in a panel. This is how WikiGen has always looked."},
+    "docs": {"label": "Docs", "search": "top", "toc": "rail", "css": LAYOUT_DOCS_CSS,
+             "desc": "Search in the top bar, a quiet sidebar, articles without a panel and the table of contents in a column on the right."},
+    "handbook": {"label": "Handbook", "search": "top", "bar": True, "css": LAYOUT_HANDBOOK_CSS,
+                 "desc": "A centered title and search box, the sections as a menu bar of dropdowns, and one centered column."},
+    "rail": {"label": "Rail", "search": "side", "brand": True, "css": LAYOUT_RAIL_CSS,
+             "desc": "No top bar. The title, search and sections sit in a dark full-height rail and articles fill the rest."},
+    "portal": {"label": "Portal", "search": "top", "hero": True, "css": LAYOUT_PORTAL_CSS,
+               "desc": "The home page opens with a big search box over the section cards. Other pages keep the sections on the right."},
+}
+DEFAULT_LAYOUT = "classic"
+
+
+def layout_of(cfg):
+    lid = cfg["site"].get("layout")
+    return lid if lid in LAYOUTS else DEFAULT_LAYOUT
+
+
+def layout_css(lid):
+    lay = LAYOUTS[lid]
+    return (
+        "/*\n  layout.css: written by %s on every build, so edits here are lost.\n"
+        "  Layout: %s. Pick another one under \"Layout and CSS\" in the editor.\n"
+        "  Your own rules go in style.css, which loads after this file and wins any tie.\n*/\n%s%s"
+        % (APP, lay["label"], LAYOUT_SHARED_CSS, lay["css"])
+    )
+
+
+def layout_list():
+    return [{"id": k, "label": v["label"], "desc": v["desc"]} for k, v in LAYOUTS.items()]
+
 # ----------------------------------------------------------------------------
 # Seed content
 # ----------------------------------------------------------------------------
@@ -1012,6 +1159,7 @@ def default_cfg(title):
             "home_recent": True,
             "sitemap": False,
             "noindex": False,
+            "layout": DEFAULT_LAYOUT,
         },
         "sections": [],
         "generated": [],
@@ -1174,7 +1322,8 @@ class Wiki:
             "folder": str(self.root),
             "site": self.cfg["site"],
             "sections": self.cfg["sections"],
-            "themes": [{"id": k, "label": v[0], "block": root_block(k)} for k, v in THEMES.items()],
+            "themes": theme_list(),
+            "layouts": layout_list(),
         }
 
     # ---- lookups
@@ -1341,7 +1490,14 @@ class Wiki:
 
     def sidebar(self, cfg, prefix, cur_sec=None, cur_art=None, home=False):
         site = cfg["site"]
-        out = ['<nav class="sidebar" id="sidebar" aria-label="Wiki">', self.search_box(cfg, prefix)]
+        lay = LAYOUTS[layout_of(cfg)]
+        out = ['<nav class="sidebar" id="sidebar" aria-label="Wiki">']
+        if lay.get("brand"):
+            tag = '<span class="tagline">%s</span>' % esc(site["tagline"]) if site.get("tagline") else ""
+            out.append('<div class="rail-brand"><a class="site-title" href="%sindex.html">%s</a>%s</div>'
+                       % (prefix, esc(site["title"]), tag))
+        if lay.get("search", "side") == "side":
+            out.append(self.search_box(cfg, prefix))
         out.append('<ul class="nav-home"><li><a href="%sindex.html"%s>Home</a></li></ul>'
                    % (prefix, ' aria-current="page"' if home else ""))
         if not cfg["sections"]:
@@ -1355,14 +1511,16 @@ class Wiki:
                 cur = ' aria-current="page"' if is_cur and a["slug"] == cur_art else ""
                 items.append('<li><a href="%s%s/%s.html"%s>%s</a></li>' % (prefix, s["slug"], a["slug"], cur, esc(a["title"])))
             out.append(
-                '<details class="nav-section"%s>\n<summary>%s<span class="nav-count">%d</span></summary>\n<ul>\n%s\n</ul>\n</details>'
-                % (" open" if (site.get("expand") or is_cur) else "", esc(s["title"]), len(arts), "\n".join(items))
+                '<details class="nav-section%s"%s>\n<summary>%s<span class="nav-count">%d</span></summary>\n<ul>\n%s\n</ul>\n</details>'
+                % (" is-current" if is_cur else "", " open" if (site.get("expand") or is_cur) and not lay.get("bar") else "",
+                   esc(s["title"]), len(arts),
+                   "\n".join(items))
             )
         out.append("</nav>")
         return "\n".join(x for x in out if x)
 
     def doc(self, cfg, *, prefix, body_class, title, desc, rel, main_html, sidebar_html, css=None, base=None,
-            og_type="website", when=""):
+            og_type="website", when="", rail_html="", hero_html=""):
         site = cfg["site"]
         st = site["title"]
         full = st if not title or title == st else "%s | %s" % (title, st)
@@ -1391,28 +1549,40 @@ class Wiki:
         if og_type == "article" and when:
             head.append('<meta property="article:modified_time" content="%s">' % attr(when))
         head.append('<meta name="twitter:card" content="summary">')
+        lid = layout_of(cfg)
+        lay = LAYOUTS[lid]
         if css is None:
+            head.append('<link rel="stylesheet" href="%slayout.css">' % prefix)
             head.append('<link rel="stylesheet" href="%sstyle.css">' % prefix)
             if site.get("search") == "builtin":
                 head.append('<script src="%ssearch.js" defer></script>' % prefix)
                 head.append("<noscript><style>.search { display: none; }</style></noscript>")
         else:
-            head.append("<style>\n%s\n</style>" % css.replace("</", "<\\/"))
+            head.append("<style>\n%s\n</style>" % (layout_css(lid) + "\n" + css).replace("</", "<\\/"))
+        body_class = "layout-%s %s" % (lid, body_class)
         tagline = '\n<span class="tagline">%s</span>' % esc(site["tagline"]) if site.get("tagline") else ""
+        top_search = ""
+        if lay.get("search") == "top" and not hero_html:
+            top_search = "\n" + self.search_box(cfg, prefix)
         foot = site.get("footer", "").replace("{year}", str(datetime.date.today().year)).replace("{title}", st)
         footer = ""
         if foot.strip():
             footer = '\n<footer class="site-footer"><p>%s</p></footer>' % Markdown(prefix).inline(foot)
+        if rail_html:
+            main = ('<main class="main has-rail" id="content">\n<aside class="toc-rail">%s</aside>\n'
+                    '<div class="content">\n%s\n</div>\n</main>' % (rail_html, main_html))
+        else:
+            main = '<main class="main" id="content">\n<div class="content">\n%s\n</div>\n</main>' % main_html
         return (
             '<!DOCTYPE html>\n<html lang="%s">\n<head>\n%s\n</head>\n<body class="%s">\n'
             '<a class="skip" href="#content">Skip to content</a>\n'
             '<input type="checkbox" id="nav-toggle" class="nav-toggle" aria-label="Show navigation">\n'
             '<header class="topbar">\n<label for="nav-toggle" class="nav-button">Menu</label>\n'
-            '<a class="site-title" href="%sindex.html">%s</a>%s\n</header>\n'
-            '<div class="layout">\n%s\n<main class="main" id="content">\n<div class="content">\n%s\n</div>\n</main>\n</div>%s\n'
+            '<a class="site-title" href="%sindex.html">%s</a>%s%s\n</header>\n%s'
+            '<div class="layout">\n%s\n%s\n</div>%s\n'
             "</body>\n</html>\n"
-            % (attr(site.get("lang") or "en"), "\n".join(head), attr(body_class), prefix, esc(st), tagline,
-               sidebar_html, main_html, footer)
+            % (attr(site.get("lang") or "en"), "\n".join(head), attr(body_class), prefix, esc(st), tagline, top_search,
+               hero_html, sidebar_html, main, footer)
         )
 
     @staticmethod
@@ -1473,9 +1643,14 @@ class Wiki:
                 parts.append('<h2 class="home-heading">Recently updated</h2>\n<ul class="article-list recent">\n%s\n</ul>' % "\n".join(lis))
         parts.append("</article>")
         desc = site.get("description") or site.get("tagline") or auto_summary(parts[1])
+        hero = ""
+        if LAYOUTS[layout_of(cfg)].get("hero"):
+            tag = "<p>%s</p>" % esc(site["tagline"]) if site.get("tagline") else ""
+            hero = '<div class="home-hero">\n<h1>%s</h1>%s\n%s\n</div>\n' % (esc(site["title"]), tag, self.search_box(cfg, ""))
         html_ = self.doc(
             cfg, prefix="", body_class="wiki page-home", title="", desc=desc, rel="index.html",
             main_html="\n".join(parts), sidebar_html=self.sidebar(cfg, "", home=True), css=css, base=base,
+            hero_html=hero,
         )
         return html_, M.missing
 
@@ -1518,8 +1693,12 @@ class Wiki:
             self.breadcrumbs(prefix, [("Home", prefix + "index.html"), (sec["title"], "index.html"), (art["title"], "")]),
             '<article>\n<h1>%s</h1>' % esc(art["title"]),
         ]
+        rail = ""
         if site.get("toc"):
-            parts.append(self.toc_html(M.headings))
+            if LAYOUTS[layout_of(cfg)].get("toc") == "rail":
+                rail = self.toc_html(M.headings)
+            else:
+                parts.append(self.toc_html(M.headings))
         parts.append(body)
         if site.get("updated"):
             parts.append('<p class="article-meta">Last updated <time datetime="%s">%s</time> in <a href="index.html">%s</a></p>'
@@ -1543,7 +1722,7 @@ class Wiki:
             cfg, prefix=prefix, body_class="wiki page-article sec-%s art-%s-%s" % (sec["slug"], sec["slug"], art["slug"]),
             title=art["title"], desc=desc, rel="%s/%s.html" % (sec["slug"], art["slug"]), main_html="\n".join(parts),
             sidebar_html=self.sidebar(cfg, prefix, sec["slug"], art["slug"]), css=css, base=base,
-            og_type="article", when=art.get("updated", ""),
+            og_type="article", when=art.get("updated", ""), rail_html=rail,
         )
         return html_, M.missing, body
 
@@ -1552,9 +1731,16 @@ class Wiki:
         data = json.dumps(entries, ensure_ascii=True, separators=(",", ":")).replace("</", "<\\/")
         return "/* generated by WikiGen: search index and script */\n" + SEARCH_JS.replace("__INDEX__", data)
 
+    def write_layout_css(self):
+        f = self.root / "layout.css"
+        text = layout_css(layout_of(self.cfg))
+        if not f.is_dir() and read_text(f) != text:
+            write_text(f, text)
+
     def build(self):
         c = self.cfg
         site = c["site"]
+        self.write_layout_css()
         resolver = self.make_resolver(c)
         files = {}
         files["index.html"], _ = self.render_home(c, read_text(self.home_md()), resolver)
@@ -1783,6 +1969,8 @@ class Wiki:
             out["url"] = str(d["url"]).strip().rstrip("/")[:300]
         if d.get("search") in SEARCH_MODES:
             out["search"] = d["search"]
+        if d.get("layout") in LAYOUTS:
+            out["layout"] = d["layout"]
         for k in SITE_BOOLS:
             if k in d:
                 out[k] = bool(d[k])
@@ -1826,6 +2014,8 @@ class Wiki:
         cfg = copy.deepcopy(self.cfg)
         if isinstance(p.get("site"), dict):
             cfg["site"] = self.clean_site(p["site"], cfg["site"])
+        if p.get("layout") in LAYOUTS:
+            cfg["site"]["layout"] = p["layout"]
         css = p.get("css") if isinstance(p.get("css"), str) else read_text(self.css_path())
         view = p.get("view")
         md = str(p.get("markdown") or "")
@@ -3228,7 +3418,7 @@ details.box > summary { cursor: pointer; padding: 8px 10px; font-weight: 600; ba
     <button data-act="new-article">New article</button>
     <button data-act="home">Home page</button>
     <span class="sep"></span>
-    <button data-act="css">Edit CSS</button>
+    <button data-act="css">Layout and CSS</button>
     <button data-act="settings">Settings</button>
     <button data-act="rescan" title="Pick up .md files and folders added under .wikigen/sections">Rescan files</button>
     <span class="grow"></span>
@@ -3338,6 +3528,11 @@ const ART_TPL = `
 
 const CSS_TPL = `
 <div class="fill">
+  <div class="bar">
+    <label>Layout <select id="layout"></select></label>
+    <button id="apply-layout">Use this layout</button>
+    <span class="hint" id="layout-desc"></span>
+  </div>
   <div class="bar">
     <label>Theme <select id="theme"></select></label>
     <button id="apply-theme">Apply theme</button>
@@ -3626,7 +3821,7 @@ function previewPayload() {
       view: "article", section: $("#a-sec").value, orig_section: view.sec || "", orig_slug: view.slug || "",
       new_slug: $("#a-slug").value, title: $("#a-title").value, description: $("#a-desc").value, markdown: $("#md").value,
     };
-    case "css": return { view: "css", target: $("#css-target").value, css: $("#css").value };
+    case "css": return { view: "css", target: $("#css-target").value, css: $("#css").value, layout: $("#layout").value };
     case "settings": return { view: "settings", target: "home", site: readSettings() };
   }
   return null;
@@ -3982,7 +4177,11 @@ async function openCss() {
   view = { type: "css" };
   $("#left").innerHTML = CSS_TPL;
   const th = $("#theme");
-  S.themes.forEach((t) => { const o = document.createElement("option"); o.value = t.id; o.textContent = t.label; th.appendChild(o); });
+  const groups = {};
+  S.themes.forEach((t) => {
+    if (!groups[t.group]) { groups[t.group] = document.createElement("optgroup"); groups[t.group].label = t.group + " themes"; th.appendChild(groups[t.group]); }
+    const o = document.createElement("option"); o.value = t.id; o.textContent = t.label; groups[t.group].appendChild(o);
+  });
   const tg = $("#css-target");
   const opt = (v, label) => { const o = document.createElement("option"); o.value = v; o.textContent = label; tg.appendChild(o); };
   opt("home", "Home page");
@@ -3997,8 +4196,30 @@ async function openCss() {
   $("#apply-theme").addEventListener("click", applyTheme);
   $("#jump-global").addEventListener("click", () => jumpTo("GLOBAL THEME"));
   $("#jump-pages").addEventListener("click", () => jumpTo("PAGE SPECIFIC RULES"));
+  layoutPicker();
   renderSide();
   renderPreview();
+}
+
+function layoutPicker() {
+  const sel = $("#layout");
+  S.layouts.forEach((l) => { const o = document.createElement("option"); o.value = l.id; o.textContent = l.label; sel.appendChild(o); });
+  sel.value = S.site.layout || "classic";
+  const describe = () => {
+    const l = S.layouts.find((x) => x.id === sel.value);
+    const pending = sel.value !== (S.site.layout || "classic");
+    $("#layout-desc").textContent = (l ? l.desc : "") + (pending ? " (Previewing, not saved yet.)" : "");
+  };
+  describe();
+  sel.addEventListener("change", () => { describe(); renderPreview(); });
+  $("#apply-layout").addEventListener("click", async () => {
+    try {
+      await api("PUT", "settings", { layout: sel.value });
+      await refresh();
+      describe();
+      toast("Layout saved");
+    } catch (e) { toast(e.message, "bad"); }
+  });
 }
 
 function applyTheme() {

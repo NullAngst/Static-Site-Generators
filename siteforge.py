@@ -997,6 +997,443 @@ def default_css(theme="site-clean"):
 
 
 # ----------------------------------------------------------------------------
+# Layouts
+#
+# A layout changes how the site is put together, not its colors. There are four choices, one
+# for the site as a whole and one for each module:
+#   Site layout     where the title and menu sit and how pages are framed
+#   Blog layout     the feed as a list, cards, a magazine front page or a dated archive
+#   Wiki layout     the sidebar on the left or right, a docs rail for the contents, or a menu bar
+#   Stories layout  a shelf, a book, a cover wall, a web serial or one story in the spotlight
+# The theme in style.css still sets colors and fonts, so every theme works with every layout.
+#
+# The chosen rules go to layout.css, which SiteForge rewrites on every build. Pages load it
+# before style.css. Layout rules start with a body class (body.layout-NAME, body.blog-layout-NAME
+# and so on), which outranks the base styles in style.css, while a rule you write in style.css
+# with the same weight still wins because it loads later.
+# ----------------------------------------------------------------------------
+
+LAYOUT_SHARED_CSS = """
+/* every layout: panel padding as variables, so full-width images can line up with it */
+.content { --pad-y: 1.75rem; --pad-x: clamp(1rem, 3vw, 2.25rem); }
+"""
+
+SITE_SIDEBAR_CSS = """
+/* Site layout, Sidebar: title, tagline and menu in a column on the left */
+@media (min-width: 900px) {
+  body.layout-sidebar { display: grid; grid-template-columns: minmax(14rem, 17rem) minmax(0, 1fr); grid-template-rows: auto 1fr auto; min-height: 100vh; }
+  body.layout-sidebar > .site-header {
+    grid-column: 1; grid-row: 1 / -1; position: sticky; top: 0; height: 100vh; overflow-y: auto;
+    background: var(--sidebar-bg); color: var(--sidebar-text); border-bottom: 0; border-right: 1px solid var(--border);
+  }
+  body.layout-sidebar .site-header .bar { flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: 2.25rem; padding: 2.75rem 1.4rem 2rem; }
+  body.layout-sidebar .site-title { font-size: 1.6rem; line-height: 1.15; color: var(--sidebar-text); }
+  body.layout-sidebar .tagline { margin-top: 0.55rem; line-height: 1.45; }
+  body.layout-sidebar .site-nav { margin-left: 0; }
+  body.layout-sidebar .site-nav ul { flex-direction: column; flex-wrap: nowrap; gap: 0.15rem; }
+  body.layout-sidebar .site-nav a {
+    display: block; padding: 0.4rem 0.75rem; color: var(--sidebar-text);
+    border-bottom: 0; border-left: 3px solid transparent; border-radius: 0 var(--radius) var(--radius) 0;
+  }
+  body.layout-sidebar .site-nav a:hover { background: var(--sidebar-active); }
+  body.layout-sidebar .site-nav a[aria-current="page"] { color: var(--accent); border-left-color: var(--accent); background: var(--sidebar-active); }
+  body.layout-sidebar > .story-backdrop { grid-column: 2; grid-row: 1; }
+  body.layout-sidebar > main, body.layout-sidebar > .with-sidebar { grid-column: 2; grid-row: 2; min-width: 0; width: 100%; }
+  body.layout-sidebar > main.page-main { max-width: calc(var(--max-width) + 4rem); padding-top: 3rem; }
+  body.layout-sidebar > .site-footer { grid-column: 2; grid-row: 3; }
+}
+"""
+
+SITE_MAGAZINE_CSS = """
+/* Site layout, Magazine: big centered masthead over a ruled menu bar, a wider page */
+body.layout-magazine .site-header .bar {
+  max-width: calc(var(--max-width) + 22rem); margin: 0 auto; flex-direction: column; align-items: center; text-align: center;
+  gap: 0; padding: 2.5rem 1.25rem 0;
+}
+body.layout-magazine .brand { align-items: center; margin-bottom: 1.4rem; }
+body.layout-magazine .site-title { font-size: clamp(2.1rem, 6vw, 3.6rem); line-height: 1.05; }
+body.layout-magazine .tagline { margin-top: 0.55rem; font-size: 1rem; font-style: italic; }
+body.layout-magazine .nav-button { margin: 0 0 1rem; }
+@media (min-width: 821px) {
+  body.layout-magazine .site-nav { width: 100%; margin-left: 0; border-top: 3px double var(--border); border-bottom: 1px solid var(--border); }
+  body.layout-magazine .site-nav ul { justify-content: center; gap: 0.25rem 2.25rem; padding: 0.7rem 0; font-size: 0.78rem; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; }
+}
+body.layout-magazine main.page-main { max-width: calc(var(--max-width) + 22rem); padding-top: 2.5rem; }
+body.layout-magazine main.page-main > .content { max-width: calc(var(--max-width) + 4rem); margin: 0 auto; --pad-y: 2.25rem; --pad-x: clamp(1.1rem, 4vw, 3rem); padding: var(--pad-y) var(--pad-x); }
+body.layout-magazine .page-title { text-align: center; font-size: clamp(2rem, 5vw, 2.8rem); }
+body.layout-magazine .site-footer { text-align: center; border-top: 3px double var(--border); }
+"""
+
+SITE_JOURNAL_CSS = """
+/* Site layout, Journal: no panels, a narrow column and a small header */
+body.layout-journal .site-header { background: none; border-bottom: 0; }
+body.layout-journal .site-header .bar {
+  max-width: min(var(--max-width), 40rem); margin: 0 auto; align-items: baseline; padding: 3.25rem 1.25rem 0.8rem;
+  background: linear-gradient(var(--text), var(--text)) center bottom / calc(100% - 2.5rem) 1px no-repeat;
+}
+body.layout-journal .site-title { font-size: 1rem; letter-spacing: 0.2em; text-transform: uppercase; }
+body.layout-journal .site-nav a { color: var(--muted); border-bottom: 0; }
+body.layout-journal .site-nav a:hover, body.layout-journal .site-nav a[aria-current="page"] { color: var(--text); }
+body.layout-journal main.page-main { max-width: min(var(--max-width), 40rem); padding-top: 3rem; padding-bottom: 4rem; }
+body.layout-journal main.page-main > .content { --pad-y: 0; --pad-x: 0; padding: 0; background: none; border: 0; border-radius: 0; }
+body.layout-journal main.page-main .page-title { font-size: clamp(1.9rem, 5vw, 2.6rem); line-height: 1.1; margin-bottom: 1.5rem; }
+body.layout-journal main.page-main blockquote { border-left: 0; padding: 0 0 0 1.5rem; font-style: italic; }
+body.layout-journal .site-footer { border-top: 0; text-align: center; }
+body.layout-journal .site-footer .bar { padding-bottom: 3rem; }
+"""
+
+SITE_LANDING_CSS = """
+/* Site layout, Landing: a tinted hero with a large title, the menu on top, raised panels */
+body.layout-landing .site-header { background: linear-gradient(165deg, color-mix(in srgb, var(--accent) 24%, var(--bg)) 0%, var(--bg) 100%); border-bottom: 0; }
+body.layout-landing .site-header .bar {
+  max-width: calc(var(--max-width) + 16rem); margin: 0 auto; flex-direction: column; align-items: center; text-align: center;
+  gap: 0; padding: 1rem 1.25rem 2.5rem;
+}
+body.layout-landing:has(> main.page-main) .site-header .bar { padding-bottom: 4.5rem; }
+body.layout-landing.is-home:has(> main.page-main) .site-header .bar { padding-bottom: 7rem; }
+body.layout-landing .brand { align-items: center; }
+body.layout-landing.is-home .brand { padding-top: 2rem; }
+body.layout-landing .site-title { font-size: clamp(2.2rem, 7vw, 4rem); line-height: 1.05; }
+body.layout-landing .tagline { max-width: 34rem; margin: 0.9rem auto 0; font-size: 1.15rem; }
+body.layout-landing .nav-button { margin: 0 0 1.5rem auto; }
+@media (min-width: 821px) {
+  body.layout-landing .site-nav { order: -1; width: 100%; margin: 0 0 2.75rem; }
+  body.layout-landing .site-nav ul { justify-content: flex-end; gap: 0.35rem; }
+  body.layout-landing .site-nav a { display: block; padding: 0.35rem 0.95rem; border: 1px solid transparent; border-radius: 99px; color: var(--text); }
+  body.layout-landing .site-nav a:hover { border-color: var(--border); }
+  body.layout-landing .site-nav a[aria-current="page"] { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+}
+body.layout-landing main.page-main { max-width: calc(var(--max-width) + 8rem); margin-top: -3rem; padding-top: 0; }
+body.layout-landing.is-home main.page-main { margin-top: -5rem; }
+body.layout-landing main.page-main > .content {
+  --pad-y: 2.5rem; --pad-x: clamp(1.25rem, 5vw, 3.5rem); padding: var(--pad-y) var(--pad-x);
+  border-radius: calc(var(--radius) * 2); box-shadow: 0 24px 60px -28px rgba(0, 0, 0, 0.45);
+}
+body.layout-landing .site-footer { border-top: 0; text-align: center; }
+body.layout-landing .site-footer .bar { padding-top: 2.5rem; padding-bottom: 3rem; }
+"""
+
+
+def _blog_cards_css(L):
+    return """
+/* blog feed as cards */
+{L}.blog-feed main > .content, {L}.blog-tag main > .content {{ max-width: none; padding: 0; background: none; border: 0; box-shadow: none; }}
+{L}.layout-landing.blog-feed main.page-main, {L}.layout-landing.blog-tag main.page-main {{ margin-top: 0; padding-top: 0.5rem; }}
+{L} .post-list.cards {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); gap: 1.5rem; margin: 1.25rem 0 0; }}
+{L} .post-list.cards .post-item {{
+  display: flex; flex-direction: column; margin: 0; padding: 0; overflow: hidden;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface);
+  background: color-mix(in srgb, var(--surface) calc(var(--surface-opacity) * 100%), transparent);
+}}
+{L} .post-list.cards .post-item:not(.has-thumb) {{ border-top: 4px solid var(--accent); }}
+{L} .post-thumb {{ display: block; overflow: hidden; background: var(--code-bg); }}
+{L} .post-thumb img {{ display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; transition: transform 0.3s; }}
+{L} .post-item:hover .post-thumb img {{ transform: scale(1.03); }}
+{L} .post-body {{ display: flex; flex-direction: column; flex: 1; padding: 1.1rem 1.25rem 1.3rem; }}
+{L} .content .post-list.cards .post-item h2 {{ font-size: 1.2rem; margin: 0 0 0.35rem; }}
+{L} .post-list.cards .tags {{ margin: 0 0 0.5rem; }}
+{L} .post-feature {{ grid-column: 1 / -1; }}
+@media (min-width: 760px) {{
+  {L} .post-list.cards .post-feature.has-thumb {{ flex-direction: row; }}
+  {L} .post-feature.has-thumb .post-thumb {{ position: relative; flex: 1.35 1 0; min-height: 17rem; }}
+  {L} .post-feature.has-thumb .post-thumb img {{ position: absolute; inset: 0; height: 100%; aspect-ratio: auto; }}
+  {L} .post-feature .post-body {{ flex: 1 1 0; justify-content: center; padding: 2rem 2.25rem; }}
+  {L} .content .post-list.cards .post-feature h2 {{ font-size: 2rem; }}
+  {L} .post-feature .post-summary {{ font-size: 1.05rem; }}
+}}
+""".format(L=L)
+
+
+BLOG_CARDS_CSS = _blog_cards_css("body.blog-layout-cards")
+
+BLOG_MAGAZINE_CSS = _blog_cards_css("body.blog-layout-magazine") + """
+/* post page: the post's image across the top of the panel, a centered head */
+body.blog-layout-magazine.blog-post .content { overflow: hidden; }
+body.blog-layout-magazine .post-hero { margin: calc(-1 * var(--pad-y)) calc(-1 * var(--pad-x)) 2rem; }
+body.blog-layout-magazine .post-hero img { display: block; width: 100%; max-height: 28rem; object-fit: cover; }
+body.blog-layout-magazine.blog-post .content > .page-title { text-align: center; font-size: clamp(2rem, 5vw, 3rem); line-height: 1.1; }
+body.blog-layout-magazine.blog-post .content > .post-meta { text-align: center; }
+body.blog-layout-magazine.blog-post .content > .tags { justify-content: center; }
+"""
+
+BLOG_ARCHIVE_CSS = """
+/* blog as a dated archive grouped by year */
+body.blog-layout-archive .post-year { margin: 2.25rem 0 0; }
+body.blog-layout-archive .post-year:first-of-type { margin-top: 0.75rem; }
+body.blog-layout-archive .content .post-year > h2 {
+  margin: 0 0 0.4rem; padding-bottom: 0.3rem; border-bottom: 1px solid var(--border);
+  font-family: var(--font-ui); font-size: 0.8rem; letter-spacing: 0.2em; color: var(--muted);
+}
+body.blog-layout-archive .post-list.archive .post-item {
+  display: grid; grid-template-columns: 4.5rem minmax(0, 1fr); column-gap: 1rem; align-items: baseline; padding: 0.4rem 0; border-top: 0;
+}
+body.blog-layout-archive .post-list.archive .post-meta { grid-column: 1; grid-row: 1; margin: 0; font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+body.blog-layout-archive .content .post-list.archive .post-item h2 { grid-column: 2; grid-row: 1; margin: 0; font-size: 1.05rem; font-weight: 600; }
+body.blog-layout-archive .post-list.archive .tags { grid-column: 2; margin: 0.2rem 0 0; }
+body.blog-layout-archive .post-list.archive .post-summary { display: none; }
+"""
+
+WIKI_DOCS_CSS = """
+/* Wiki layout, Docs: a quiet sidebar, open articles and the contents in a rail on the right */
+body.wiki-layout-docs .wiki-side { background: var(--bg); padding-top: 1.5rem; }
+body.wiki-layout-docs .nav-section > summary { font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+body.wiki-layout-docs .nav-section ul { border-left: 0; margin-left: 0.3rem; }
+body.wiki-layout-docs.mod-wiki .with-sidebar > main { padding: 2.25rem clamp(1rem, 4vw, 3.5rem) 4rem; }
+body.wiki-layout-docs.mod-wiki .content { max-width: calc(var(--max-width) + 8rem); padding: 0; background: none; border: 0; border-radius: 0; }
+body.wiki-layout-docs.mod-wiki .content h1 { font-size: 2.3rem; }
+body.wiki-layout-docs .toc-rail .wiki-toc { margin: 0 0 2rem; }
+@media (min-width: 1180px) {
+  body.wiki-layout-docs .wiki-body.has-rail { display: grid; grid-template-columns: minmax(0, calc(var(--max-width) + 8rem)) 14rem; gap: 3rem; align-items: start; }
+  body.wiki-layout-docs .wiki-body.has-rail > .content { grid-column: 1; grid-row: 1; }
+  body.wiki-layout-docs .toc-rail { grid-column: 2; grid-row: 1; position: sticky; top: 1.5rem; max-height: calc(100vh - 3rem); overflow-y: auto; }
+  body.wiki-layout-docs .toc-rail .wiki-toc { margin: 0; padding: 0 0 0 1rem; background: none; border: 0; border-left: 1px solid var(--border); border-radius: 0; font-size: 0.85rem; }
+  body.wiki-layout-docs .toc-rail .wiki-toc summary { list-style: none; margin-bottom: 0.4rem; font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+  body.wiki-layout-docs .toc-rail .wiki-toc summary::-webkit-details-marker { display: none; }
+  body.wiki-layout-docs .toc-rail .wiki-toc ol { list-style: none; margin: 0; padding: 0; }
+  body.wiki-layout-docs .toc-rail .wiki-toc ol ol { padding-left: 0.85rem; }
+  body.wiki-layout-docs .toc-rail .wiki-toc a { display: block; padding: 0.18rem 0; color: var(--muted); text-decoration: none; }
+  body.wiki-layout-docs .toc-rail .wiki-toc a:hover { color: var(--accent); }
+}
+"""
+
+WIKI_HANDBOOK_CSS = """
+/* Wiki layout, Handbook: search and sections as a menu bar of dropdowns, one centered column */
+@media (min-width: 821px) {
+  body.wiki-layout-handbook.mod-wiki .with-sidebar { display: block; }
+  body.wiki-layout-handbook .wiki-side {
+    position: sticky; top: 0; z-index: 15; display: flex; flex-wrap: wrap; justify-content: center; align-items: center;
+    gap: 0.15rem 0.35rem; min-height: 0; max-height: none; overflow: visible; padding: 0.4rem 1rem;
+    border-right: 0; border-bottom: 1px solid var(--border);
+  }
+  body.wiki-layout-handbook .wiki-side .search { flex: 0 1 15rem; margin: 0 0.75rem 0 0; }
+  body.wiki-layout-handbook .wiki-side .search input { padding: 0.3rem 0.65rem; }
+  body.wiki-layout-handbook .wiki-side .search-results { position: absolute; left: 0; width: 22rem; max-width: 90vw; z-index: 30; max-height: 70vh; overflow-y: auto; }
+  body.wiki-layout-handbook .nav-home { margin: 0; }
+  body.wiki-layout-handbook .nav-section { position: relative; margin: 0; }
+  body.wiki-layout-handbook .nav-count { display: none; }
+  body.wiki-layout-handbook .nav-section.is-current > summary { color: var(--accent); box-shadow: inset 0 -2px 0 var(--accent); border-radius: 0; }
+  body.wiki-layout-handbook .nav-section > ul {
+    position: absolute; top: calc(100% + 0.45rem); left: 0; z-index: 20; min-width: 15rem; max-height: 60vh; overflow-y: auto;
+    margin: 0; padding: 0.4rem; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
+  }
+  body.wiki-layout-handbook.mod-wiki .with-sidebar > main { padding: 2.75rem 1.25rem 4rem; }
+  body.wiki-layout-handbook.mod-wiki .content { max-width: calc(var(--max-width) + 6rem); margin: 0 auto; padding: 0; background: none; border: 0; border-radius: 0; }
+  body.wiki-layout-handbook.mod-wiki .breadcrumbs ol { justify-content: center; }
+  body.wiki-layout-handbook.mod-wiki .content > h1 { text-align: center; font-size: 2.4rem; }
+}
+"""
+
+WIKI_RIGHT_CSS = """
+/* Wiki layout, Right sidebar: articles first, sections on the right, a raised panel */
+@media (min-width: 821px) {
+  body.wiki-layout-right .with-sidebar { grid-template-columns: minmax(0, 1fr) var(--sidebar-width); }
+  body.wiki-layout-right .wiki-side { grid-column: 2; grid-row: 1; border-right: 0; border-left: 1px solid var(--border); }
+  body.wiki-layout-right.mod-wiki .with-sidebar > main { grid-column: 1; grid-row: 1; padding-top: 2.25rem; }
+  body.wiki-layout-right.mod-wiki .content { margin: 0 auto; box-shadow: 0 18px 44px -26px rgba(0, 0, 0, 0.4); }
+}
+body.wiki-layout-right .wiki-card { background: var(--surface); border-top: 3px solid var(--accent); }
+"""
+
+LIB_SOLO_CSS = """
+/* chapters without the sidebar */
+.solo { max-width: calc(var(--measure) + 6rem); margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+"""
+
+LIB_BOOK_CSS = LIB_SOLO_CSS + """
+/* Stories layout, Book: each chapter is a paper page with a Contents dropdown */
+body.lib-layout-book .solo .sheet {
+  max-width: none; padding: clamp(1.5rem, 6vw, 4.5rem) clamp(1.25rem, 7vw, 5rem);
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 18px 40px -24px rgba(0, 0, 0, 0.35);
+}
+body.lib-layout-book .contents-drop { margin: -0.5rem 0 2.5rem; text-align: center; font-family: var(--font-ui); font-size: 0.85rem; }
+body.lib-layout-book .contents-drop > summary { display: inline-block; cursor: pointer; padding: 0.3rem 1rem; border: 1px solid var(--border); border-radius: 99px; color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; font-size: 0.72rem; list-style: none; }
+body.lib-layout-book .contents-drop > summary::-webkit-details-marker { display: none; }
+body.lib-layout-book .contents-drop[open] > summary { color: var(--accent); border-color: var(--accent); }
+body.lib-layout-book .contents-drop .side {
+  display: block; position: static; min-height: 0; max-height: 55vh; margin: 0.75rem auto 0; max-width: 24rem; text-align: left;
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+}
+body.lib-layout-book .chapter-head { margin-bottom: 3rem; }
+body.lib-layout-book .chapter-head h1 { font-size: 2.2rem; }
+body.lib-layout-book .chapter-head h1::after { content: ""; display: block; width: 3rem; height: 1px; margin: 1.25rem auto 0; background: var(--accent); }
+body.lib-layout-book .shelf { grid-template-columns: 1fr; gap: 0; max-width: 48rem; }
+body.lib-layout-book .book { padding: 1.25rem 0; border-top: 1px solid var(--border); }
+body.lib-layout-book .book:first-child { border-top: 0; }
+body.lib-layout-book .book .cover { width: 5.5rem; }
+"""
+
+LIB_SHELF_CSS = """
+/* Stories layout, Bookshelf: a wall of covers, story pages open with a large cover */
+body.lib-layout-shelf .shelf { grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr)); gap: 2rem 1.5rem; }
+body.lib-layout-shelf .book { flex-direction: column; gap: 0.7rem; }
+body.lib-layout-shelf .book > a { display: block; }
+body.lib-layout-shelf .book .cover { display: block; width: 100%; aspect-ratio: 2 / 3; object-fit: cover; box-shadow: 0 14px 28px -14px rgba(0, 0, 0, 0.55); transition: transform 0.2s, box-shadow 0.2s; }
+body.lib-layout-shelf .book .cover.none { display: flex; font-family: var(--font-heading); font-size: 1rem; padding: 1rem; background: linear-gradient(160deg, color-mix(in srgb, var(--accent) 35%, var(--surface)), var(--code-bg)); color: var(--text); }
+body.lib-layout-shelf .book > a:hover .cover { transform: translateY(-4px); box-shadow: 0 20px 34px -14px rgba(0, 0, 0, 0.6); }
+body.lib-layout-shelf .book h2 { font-size: 1.02rem; }
+body.lib-layout-shelf .book .subtitle, body.lib-layout-shelf .book p:not(.subtitle) { display: none; }
+body.lib-layout-shelf .book .facts { font-size: 0.72rem; margin: 0.3rem 0 0; }
+body.lib-layout-shelf .story-head { align-items: flex-end; gap: 2.25rem; }
+body.lib-layout-shelf .story-head .cover { width: 15rem; box-shadow: 0 20px 40px -18px rgba(0, 0, 0, 0.6); }
+body.lib-layout-shelf .story-head h1 { font-size: 2.5rem; }
+body.lib-layout-shelf.lib-story .sheet { max-width: calc(var(--measure) + 10rem); }
+body.lib-layout-shelf .chapter-list ol { display: grid; grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr)); gap: 0.6rem; }
+body.lib-layout-shelf .chapter-list li, body.lib-layout-shelf .chapter-list li:last-child { border: 1px solid var(--border); border-radius: var(--radius); }
+body.lib-layout-shelf .chapter-list a { flex-wrap: wrap; height: 100%; padding: 0.7rem 0.85rem; }
+body.lib-layout-shelf .chapter-list .ch-meta { flex-basis: 100%; padding-left: 2.35em; }
+"""
+
+LIB_SERIAL_CSS = LIB_SOLO_CSS + """
+/* Stories layout, Serial: latest chapters lead, navigation above and below every chapter */
+body.lib-layout-serial .updates { margin: 0.75rem 0 0; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+body.lib-layout-serial .updates li { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0.25rem 1rem; padding: 0.7rem 1rem; }
+body.lib-layout-serial .updates li:first-child { border-top: 0; }
+body.lib-layout-serial .updates a { font-weight: 600; text-decoration: none; }
+body.lib-layout-serial .shelf { grid-template-columns: 1fr; gap: 0; margin-top: 0.75rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+body.lib-layout-serial .book { align-items: center; padding: 0.85rem 1rem; border-top: 1px solid var(--border); }
+body.lib-layout-serial .book:first-child { border-top: 0; }
+body.lib-layout-serial .book .cover { width: 3.4rem; }
+body.lib-layout-serial .book .cover.none { font-size: 0.55rem; padding: 0.25rem; }
+body.lib-layout-serial .book .facts { margin: 0; }
+body.lib-layout-serial .book p:not(.subtitle) { margin-bottom: 0.3rem; }
+body.lib-layout-serial .solo { max-width: calc(var(--measure) + 4rem); }
+body.lib-layout-serial .pager.top { margin: 0 0 2.5rem; }
+body.lib-layout-serial .pager a { text-align: center; }
+body.lib-layout-serial .pager .index { flex: 0 0 auto; }
+body.lib-layout-serial .pager .prev { text-align: left; }
+body.lib-layout-serial .pager .next { text-align: right; }
+body.lib-layout-serial .chapter-head { text-align: left; padding-bottom: 1.25rem; border-bottom: 1px solid var(--border); }
+@media (max-width: 600px) {
+  body.lib-layout-serial .pager a { padding: 0.6rem 0.5rem; font-size: 0; }
+  body.lib-layout-serial .pager small { margin: 0; font-size: 0.75rem; }
+}
+"""
+
+LIB_SPOTLIGHT_CSS = """
+/* Stories layout, Spotlight: the first story fills the top, story pages open on a cover backdrop */
+body.lib-layout-spotlight .shelf { grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr)); }
+body.lib-layout-spotlight .book { padding: 1rem; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+body.lib-layout-spotlight .book.featured {
+  grid-column: 1 / -1; gap: clamp(1rem, 4vw, 2.5rem); padding: clamp(1.25rem, 4vw, 2.5rem); align-items: center;
+  background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 20%, var(--surface)) 0%, var(--surface) 70%);
+}
+body.lib-layout-spotlight .book.featured .cover { width: clamp(8rem, 22vw, 14rem); box-shadow: 0 20px 40px -18px rgba(0, 0, 0, 0.6); }
+body.lib-layout-spotlight .book.featured h2 { font-size: clamp(1.6rem, 4vw, 2.4rem); }
+body.lib-layout-spotlight .book.featured p { font-size: 1.02rem; }
+body.lib-layout-spotlight .story-backdrop {
+  position: relative; height: 15rem; overflow: hidden; border-bottom: 1px solid var(--border);
+  background: linear-gradient(160deg, color-mix(in srgb, var(--accent) 40%, var(--bg)), var(--bg));
+}
+body.lib-layout-spotlight .story-backdrop img { position: absolute; inset: -40px; width: calc(100% + 80px); height: calc(100% + 80px); object-fit: cover; filter: blur(24px) saturate(1.2); opacity: 0.6; }
+body.lib-layout-spotlight.lib-story .with-sidebar > main, body.lib-layout-spotlight.lib-story main.page-main { padding-top: 0; }
+body.lib-layout-spotlight.lib-story .story-head { position: relative; margin-top: -6rem; }
+body.lib-layout-spotlight.lib-story .story-head .cover { width: 12rem; box-shadow: 0 22px 44px -18px rgba(0, 0, 0, 0.65); }
+@media (min-width: 700px) {
+  body.lib-layout-spotlight.lib-story .story-head .about { padding-top: 6.5rem; }
+}
+body.lib-layout-spotlight.lib-story .story-head.no-cover { margin-top: -4rem; }
+body.lib-layout-spotlight.lib-story .story-head.no-cover .about { padding-top: 0; }
+body.lib-layout-spotlight.lib-story .story-head.no-cover h1 { font-size: 2.6rem; }
+"""
+
+# Each axis: id -> label, description, CSS and the structural switches the renderers read.
+LAYOUTS = {
+    "site": {
+        "classic": {"label": "Classic", "css": "",
+                    "desc": "A header bar with the menu on the right and pages in a panel. This is how SiteForge has always looked."},
+        "sidebar": {"label": "Sidebar", "css": SITE_SIDEBAR_CSS,
+                    "desc": "The title, tagline and menu sit in a column on the left that stays put while you scroll."},
+        "magazine": {"label": "Magazine", "css": SITE_MAGAZINE_CSS,
+                     "desc": "A big centered masthead over a ruled menu bar, and a wider page."},
+        "journal": {"label": "Journal", "css": SITE_JOURNAL_CSS,
+                    "desc": "No boxes, a narrow column and a small header with a thin rule."},
+        "landing": {"label": "Landing", "css": SITE_LANDING_CSS,
+                    "desc": "A tinted hero with a large title and the menu on top. Pages sit in raised panels."},
+    },
+    "blog": {
+        "list": {"label": "List", "feed": "list", "css": "",
+                 "desc": "Posts in a list with the date, tags and summary. The original look."},
+        "cards": {"label": "Cards", "feed": "cards", "css": BLOG_CARDS_CSS,
+                  "desc": "A grid of cards, each with the post's image when it has one."},
+        "magazine": {"label": "Magazine", "feed": "cards", "feature": True, "hero": True, "css": BLOG_MAGAZINE_CSS,
+                     "desc": "Cards with the newest post featured across the top. Post pages open with their image."},
+        "archive": {"label": "Archive", "feed": "archive", "css": BLOG_ARCHIVE_CSS,
+                    "desc": "One line per post, grouped by year. No summaries."},
+    },
+    "wiki": {
+        "classic": {"label": "Classic", "css": "",
+                    "desc": "Search and sections in a sidebar on the left, articles in a panel. The original look."},
+        "docs": {"label": "Docs", "toc": "rail", "css": WIKI_DOCS_CSS,
+                 "desc": "A quiet sidebar, articles without a panel and the table of contents in a column on the right."},
+        "handbook": {"label": "Handbook", "bar": True, "css": WIKI_HANDBOOK_CSS,
+                     "desc": "Search and the sections become a menu bar of dropdowns over one centered column."},
+        "right": {"label": "Right sidebar", "css": WIKI_RIGHT_CSS,
+                  "desc": "Articles come first in a raised panel and the sections sit on the right."},
+    },
+    "library": {
+        "classic": {"label": "Classic", "chapters": "side", "css": "",
+                    "desc": "A shelf of stories and the chapter list in a sidebar. The original look."},
+        "book": {"label": "Book", "chapters": "solo", "drop": True, "css": LIB_BOOK_CSS,
+                 "desc": "Each chapter sits on a paper page with no sidebar and a Contents dropdown. The library reads like a catalog."},
+        "shelf": {"label": "Bookshelf", "chapters": "side", "css": LIB_SHELF_CSS,
+                  "desc": "The library is a wall of covers. Story pages open with a large cover and the chapters as tiles."},
+        "serial": {"label": "Serial", "chapters": "solo", "pager_top": True, "updates_first": True, "css": LIB_SERIAL_CSS,
+                   "desc": "Made for web serials: the latest chapters first, and previous, contents and next links above and below every chapter."},
+        "spotlight": {"label": "Spotlight", "chapters": "side", "featured": True, "backdrop": True, "css": LIB_SPOTLIGHT_CSS,
+                      "desc": "The first story fills the top of the library with a read button. Story pages open on a blurred copy of the cover."},
+    },
+}
+LAYOUT_KEYS = {"site": "layout", "blog": "blog_layout", "wiki": "wiki_layout", "library": "lib_layout"}
+LAYOUT_CLASS = {"site": "layout-", "blog": "blog-layout-", "wiki": "wiki-layout-", "library": "lib-layout-"}
+LAYOUT_DEFAULTS = {"site": "classic", "blog": "list", "wiki": "classic", "library": "classic"}
+
+
+def layout_id(c, axis):
+    lid = c["site"].get(LAYOUT_KEYS[axis])
+    return lid if lid in LAYOUTS[axis] else LAYOUT_DEFAULTS[axis]
+
+
+def layout_opt(c, axis):
+    return LAYOUTS[axis][layout_id(c, axis)]
+
+
+def layout_classes(c):
+    return " ".join(LAYOUT_CLASS[a] + layout_id(c, a) for a in LAYOUTS)
+
+
+def layout_css(c, modules=None):
+    """The layout.css text for a config. modules: the module ids switched on (their CSS is left
+    out otherwise)."""
+    names = ", ".join("%s: %s" % (a.title() if a != "library" else "Stories", LAYOUTS[a][layout_id(c, a)]["label"])
+                      for a in LAYOUTS if a == "site" or modules is None or a in modules)
+    parts = ["/*\n  layout.css: written by %s on every build, so edits here are lost.\n"
+             "  Layouts: %s. Pick others under \"Layout and CSS\" in the editor.\n"
+             "  Your own rules go in style.css, which loads after this file and wins any tie.\n*/\n" % (APP, names),
+             LAYOUT_SHARED_CSS]
+    for a in LAYOUTS:
+        if a == "site" or modules is None or a in modules:
+            parts.append(layout_opt(c, a)["css"])
+    return "".join(parts)
+
+
+def layout_list():
+    return {a: [{"id": k, "label": v["label"], "desc": v["desc"]} for k, v in opts.items()] for a, opts in LAYOUTS.items()}
+
+
+def card_image(url, prefix):
+    """A post image as a usable src, or "" when it is missing or not a web or site path."""
+    url = str(url or "").strip()
+    if not url:
+        return ""
+    if _SCHEME.match(url):
+        return url if re.match(r"^https?://", url, re.I) else ""
+    out = fix_url(url, prefix)
+    return "" if out == "#" else out
+
+
+# ----------------------------------------------------------------------------
 # Small utilities
 # ----------------------------------------------------------------------------
 
@@ -1157,6 +1594,8 @@ SITE_DEFAULTS = {
     "prose": "indented", "dropcap": True, "wordcount": True, "reading_time": True, "wpm": 240, "lib_updates": True,
     # blog
     "post_nav": True,
+    # layouts
+    "layout": "classic", "blog_layout": "list", "wiki_layout": "classic", "lib_layout": "classic",
 }
 SITE_BOOLS = ("noindex", "sitemap", "feeds", "toc", "updated", "expand", "wiki_cards", "wiki_recent", "dropcap",
               "wordcount", "reading_time", "lib_updates", "post_nav")
@@ -1353,6 +1792,7 @@ class SiteBase:
             "genres": sorted({g for s in c["library"]["stories"] for g in s.get("genres", [])}, key=str.lower),
             "statuses": [{"id": k, "label": v} for k, v in STATUSES],
             "themes": [{"id": k, "label": v[0], "group": v[1], "block": root_block(k)} for k, v in THEMES.items()],
+            "layouts": layout_list(),
             "names": MODULE_NAMES,
         }
 
@@ -1590,11 +2030,13 @@ class SiteBase:
         head.extend(self.head_seo(c, seo))
         head.extend(self.feed_links(c, prefix))
         if css is None:
+            head.append('<link rel="stylesheet" href="%slayout.css">' % prefix)
             head.append('<link rel="stylesheet" href="%sstyle.css">' % prefix)
             head.extend(head_extra or [])
         else:
+            css = layout_css(c, [m for m in MODULES if self.enabled(m, c)]) + "\n" + css
             head.append("<style>\n%s\n</style>" % css.replace("</", "<\\/"))
-        classes = body_class + (" is-home" if is_home else "")
+        classes = layout_classes(c) + " " + body_class + (" is-home" if is_home else "")
         tagline = '<span class="tagline">%s</span>' % esc(site["tagline"]) if site.get("tagline") else ""
         nav = self.nav_html(c, prefix, rel, current_mod)
         foot = (site.get("footer", "").replace("{year}", str(datetime.date.today().year))
@@ -1749,6 +2191,9 @@ class SiteBase:
             out["search"] = d["search"]
         if d.get("prose") in ("indented", "spaced"):
             out["prose"] = d["prose"]
+        for axis, key in LAYOUT_KEYS.items():
+            if d.get(key) in LAYOUTS[axis]:
+                out[key] = d[key]
         if "wpm" in d:
             try:
                 out["wpm"] = max(60, min(1000, int(d["wpm"])))
@@ -1801,7 +2246,7 @@ class SiteBase:
         self._res = (None, None)
         if self.enabled("library"):
             self.lib_count_words(c)
-        files = {"index.html": self.render_home(c)}
+        files = {"index.html": self.render_home(c), "layout.css": layout_css(c, [m for m in MODULES if self.enabled(m, c)])}
         for p in c["pages"]:
             if p["slug"] != "index":
                 files[page_rel(p["slug"])] = self.render_page(c, p, read_text(self.page_md(p["slug"])))
@@ -1943,6 +2388,10 @@ class SiteBase:
             cfg["site"] = self.clean_site(p["site"], cfg["site"])
         if isinstance(p.get("nav"), list):
             cfg["nav"] = [n for n in p["nav"] if isinstance(n, dict)]
+        if isinstance(p.get("layouts"), dict):
+            for axis, key in LAYOUT_KEYS.items():
+                if p["layouts"].get(key) in LAYOUTS[axis]:
+                    cfg["site"][key] = p["layouts"][key]
         css = p.get("css") if isinstance(p.get("css"), str) else read_text(self.css_path())
         view = p.get("view")
         md = str(p.get("markdown") or "")
@@ -2068,17 +2517,42 @@ class BlogMixin:
             '<li><a href="%s%s">%s</a></li>' % (prefix, attr(self.tag_rel(t, c)), esc(t)) for t in tags)
 
     def post_list(self, c, posts, prefix):
+        """The blog feed, shaped by the blog layout: a list, a card grid or a dated archive."""
         if not posts:
             return '<p class="empty">No posts yet.</p>'
+        lay = layout_opt(c, "blog")
+        style = lay.get("feed", "list")
         items = []
-        for p in posts:
+        for n, p in enumerate(posts):
             summary = p.get("summary", "").strip() or auto_summary(Markdown("").render(read_text(self.post_md(p["slug"]))))
-            items.append(
-                '<li class="post-item">\n<h2><a href="%s%s">%s</a></h2>\n<p class="post-meta"><time datetime="%s">%s</time></p>\n%s%s</li>'
-                % (prefix, attr(self.post_rel(p["slug"], c)), esc(p["title"]), attr(p["date"]), esc(nice_date(p["date"])),
-                   self.tags_html(c, p.get("tags", []), prefix),
-                   '<p class="post-summary">%s</p>\n' % esc(summary) if summary else ""))
-        return '<ul class="post-list">\n%s\n</ul>' % "\n".join(items)
+            href = prefix + attr(self.post_rel(p["slug"], c))
+            when = nice_date(p["date"])
+            if style == "archive":
+                d = datetime.date.fromisoformat(clean_date(p["date"]))
+                when = d.strftime("%b ") + str(d.day)
+            title = '<h2><a href="%s">%s</a></h2>\n' % (href, esc(p["title"]))
+            meta = '<p class="post-meta"><time datetime="%s">%s</time></p>\n' % (attr(p["date"]), esc(when))
+            tags = self.tags_html(c, p.get("tags", []), prefix)
+            summ = '<p class="post-summary">%s</p>\n' % esc(summary) if summary else ""
+            if style == "cards":
+                img = card_image(p.get("image"), prefix)
+                cls = ["post-item"] + (["has-thumb"] if img else []) + (["post-feature"] if lay.get("feature") and n == 0 else [])
+                thumb = ('<a class="post-thumb" href="%s" tabindex="-1" aria-hidden="true"><img src="%s" alt="" loading="lazy"></a>\n'
+                         % (href, attr(img)) if img else "")
+                items.append('<li class="%s">\n%s<div class="post-body">\n%s%s%s%s</div>\n</li>'
+                             % (" ".join(cls), thumb, title, meta, tags, summ))
+            else:
+                items.append('<li class="post-item">\n%s%s%s%s</li>' % (title, meta, tags, summ))
+        if style == "archive":
+            years = []
+            for p, item in zip(posts, items):
+                y = clean_date(p["date"])[:4]
+                if not years or years[-1][0] != y:
+                    years.append((y, []))
+                years[-1][1].append(item)
+            return "\n".join('<section class="post-year">\n<h2>%s</h2>\n<ul class="post-list archive">\n%s\n</ul>\n</section>'
+                             % (y, "\n".join(rows)) for y, rows in years)
+        return '<ul class="post-list%s">\n%s\n</ul>' % (" cards" if style == "cards" else "", "\n".join(items))
 
     def blog_landing(self, c, rel, css=None, base=None, intro=None):
         prefix = up(rel)
@@ -2104,7 +2578,9 @@ class BlogMixin:
         rel = self.post_rel(post["slug"], c)
         prefix = up(rel)
         body = self.md(c, prefix).render(strip_title_h1(markdown, post["title"]))
-        parts = ['<h1 class="page-title">%s</h1>' % esc(post["title"]),
+        img = card_image(post.get("image"), prefix) if layout_opt(c, "blog").get("hero") else ""
+        parts = ['<figure class="post-hero"><img src="%s" alt=""></figure>' % attr(img) if img else "",
+                 '<h1 class="page-title">%s</h1>' % esc(post["title"]),
                  '<p class="post-meta"><time datetime="%s">%s</time></p>' % (attr(post["date"]), esc(nice_date(post["date"]))),
                  self.tags_html(c, post.get("tags", []), prefix), body]
         posts = self.published_posts(c)
@@ -2466,8 +2942,10 @@ class WikiMixin:
             for a in arts:
                 cur = ' aria-current="page"' if is_cur and a["slug"] == cur_art else ""
                 items.append('<li><a href="%s%s"%s>%s</a></li>' % (prefix, self.wart_rel(s["slug"], a["slug"], c), cur, esc(a["title"])))
-            out.append('<details class="nav-section"%s>\n<summary>%s<span class="nav-count">%d</span></summary>\n<ul>\n%s\n</ul>\n</details>'
-                       % (" open" if (c["site"].get("expand") or is_cur) else "", esc(s["title"]), len(arts), "\n".join(items)))
+            bar = layout_opt(c, "wiki").get("bar")
+            out.append('<details class="nav-section%s"%s>\n<summary>%s<span class="nav-count">%d</span></summary>\n<ul>\n%s\n</ul>\n</details>'
+                       % (" is-current" if is_cur else "", " open" if (c["site"].get("expand") or is_cur) and not bar else "",
+                          esc(s["title"]), len(arts), "\n".join(items)))
         out.append("</nav>")
         return "\n".join(x for x in out if x)
 
@@ -2502,10 +2980,12 @@ class WikiMixin:
         out.append("</ol></details></nav>")
         return "".join(out)
 
-    def wiki_page(self, c, rel, side, parts, **kw):
+    def wiki_page(self, c, rel, side, parts, rail="", **kw):
         prefix = up(rel)
-        main = self.sidebar_layout(side, '<article class="content">\n%s\n</article>' % "\n".join(x for x in parts if x),
-                                   button="Browse the " + self.module_label("wiki", c).lower())
+        article = '<article class="content">\n%s\n</article>' % "\n".join(x for x in parts if x)
+        if rail:
+            article = '<div class="wiki-body has-rail">\n<aside class="toc-rail">%s</aside>\n%s\n</div>' % (rail, article)
+        main = self.sidebar_layout(side, article, button="Browse the " + self.module_label("wiki", c).lower())
         return self.doc(c, rel=rel, main=main, full=True, current_mod="wiki", head_extra=self.wiki_head(c, prefix), **kw)
 
     def wiki_landing(self, c, rel, css=None, base=None, intro=None):
@@ -2571,8 +3051,12 @@ class WikiMixin:
         parts = [self.breadcrumbs([(self.module_label("wiki", c), prefix + self.landing_rel("wiki", c)),
                                    (sec["title"], "index.html"), (art["title"], "")]),
                  "<h1>%s</h1>" % esc(art["title"])]
+        rail = ""
         if site.get("toc"):
-            parts.append(self.toc_html(M.headings))
+            if layout_opt(c, "wiki").get("toc") == "rail":
+                rail = self.toc_html(M.headings)
+            else:
+                parts.append(self.toc_html(M.headings))
         parts.append(body)
         if site.get("updated"):
             parts.append('<p class="article-meta">Last updated <time datetime="%s">%s</time> in <a href="index.html">%s</a></p>'
@@ -2592,7 +3076,7 @@ class WikiMixin:
         return self.wiki_page(c, rel, self.wiki_sidebar(c, prefix, sec["slug"], art["slug"]), parts,
                               body_class="mod-wiki wiki-article sec-%s art-%s-%s" % (sec["slug"], sec["slug"], art["slug"]),
                               title=art["title"], desc=art.get("description") or auto_summary(body), og_type="article",
-                              published=art.get("updated", ""), css=css, base=base)
+                              published=art.get("updated", ""), css=css, base=base, rail=rail)
 
     def wiki_files(self, c):
         files = {}
@@ -3111,16 +3595,21 @@ class LibraryMixin:
             out.append("<li>%s</li>" % esc(story["series"] + (" #%s" % story["series_no"] if story.get("series_no") else "")))
         return '<ul class="facts">%s</ul>' % "".join(out)
 
-    def book_card(self, c, s, prefix):
+    def book_card(self, c, s, prefix, featured=False):
         src = self.cover_src(s, prefix)
         cover = ('<img class="cover" src="%s" alt="Cover of %s" loading="lazy">' % (attr(src), attr(s["title"]))
                  if src else '<span class="cover none">%s</span>' % esc(s["title"]))
         href = prefix + self.story_rel(s["slug"], c)
-        return ('<article class="book">\n<a href="%s" tabindex="-1" aria-hidden="true">%s</a>\n<div>\n<h2><a href="%s">%s</a></h2>\n%s%s%s</div>\n</article>'
-                % (attr(href), cover, attr(href), esc(s["title"]),
+        button = ""
+        if featured:
+            chs = ch_visible(s)
+            first = prefix + self.chapter_rel(s, chs[0], c) if s["kind"] == "chaptered" and chs else href
+            button = '<p><a class="read-button" href="%s">Start reading</a></p>\n' % attr(first)
+        return ('<article class="book%s">\n<a href="%s" tabindex="-1" aria-hidden="true">%s</a>\n<div>\n<h2><a href="%s">%s</a></h2>\n%s%s%s%s</div>\n</article>'
+                % (" featured" if featured else "", attr(href), cover, attr(href), esc(s["title"]),
                    '<p class="subtitle">%s</p>' % esc(s["subtitle"]) if s.get("subtitle") else "",
                    "<p>%s</p>" % esc(s["blurb"]) if s.get("blurb") else "",
-                   self.story_facts(c, s, prefix, self.story_words(s), len(ch_visible(s)))))
+                   self.story_facts(c, s, prefix, self.story_words(s), len(ch_visible(s))), button))
 
     def chapters_nav(self, c, story, prefix, current=None):
         author = story.get("author") or c["site"].get("author") or ""
@@ -3141,7 +3630,9 @@ class LibraryMixin:
             parts.append('<h1 class="page-title">%s</h1>' % esc(label))
         if body:
             parts.append('<div class="prose">%s</div>' % body)
-        cards = [self.book_card(c, s, prefix) for s in lib_visible(c)]
+        lay = layout_opt(c, "library")
+        cards = [self.book_card(c, s, prefix, featured=bool(lay.get("featured")) and n == 0) for n, s in enumerate(lib_visible(c))]
+        shelf_at = len(parts)
         parts.append('<h2 class="section-title">Stories</h2>\n<div class="shelf">\n%s\n</div>' % "\n".join(cards)
                      if cards else '<p class="empty">No stories yet.</p>')
         if site.get("lib_updates"):
@@ -3150,7 +3641,11 @@ class LibraryMixin:
                 lis = ['<li><a href="%s%s">%s</a><span class="when">%s, %s</span></li>'
                        % (prefix, self.chapter_rel(s, ch, c), esc(ch["title"]), esc(s["title"]), esc(nice_date(ch["date"])))
                        for s, ch in recent]
-                parts.append('<h2 class="section-title">Latest chapters</h2>\n<ul class="updates">\n%s\n</ul>' % "\n".join(lis))
+                updates = '<h2 class="section-title">Latest chapters</h2>\n<ul class="updates">\n%s\n</ul>' % "\n".join(lis)
+                if lay.get("updates_first"):
+                    parts.insert(shelf_at, updates)
+                else:
+                    parts.append(updates)
         parts.append("</main>")
         return self.doc(c, rel=rel, body_class=self.lib_classes(c, ["lib-home"]), title="" if rel == "index.html" else label,
                         main="\n".join(parts), full=True, desc=auto_summary(body) or site.get("description") or site.get("tagline"),
@@ -3165,8 +3660,9 @@ class LibraryMixin:
         chs = ch_visible(story)
         words = self.story_words(story)
         author = story.get("author") or site.get("author") or ""
-        head = ['<div class="story-head">']
+        lay = layout_opt(c, "library")
         src = self.cover_src(story, prefix)
+        head = ['<div class="story-head%s">' % ("" if src else " no-cover")]
         if src:
             head.append('<img class="cover" src="%s" alt="Cover of %s">' % (attr(src), attr(story["title"])))
         head.append('<div class="about">\n<h1>%s</h1>' % esc(story["title"]))
@@ -3201,10 +3697,15 @@ class LibraryMixin:
             else:
                 parts.append('<p class="empty">No chapters published yet.</p>')
         inner = '<div class="sheet">\n%s\n</div>' % "\n".join(parts)
-        if story["kind"] == "chaptered":
+        if story["kind"] == "chaptered" and lay.get("chapters") == "solo":
+            main = '<main id="main" class="solo">\n%s\n</main>' % inner
+        elif story["kind"] == "chaptered":
             main = self.sidebar_layout(self.chapters_nav(c, story, prefix), inner, button="Chapters")
         else:
             main = '<main id="main" class="wrap page-main">\n%s\n</main>' % inner
+        if lay.get("backdrop"):
+            main = ('<div class="story-backdrop" aria-hidden="true">%s</div>\n%s'
+                    % ('<img src="%s" alt="">' % attr(src) if src else "", main))
         return self.doc(c, rel=rel, body_class=self.lib_classes(c, ["lib-story", "story-" + story["slug"]]),
                         title=story["title"], desc=story.get("description") or story.get("blurb") or auto_summary(body),
                         main=main, full=True, og_type="article", image=story.get("cover"), current_mod="library",
@@ -3231,15 +3732,27 @@ class LibraryMixin:
             parts.append('<aside class="note prose">\n<h2>Author\u2019s note</h2>\n%s\n</aside>' % Markdown(prefix).render(ch["note"]))
         if n and n == len(chs) and story["status"] == "complete":
             parts.append('<p class="the-end">The end</p>')
+        lay = layout_opt(c, "library")
         pager = []
         if n > 1:
             pager.append('<a class="prev" href="%s.html"><small>Previous</small>%s</a>' % (attr(chs[n - 2]["slug"]), esc(chs[n - 2]["title"])))
+        if lay.get("pager_top"):
+            pager.append('<a class="index" href="index.html"><small>Story</small>Contents</a>')
         if n and n < len(chs):
             pager.append('<a class="next" href="%s.html"><small>Next</small>%s</a>' % (attr(chs[n]["slug"]), esc(chs[n]["title"])))
         if pager:
             parts.append('<nav class="pager" aria-label="Chapters">%s</nav>' % "".join(pager))
-        main = self.sidebar_layout(self.chapters_nav(c, story, prefix, ch["slug"]),
-                                   '<div class="sheet">\n%s\n</div>' % "\n".join(parts), button="Chapters")
+            if lay.get("pager_top"):
+                parts.insert(0, '<nav class="pager top" aria-label="Chapters">%s</nav>' % "".join(pager))
+        if lay.get("chapters") == "solo":
+            drop = ""
+            if lay.get("drop"):
+                drop = ('<details class="contents-drop"><summary>Contents</summary>\n%s\n</details>\n'
+                        % self.chapters_nav(c, story, prefix, ch["slug"]))
+            main = '<main id="main" class="solo">\n<div class="sheet">\n%s%s\n</div>\n</main>' % (drop, "\n".join(parts))
+        else:
+            main = self.sidebar_layout(self.chapters_nav(c, story, prefix, ch["slug"]),
+                                       '<div class="sheet">\n%s\n</div>' % "\n".join(parts), button="Chapters")
         return self.doc(c, rel=rel, body_class=self.lib_classes(c, ["lib-chapter", "story-" + story["slug"], "chapter-" + ch["slug"]]),
                         title="%s | %s" % (ch["title"], story["title"]), desc=auto_summary(body) or story.get("blurb", ""),
                         main=main, full=True, og_type="article", published=ch["date"], image=story.get("cover"),
@@ -3526,6 +4039,8 @@ class ImportMixin:
             self._import_wikigen(src, scfg, report, bool(d.get("settings")))
         else:
             self._import_storygen(src, scfg, report, bool(d.get("settings")))
+        if d.get("settings"):
+            self._import_layout(kind, scfg, report)
         copied = self._import_assets(src)
         if copied:
             report["notes"].append("Copied %d file(s) from assets/." % copied)
@@ -3544,6 +4059,21 @@ class ImportMixin:
         self.build()
         report["state"] = self.state()
         return report
+
+    def _import_layout(self, kind, scfg, report):
+        """Carry the layout the old tool used over to the matching SiteForge layout."""
+        old = str((scfg.get("site") or {}).get("layout") or "") if isinstance(scfg, dict) else ""
+        site = self.cfg["site"]
+        if kind == "sitegen" and old in ("sidebar", "magazine", "journal", "landing"):
+            site["layout"] = old
+            site["blog_layout"] = {"magazine": "magazine", "journal": "archive", "landing": "cards"}.get(old, "list")
+        elif kind == "wikigen" and old in ("docs", "handbook", "portal"):
+            site["wiki_layout"] = "right" if old == "portal" else old
+        elif kind == "storygen" and old in LAYOUTS["library"] and old != "classic":
+            site["lib_layout"] = old
+        else:
+            return
+        report["notes"].append("Matched the %s layout it used." % old.title())
 
     def _copy_site_settings(self, s, keys):
         for k in keys:
@@ -5092,7 +5622,7 @@ details.box .pad { max-width: none; }
     <span class="sep"></span>
     <button data-act="structure">Site structure</button>
     <button data-act="menu">Menu</button>
-    <button data-act="css">Edit CSS</button>
+    <button data-act="css">Layout and CSS</button>
     <button data-act="settings">Settings</button>
     <button data-act="rescan" id="b-rescan" title="Pick up .md files added outside the editor">Rescan files</button>
     <button data-act="publish">Publish</button>
@@ -5345,7 +5875,7 @@ function previewPayload() {
     case "story": return storyPayload();
     case "chapter": return { view: "chapter", story: $("#c-story").value, orig_story: view.story || "", orig_slug: view.slug || "",
       new_slug: $("#c-slug").value, title: $("#c-title").value, date: $("#c-date").value, note: $("#c-note").value, markdown: md() };
-    case "css": return { view: "css", target: $("#css-target").value, css: $("#css").value };
+    case "css": return { view: "css", target: $("#css-target").value, css: $("#css").value, layouts: layoutVals() };
     case "settings": return { view: "settings", target: "home", site: readSettings() };
     case "menu": return { view: "menu", target: "home", nav: S.nav };
   }
@@ -6162,6 +6692,8 @@ async function saveMenu() {
 /* ---------- css ---------- */
 const CSS_TPL = `
 <div class="fill">
+  <div class="bar" id="layout-bar"><strong>Layout</strong><span id="layout-picks" style="display:inline-flex;flex-wrap:wrap;gap:8px 14px"></span><button id="apply-layout">Use these layouts</button></div>
+  <div class="bar sub"><span class="hint" id="layout-desc"></span></div>
   <div class="bar"><label>Theme <select id="theme"></select></label><button id="apply-theme">Apply theme</button><span class="grow"></span><button id="css-save" class="primary">Save CSS</button></div>
   <div class="bar sub"><label>Preview <select id="css-target"></select></label><span class="grow"></span><button id="jump-global">Go to theme</button><button id="jump-pages">Go to your rules</button></div>
   <textarea id="css" class="code" spellcheck="false" wrap="off"></textarea>
@@ -6205,8 +6737,58 @@ async function openCss() {
   };
   $("#jump-global").addEventListener("click", () => jump("GLOBAL THEME"));
   $("#jump-pages").addEventListener("click", () => jump("PAGE SPECIFIC RULES"));
+  layoutPicker();
   renderSide();
   renderPreview();
+}
+
+const LAYOUT_AXES = [["site", "layout", "Site", null], ["blog", "blog_layout", "Blog", "blog"],
+  ["wiki", "wiki_layout", "Wiki", "wiki"], ["library", "lib_layout", "Stories", "library"]];
+
+function layoutVals() {
+  const out = {};
+  LAYOUT_AXES.forEach(([axis, key]) => { const sel = $("#lay-" + axis); if (sel) out[key] = sel.value; });
+  return out;
+}
+
+function layoutPicker() {
+  const box = $("#layout-picks");
+  const describe = (axis) => {
+    const sel = $("#lay-" + axis);
+    const l = S.layouts[axis].find((x) => x.id === sel.value);
+    const pending = LAYOUT_AXES.some(([a, key]) => $("#lay-" + a) && $("#lay-" + a).value !== S.site[key]);
+    $("#layout-desc").textContent = (l ? l.label + ": " + l.desc : "") + (pending ? " (Previewing, not saved yet.)" : "");
+  };
+  LAYOUT_AXES.forEach(([axis, key, label, mod]) => {
+    if (mod && !(S.modules[mod] && S.modules[mod].enabled)) return;
+    const name = mod ? (S.modules[mod].label || label) : label;
+    const sel = el("select", { id: "lay-" + axis });
+    S.layouts[axis].forEach((l) => sel.appendChild(el("option", { value: l.id, text: l.label })));
+    sel.value = S.site[key];
+    sel.addEventListener("change", () => {
+      describe(axis);
+      const tg = $("#css-target");
+      if (mod && !tg.value.startsWith(mod + ":")) {
+        const all = [...tg.options].map((o) => o.value).filter((v) => v.startsWith(mod + ":"));
+        const pick = (mod === "wiki" && all.find((v) => v.includes("/"))) || all[0];
+        if (pick) tg.value = pick;
+      }
+      renderPreview();
+    });
+    sel.addEventListener("focus", () => describe(axis));
+    const lab = el("label", {});
+    lab.append(name + " ", sel);
+    box.appendChild(lab);
+  });
+  describe("site");
+  $("#apply-layout").addEventListener("click", async () => {
+    try {
+      await api("PUT", "settings", layoutVals());
+      await refresh();
+      describe("site");
+      toast("Layouts saved");
+    } catch (e) { toast(e.message, "bad"); }
+  });
 }
 
 /* ---------- settings ---------- */
