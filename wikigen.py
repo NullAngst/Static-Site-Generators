@@ -1325,6 +1325,197 @@ PORTAL_DESC = ("A 1998 secure-system site: classification banners, a box of warn
                "bottom. Set its text, line breaks and colors in Settings under Secure portal layout. Pairs with the "
                "Secure portal theme.")
 
+# ----------------------------------------------------------------------------
+# Framed layout
+#
+# The Secure portal's page structure with none of its costume: an optional bar across the top,
+# an optional notice box, then one framed page with the title row on top (an image either side
+# if you want), the menu in a column on the left, the content on the right and the footer
+# along the bottom. Colors and fonts all come from the theme, so it reads as an ordinary site.
+# Its text and images are set in Settings under "Framed layout".
+# ----------------------------------------------------------------------------
+
+FRAME_TEXT = (("top_bar", 200), ("notice", 2000), ("left_image", 400), ("right_image", 400), ("nav_title", 60),
+              ("nav_note", 300))
+FRAME_DEFAULTS = {
+    "top_bar": "",
+    "bottom_bar": False,
+    "notice": "",
+    "left_image": "",
+    "right_image": "",
+    "nav_title": "Menu",
+    "nav_note": "",
+    "width": 960,
+}
+
+
+def clean_frame(d, current=None):
+    """Framed layout settings with every value checked."""
+    out = dict(FRAME_DEFAULTS)
+    if isinstance(current, dict):
+        out.update({k: v for k, v in current.items() if k in FRAME_DEFAULTS})
+    if isinstance(d, dict):
+        out.update({k: v for k, v in d.items() if k in FRAME_DEFAULTS})
+    for k, limit in FRAME_TEXT:
+        out[k] = str(out[k] if out[k] is not None else "").replace("\r\n", "\n").replace("\r", "\n")[:limit]
+    for k in ("left_image", "right_image"):
+        out[k] = out[k].strip()
+    out["bottom_bar"] = bool(out["bottom_bar"])
+    try:
+        out["width"] = max(640, min(1600, int(out["width"])))
+    except (TypeError, ValueError):
+        out["width"] = FRAME_DEFAULTS["width"]
+    return out
+
+
+def frame_vars_css(f):
+    return "\n/* Framed width, from Settings > Framed layout */\nbody.layout-frame { --pt-width: %dpx; }\n" % f["width"]
+
+
+def _frame_src(url, prefix):
+    """An image path from the settings as a src: a full web address as is, a site path made
+    relative to the page, anything else (other schemes) dropped."""
+    url = str(url or "").strip()
+    if not url:
+        return ""
+    if re.match(r"^https?://", url, re.I):
+        return url
+    if url.startswith("//") or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", url):
+        return ""
+    return prefix + url.lstrip("/")
+
+
+def frame_body(f, *, prefix, title, brand, nav, main, footer):
+    """The body of a Framed page. Same arguments as portal_body, plus prefix for image paths."""
+    out = []
+    bar = f["top_bar"].strip()
+    if bar:
+        out.append('<div class="pt-banner">%s</div>' % esc(bar))
+    lines = _portal_lines(f["notice"])
+    if lines:
+        out.append('<div class="pt-warn" role="note">\n%s\n</div>' % "\n".join("<p>%s</p>" % esc(ln) for ln in lines))
+    head = []
+    left, right = _frame_src(f["left_image"], prefix), _frame_src(f["right_image"], prefix)
+    if left:
+        head.append('<div class="pt-img left"><img src="%s" alt=""></div>' % attr(left))
+    head.append('<div class="pt-brand">%s</div>' % brand)
+    if right:
+        head.append('<div class="pt-img right"><img src="%s" alt=""></div>' % attr(right))
+    out.append('<div class="pt-frame">\n<header class="pt-head%s">\n%s\n</header>'
+               % ("" if left or right else " solo", "\n".join(head)))
+    side = ""
+    if nav.strip():
+        t = '<div class="pt-nav-title">%s</div>\n' % esc(f["nav_title"]) if f["nav_title"].strip() else ""
+        note = '\n<p class="pt-note">%s</p>' % esc(f["nav_note"]) if f["nav_note"].strip() else ""
+        side = '<aside class="pt-nav">\n%s%s%s\n</aside>\n' % (t, nav, note)
+    out.append('<div class="pt-body%s">\n%s<div class="pt-main">\n%s\n</div>\n</div>'
+               % ("" if side else " no-nav", side, main))
+    if footer.strip():
+        out.append('<div class="pt-foot">\n%s\n</div>' % footer)
+    out.append("</div>")
+    if bar and f["bottom_bar"]:
+        out.append('<div class="pt-banner bottom">%s</div>' % esc(bar))
+    return "\n".join(out)
+
+
+def special_body(lid, site, prefix, **kw):
+    """The body for the Secure portal and Framed layouts, which build their own page frame."""
+    if lid == "frame":
+        return frame_body(clean_frame(site.get("frame")), prefix=prefix, **kw)
+    return portal_body(clean_portal(site.get("secure")), **kw)
+
+
+SPECIAL_LAYOUTS = ("secure", "frame")
+
+FRAME_CSS = """
+/* Site layout, Framed: one framed page with the menu in a column on the left. Theme colors only. */
+body.layout-frame { --pt-frame: var(--border); --pt-visited: var(--accent); --pt-highlight: var(--accent); padding-bottom: 1.5rem; }
+body.layout-frame .pt-banner {
+  background: var(--accent); color: var(--surface); text-align: center;
+  font: 600 0.8125rem/1.4 var(--font-ui); letter-spacing: 0.04em; padding: 0.4rem 0.75rem;
+}
+body.layout-frame .pt-banner.bottom { margin-top: 1.5rem; }
+body.layout-frame .pt-warn, body.layout-frame .pt-frame { width: min(var(--pt-width), calc(100% - 2rem)); margin: 1.5rem auto 0; }
+body.layout-frame .pt-warn {
+  padding: 0.75rem 1rem; background: var(--surface); color: var(--text); text-align: center;
+  font: 0.9375rem/1.55 var(--font-ui); border: 1px solid var(--border); border-bottom: 0;
+}
+body.layout-frame .pt-warn p { margin: 0; }
+body.layout-frame .pt-warn p:first-child { font-weight: 600; }
+body.layout-frame .pt-warn + .pt-frame { margin-top: 0; }
+body.layout-frame .pt-frame {
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  box-shadow: 0 18px 40px -30px rgba(0, 0, 0, 0.45);
+}
+body.layout-frame .pt-head {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 1rem;
+  padding: 1.25rem 1.25rem; background: var(--header-bg); color: var(--header-text); border-bottom: 1px solid var(--border);
+}
+body.layout-frame .pt-head.solo { grid-template-columns: minmax(0, 1fr); }
+body.layout-frame .pt-brand { grid-column: 2; text-align: center; min-width: 0; }
+body.layout-frame .pt-head.solo .pt-brand { grid-column: 1; }
+body.layout-frame .pt-brand .site-title {
+  display: inline-block; font-family: var(--font-heading); font-weight: var(--heading-weight, 700);
+  font-size: clamp(1.45rem, 3.4vw, 2.1rem); line-height: 1.15; color: var(--header-text); text-decoration: none;
+  text-transform: var(--heading-transform, none); letter-spacing: var(--letter-spacing, 0); overflow-wrap: anywhere;
+}
+body.layout-frame .pt-brand .tagline { display: block; margin: 0.4rem 0 0; color: var(--muted); }
+body.layout-frame .pt-img { min-width: 0; }
+body.layout-frame .pt-img.left { grid-column: 1; justify-self: start; }
+body.layout-frame .pt-img.right { grid-column: 3; justify-self: end; }
+body.layout-frame .pt-img img { display: block; max-width: 160px; max-height: 96px; width: auto; height: auto; }
+body.layout-frame .pt-body { display: grid; grid-template-columns: 12rem minmax(0, 1fr); align-items: stretch; }
+body.layout-frame .pt-body.no-nav { grid-template-columns: minmax(0, 1fr); }
+body.layout-frame .pt-nav {
+  min-width: 0; padding: 1.1rem 0.85rem; background: var(--sidebar-bg); color: var(--sidebar-text);
+  border-right: 1px solid var(--border); font: 0.9rem/1.45 var(--font-ui);
+}
+body.layout-frame .pt-nav-title {
+  margin: 0 0 0.6rem; padding: 0 0.6rem 0.35rem; border-bottom: 1px solid var(--border);
+  color: var(--muted); font: 600 0.75rem/1.3 var(--font-ui); letter-spacing: 0.08em; text-transform: uppercase;
+}
+body.layout-frame .pt-nav .site-nav { display: block; width: auto; margin: 0; font: inherit; }
+body.layout-frame .pt-nav .site-nav ul { display: block; margin: 0; padding: 0; list-style: none; }
+body.layout-frame .pt-nav .site-nav li { margin: 0 0 0.1rem; }
+body.layout-frame .pt-nav .site-nav a {
+  display: block; padding: 0.35rem 0.6rem; border: 0; border-left: 3px solid transparent;
+  border-radius: 0 var(--radius) var(--radius) 0; color: var(--sidebar-text); text-decoration: none; background: none;
+}
+body.layout-frame .pt-nav .site-nav a:hover { background: var(--sidebar-active); }
+body.layout-frame .pt-nav .site-nav a[aria-current="page"], body.layout-frame .pt-nav .site-nav a.active {
+  color: var(--accent); border-left-color: var(--accent); background: var(--sidebar-active); font-weight: 600;
+}
+body.layout-frame .pt-body .pt-nav .sidebar a, body.layout-frame .pt-body .pt-nav .sidebar a:visited { color: var(--sidebar-text); }
+body.layout-frame .pt-body .pt-nav .sidebar a[aria-current="page"] { color: var(--accent); background: var(--sidebar-active); }
+body.layout-frame .pt-note { margin: 1.1rem 0 0; padding: 0 0.6rem; font-size: 0.75rem; color: var(--muted); }
+body.layout-frame .pt-main { min-width: 0; padding: 1.5rem 1.75rem 1.75rem; }
+body.layout-frame .pt-foot {
+  padding: 1rem 1.25rem; border-top: 1px solid var(--border); background: var(--header-bg); color: var(--muted);
+  text-align: center; font: 0.85rem/1.5 var(--font-ui);
+}
+body.layout-frame .pt-foot .site-footer { margin: 0; padding: 0; border: 0; background: none; color: var(--muted); }
+body.layout-frame .pt-foot .site-footer > * { max-width: none; margin: 0; padding: 0; }
+body.layout-frame .pt-foot .site-footer p { margin: 0; }
+@media (max-width: 720px) {
+  body.layout-frame .pt-head { grid-template-columns: minmax(0, 1fr); }
+  body.layout-frame .pt-brand { grid-column: 1; }
+  body.layout-frame .pt-img { display: none; }
+  body.layout-frame .pt-body { display: block; }
+  body.layout-frame .pt-nav { border-right: 0; border-bottom: 1px solid var(--border); }
+  body.layout-frame .pt-main { padding: 1rem; }
+}
+@media print {
+  body.layout-frame .pt-banner, body.layout-frame .pt-warn, body.layout-frame .pt-nav { display: none; }
+  body.layout-frame .pt-frame { border: 0; width: auto; box-shadow: none; }
+}
+"""
+
+FRAME_DESC = ("The Secure portal's page structure with an ordinary look: an optional bar across the top and notice "
+              "box, then one framed page with the title row on top, the menu in a column on the left and the footer "
+              "along the bottom. Colors and fonts come from the theme. Set its text and images in Settings under "
+              "Framed layout.")
+
+
 SECURE_TOOL_CSS = """
 /* WikiGen pages inside the Secure portal frame: the wiki sidebar is the menu column */
 body.layout-secure .pt-body { grid-template-columns: 15rem minmax(0, 1fr); }
@@ -1355,6 +1546,8 @@ LAYOUTS = {
     "portal": {"label": "Portal", "search": "top", "hero": True, "css": LAYOUT_PORTAL_CSS,
                "desc": "The home page opens with a big search box over the section cards. Other pages keep the sections on the right."},
     "secure": {"label": "Secure portal", "search": "side", "css": PORTAL_CSS + SECURE_TOOL_CSS, "desc": PORTAL_DESC},
+    "frame": {"label": "Framed", "search": "side", "css": FRAME_CSS + SECURE_TOOL_CSS.replace("layout-secure", "layout-frame"),
+              "desc": FRAME_DESC},
 }
 DEFAULT_LAYOUT = "classic"
 
@@ -1376,9 +1569,11 @@ def _layout_css_base(lid):
 
 def layout_css(lid, cfg=None):
     text = _layout_css_base(lid)
+    site = cfg.get("site") if isinstance(cfg, dict) and isinstance(cfg.get("site"), dict) else {}
     if lid == "secure":
-        site = cfg.get("site") if isinstance(cfg, dict) and isinstance(cfg.get("site"), dict) else {}
         text += portal_vars_css(clean_portal(site.get("secure")))
+    elif lid == "frame":
+        text += frame_vars_css(clean_frame(site.get("frame")))
     return text
 
 
@@ -1610,6 +1805,7 @@ class Wiki:
         for k, v in d["site"].items():
             c["site"].setdefault(k, v)
         c["site"]["secure"] = clean_portal(c["site"].get("secure"))
+        c["site"]["frame"] = clean_frame(c["site"].get("frame"))
         if c["site"].get("search") not in SEARCH_MODES:
             c["site"]["search"] = "builtin"
         if not isinstance(c.get("generated"), list):
@@ -1641,6 +1837,7 @@ class Wiki:
             "folder": str(self.root),
             "site": self.cfg["site"],
             "secure_defaults": PORTAL_DEFAULTS,
+            "frame_defaults": FRAME_DEFAULTS,
             "sections": self.cfg["sections"],
             "themes": theme_list(),
             "layouts": layout_list(),
@@ -1893,9 +2090,9 @@ class Wiki:
                     '<div class="content">\n%s\n</div>\n</main>' % (rail_html, main_html))
         else:
             main = '<main class="main" id="content">\n<div class="content">\n%s\n</div>\n</main>' % main_html
-        if lid == "secure":
+        if lid in SPECIAL_LAYOUTS:
             brand = '<a class="site-title" href="%sindex.html">%s</a>%s' % (prefix, esc(st), tagline)
-            inner = portal_body(clean_portal(site.get("secure")), title=st, brand=brand, nav=sidebar_html,
+            inner = special_body(lid, site, prefix, title=st, brand=brand, nav=sidebar_html,
                                 main=hero_html + main, footer=footer)
             return ('<!DOCTYPE html>\n<html lang="%s">\n<head>\n%s\n</head>\n<body class="%s">\n'
                     '<a class="skip" href="#content">Skip to content</a>\n%s\n</body>\n</html>\n'
@@ -2303,6 +2500,8 @@ class Wiki:
                 out[k] = bool(d[k])
         if isinstance(d.get("secure"), dict):
             out["secure"] = clean_portal(d["secure"], current.get("secure"))
+        if isinstance(d.get("frame"), dict):
+            out["frame"] = clean_frame(d["frame"], current.get("frame"))
         out["title"] = out.get("title") or current.get("title") or "My wiki"
         out["lang"] = out.get("lang") or "en"
         return out
@@ -4553,6 +4752,57 @@ function layoutPicker() {
   });
 }
 
+/* ---------- framed layout settings ---------- */
+const FR_TEXT = ["top_bar", "notice", "left_image", "right_image", "nav_title", "nav_note"];
+const FRAME_TPL = `
+<fieldset id="fr-box"><legend>Framed layout</legend>
+  <details id="fr-more"><summary>Settings for the Framed layout</summary>
+  <p class="hint">These apply when the layout is Framed, which you pick under Layout and CSS. It has the same page structure as Secure portal, with the colors and fonts from your theme. Leave a box empty to hide that part of the page.</p>
+  <label class="field">Bar across the top <input id="fr-top_bar" maxlength="200" placeholder="An announcement, a motto, or leave empty"></label>
+  <label><input type="checkbox" id="fr-bottom_bar"> Repeat the bar at the bottom of the page</label>
+  <label class="field">Notice box <textarea id="fr-notice" rows="4"></textarea><span class="hint">Shown above the page. Each line here is its own line, and the first one is bold. Blank lines are skipped.</span></label>
+  <label class="field">Image left of the title <input id="fr-left_image" maxlength="400" placeholder="assets/logo.png or a full URL"></label>
+  <label class="field">Image right of the title <input id="fr-right_image" maxlength="400" placeholder="assets/badge.png or a full URL"><span class="hint">Shown up to 160 by 96 pixels. Hidden on phones.</span></label>
+  <label class="field">Menu heading <input id="fr-nav_title" maxlength="60"></label>
+  <label class="field">Note under the menu <textarea id="fr-nav_note" rows="2"></textarea></label>
+  <label class="field">Frame width in pixels <input type="number" id="fr-width" min="640" max="1600" step="10" style="max-width:120px"></label>
+  <p><button type="button" id="fr-reset">Reset these settings</button></p>
+  </details>
+</fieldset>`;
+
+function frameFieldset() { return FRAME_TPL; }
+
+function frameFill(f) {
+  f = f || {};
+  const g = (k) => document.getElementById("fr-" + k);
+  FR_TEXT.forEach((k) => { if (g(k)) g(k).value = f[k] == null ? "" : f[k]; });
+  if (g("bottom_bar")) g("bottom_bar").checked = !!f.bottom_bar;
+  if (g("width")) g("width").value = f.width || 960;
+}
+
+function frameRead() {
+  const g = (k) => document.getElementById("fr-" + k);
+  if (!g("top_bar")) return undefined;
+  const o = {};
+  FR_TEXT.forEach((k) => { o[k] = g(k).value; });
+  o.bottom_bar = g("bottom_bar").checked;
+  o.width = parseInt(g("width").value, 10) || 960;
+  return o;
+}
+
+function frameWire(onChange) {
+  const box = document.getElementById("fr-box");
+  if (!box) return;
+  frameFill(S.site.frame || S.frame_defaults);
+  document.getElementById("fr-more").open = S.site.layout === "frame";
+  box.querySelectorAll("input, textarea").forEach((i) => i.addEventListener(i.type === "checkbox" ? "change" : "input", onChange));
+  document.getElementById("fr-reset").addEventListener("click", () => {
+    if (!window.confirm("Put every Framed setting back to its default? Save settings afterwards to keep it.")) return;
+    frameFill(S.frame_defaults);
+    onChange();
+  });
+}
+
 /* ---------- portal layout settings ---------- */
 const PT_COLORS = [["banner_bg", "Banner background"], ["banner_line", "Banner edges"], ["banner_text", "Banner text"],
   ["warn_text", "Warning text"], ["heading", "Headings and bullets"], ["highlight", "Highlights"],
@@ -4561,8 +4811,9 @@ const PT_TEXT = ["banner", "warning", "seal_text", "seal_caption", "nav_title", 
   "counter_label", "counter", "counter_note", "badges"];
 const PT_BOOL = ["banner_bottom", "warning_big", "blink", "chrome", "flag", "seal"];
 const PORTAL_TPL = `
-<style>#pt-box{margin:18px 0 0;padding:10px 14px 14px;border:1px solid rgba(127,127,127,.4);border-radius:8px}#pt-box legend{font-weight:600;padding:0 4px}#pt-box>label:not(.field){display:block;margin:6px 0}#pt-box textarea{display:block;width:100%;box-sizing:border-box;padding:6px 8px;border-radius:6px;font:inherit}#pt-box .field{display:block;margin:10px 0}</style>
+<style>#pt-box,#fr-box{margin:18px 0 0;padding:10px 14px 14px;border:1px solid rgba(127,127,127,.4);border-radius:8px}#pt-box legend,#fr-box legend{font-weight:600;padding:0 4px}#pt-box summary,#fr-box summary{cursor:pointer;margin:2px 0 4px}#pt-box details>label:not(.field),#fr-box details>label:not(.field){display:block;margin:6px 0}#pt-box textarea,#fr-box textarea{display:block;width:100%;box-sizing:border-box;padding:6px 8px;border-radius:6px;font:inherit}#pt-box .field,#fr-box .field{display:block;margin:10px 0}</style>
 <fieldset id="pt-box"><legend>Secure portal layout</legend>
+  <details id="pt-more"><summary>Settings for the Secure portal layout</summary>
   <p class="hint">These apply when the layout is Secure portal, which you pick under Layout and CSS. Leave a box empty to hide that part of the page.</p>
   <label class="field">Classification banner <input id="pt-banner" maxlength="200"></label>
   <label><input type="checkbox" id="pt-banner_bottom"> Repeat the banner at the bottom of the page</label>
@@ -4586,6 +4837,7 @@ const PORTAL_TPL = `
   <div class="field"><span>Colors</span><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:6px 14px;margin-top:4px">PTCOLORS</div>
   <span class="hint">The page, panel, text, link and font colors come from the theme. The Secure portal theme is the one this layout was made with.</span></div>
   <p><button type="button" id="pt-reset">Reset these settings</button></p>
+  </details>
 </fieldset>`;
 
 function portalFieldset() {
@@ -4617,6 +4869,7 @@ function portalWire(onChange) {
   const box = document.getElementById("pt-box");
   if (!box) return;
   portalFill(S.site.secure || S.secure_defaults);
+  document.getElementById("pt-more").open = S.site.layout === "secure";
   box.querySelectorAll("input, textarea").forEach((i) => i.addEventListener(i.type === "checkbox" ? "change" : "input", onChange));
   document.getElementById("pt-reset").addEventListener("click", () => {
     if (!window.confirm("Put every Secure portal setting back to its default? Save settings afterwards to keep it.")) return;
@@ -4701,6 +4954,7 @@ function readSettings() {
     footer: $("#st-footer").value, author: $("#st-author").value, lang: $("#st-lang").value, url: $("#st-url").value,
     search: ($("input[name=st-search]:checked") || { value: "builtin" }).value,
     secure: portalRead(),
+    frame: frameRead(),
   };
   BOOLS.forEach((k) => { o[k] = $("#st-" + k).checked; });
   return o;
@@ -4708,8 +4962,9 @@ function readSettings() {
 
 async function openSettings() {
   view = { type: "settings" };
-  $("#left").innerHTML = SET_TPL.replace("PORTALBOX", portalFieldset());
+  $("#left").innerHTML = SET_TPL.replace("PORTALBOX", portalFieldset() + frameFieldset());
   portalWire(markDirty);
+  frameWire(markDirty);
   const s = S.site;
   ["title", "tagline", "description", "footer", "author", "lang", "url"].forEach((k) => { $("#st-" + k).value = s[k] || ""; });
   BOOLS.forEach((k) => { $("#st-" + k).checked = !!s[k]; });

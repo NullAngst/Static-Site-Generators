@@ -161,7 +161,7 @@ Pick layouts under **Layout and CSS**. The preview updates as you change the dro
 
 | Choice | Layouts |
 |---|---|
-| Site | **Classic**, **Sidebar** (title and menu in a fixed left column), **Magazine** (big centered masthead over a ruled menu bar), **Journal** (no panels, narrow column, small header), **Landing** (tinted hero with the menu on top, raised panels), **Secure portal** (a 1998 secure-system site, see below) |
+| Site | **Classic**, **Sidebar** (title and menu in a fixed left column), **Magazine** (big centered masthead over a ruled menu bar), **Journal** (no panels, narrow column, small header), **Landing** (tinted hero with the menu on top, raised panels), **Secure portal** (a 1998 secure-system site, see below), **Framed** (the Secure portal's page structure with an ordinary look, see below) |
 | Blog | **List**, **Cards** (grid with each post's image), **Magazine** (cards with the newest post featured, post pages open with their image), **Archive** (one line per post, grouped by year) |
 | Wiki | **Classic**, **Docs** (quiet sidebar, open articles, table of contents in a right-hand rail), **Handbook** (search and sections as a menu bar of dropdowns), **Right sidebar** |
 | Stories | **Classic**, **Book** (paper pages with a Contents dropdown, no sidebar), **Bookshelf** (cover wall, chapters as tiles), **Serial** (latest chapters first, navigation above and below each chapter), **Spotlight** (first story featured, story pages open on a blurred cover) |
@@ -190,7 +190,23 @@ Everything it shows is set in **Settings** under **Secure portal layout**, and t
 
 **Reset these settings** puts every value back to the default. The webring links all point to `#`, the same as half the links on any real 1998 site.
 
+Its settings sit in a section that opens by itself when Secure portal is the layout in use, and stays folded otherwise.
+
 In the wiki and the library, the wiki sidebar and the chapter list move into a box above the article, since there is no room for two columns inside the frame. WikiGen puts its sidebar, search included, in the menu column instead. WikiGen's older **Portal** layout, the one with the big search box, is a different layout and is unchanged.
+
+### Framed
+
+Framed keeps where everything sits in Secure portal and drops the costume. From top to bottom: an optional bar across the page, an optional notice box, then one framed page with the title row on top, the menu in a column on the left, your content on the right and the footer along the bottom. There are no banners, flag, seal, blinking, webring, counter or badges, and every color and font comes from the theme, so it works as an ordinary site with any of the 27 themes.
+
+Set it in **Settings** under **Framed layout**:
+
+- **Bar across the top**, and whether it repeats at the bottom. Empty hides it.
+- **Notice box:** each line is its own line, and the first one is bold. Empty hides it.
+- **Images left and right of the title**, as `assets/...` paths or full web addresses. They show at up to 160 by 96 pixels and are hidden on phones.
+- **Menu heading** and a **note under the menu**.
+- **Frame width** in pixels.
+
+It is in all four tools, handles wiki sidebars and chapter lists the same way Secure portal does, and SiteForge keeps it and its settings when importing a site from one of the other three.
 
 ## Output
 
@@ -226,7 +242,7 @@ Pages and a blog, with no JavaScript in the output.
 - **SEO:** per-page and per-post fields with a live search-result preview, site-wide defaults, `sitemap.xml` and `robots.txt`.
 - **Menu:** an editor that hides pages without deleting them and adds custom links.
 - **Themes:** all 27 (Site group first) and a CSS editor.
-- **Layouts:** Classic, Sidebar, Magazine (card feed with a featured post and post images), Journal (dated archive by year), Landing (hero band, raised panels, card feed) and Secure portal.
+- **Layouts:** Classic, Sidebar, Magazine (card feed with a featured post and post images), Journal (dated archive by year), Landing (hero band, raised panels, card feed), Secure portal and Framed.
 
 Output: pages at the root, and posts and tag pages under `blog/`. Sources are in `.sitegen/`.
 
@@ -240,7 +256,7 @@ A wiki: the site title across the top, a left sidebar with search and one dropdo
 - **Workflow:** drafts, plus rescanning Markdown written in another editor.
 - **Search:** three modes, set in Settings. **Built-in** is instant, via one generated `search.js`. **Web** is a DuckDuckGo form limited to your domain, with no JavaScript. **Off** means the site contains no JavaScript at all. Built-in search indexes the first 8,000 characters of each article.
 - **Themes:** all 27 (Wiki group first).
-- **Layouts:** Classic, Docs (search in the top bar, contents in a right rail), Handbook (sections as a dropdown menu bar, centered column), Rail (no top bar, dark full-height rail), Portal (home page hero with a big search box, sections on the right) and Secure portal (the sidebar becomes the menu column).
+- **Layouts:** Classic, Docs (search in the top bar, contents in a right rail), Handbook (sections as a dropdown menu bar, centered column), Rail (no top bar, dark full-height rail), Portal (home page hero with a big search box, sections on the right), Secure portal and Framed (in both, the sidebar becomes the menu column).
 
 Output: `index.html`, then `<section>/index.html` and `<section>/<article>.html`. Sources are in `.wikigen/`.
 
@@ -254,7 +270,7 @@ Fiction sites, with no JavaScript in the output.
 - **Typography:** indented or spaced paragraphs, optional drop capitals, `* * *` scene breaks, and reading time estimates.
 - **Also:** genre pages, drafts, extra pages, and an RSS feed of new chapters.
 - **Themes:** all 27 (Reading group first).
-- **Layouts:** Classic, Book, Bookshelf, Serial and Spotlight, the same set as SiteForge's Stories layouts, plus Secure portal.
+- **Layouts:** Classic, Book, Bookshelf, Serial and Spotlight, the same set as SiteForge's Stories layouts, plus Secure portal and Framed.
 
 Output: `index.html`, then `<story>/index.html` and `<story>/<chapter>.html`, plus `genre/`. Sources are in `.storygen/`.
 
