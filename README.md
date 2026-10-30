@@ -66,7 +66,7 @@ A new folder opens a setup screen, where you choose:
 
 - **What the homepage is:** a page you write, a blog feed, a wiki, or a book list.
 - **What else to switch on:** any of Blog, Wiki and Library.
-- **A theme**, from 26 in three groups.
+- **A theme**, from 27 in four groups.
 - **Optionally, an existing SiteGen, WikiGen or StoryGen site to import.**
 
 All of it can be changed later in **Site structure**.
@@ -142,15 +142,16 @@ From all three, images in `assets/` are copied. The site title, URL and similar 
 
 ## Themes
 
-All 26 themes from the standalone tools are included, in three groups:
+All 26 themes from the standalone tools are included, plus one more, in four groups:
 
 - **Site themes:** Clean light, Midnight, Terminal, Paper, Nord, Neon night, Solarized light, Minimal serif.
 - **Wiki themes:** Clean light, Classic wiki, Slate dark, Nord, Gruvbox dark, Dracula, Solarized light, Paper, Terminal.
 - **Reading themes:** Paperback, Night reading, Parchment, Manuscript, Ink on white, Midnight blue, Sepia, Noir, Pulp.
+- **Retro themes:** Secure portal, the dark gray, red and phosphor palette the Secure portal layout was made with.
 
 The standalone tools each used their own set of CSS variables, so SiteForge converts every theme to one shared set. Each theme's colours and fonts carry over exactly, and anything a theme never defined is derived from its own palette, such as a sidebar colour for a blog theme. Any theme therefore styles every module.
 
-SiteGen, WikiGen and StoryGen now ship the same 26 themes too, with the same values, so a palette looks the same whichever tool you use. Each tool lists its own group first and keeps the short theme names it always had.
+SiteGen, WikiGen and StoryGen now ship the same 27 themes too, with the same values, so a palette looks the same whichever tool you use. Each tool lists its own group first and keeps the short theme names it always had.
 
 ## Layouts
 
@@ -160,7 +161,7 @@ Pick layouts under **Layout and CSS**. The preview updates as you change the dro
 
 | Choice | Layouts |
 |---|---|
-| Site | **Classic**, **Sidebar** (title and menu in a fixed left column), **Magazine** (big centered masthead over a ruled menu bar), **Journal** (no panels, narrow column, small header), **Landing** (tinted hero with the menu on top, raised panels) |
+| Site | **Classic**, **Sidebar** (title and menu in a fixed left column), **Magazine** (big centered masthead over a ruled menu bar), **Journal** (no panels, narrow column, small header), **Landing** (tinted hero with the menu on top, raised panels), **Secure portal** (a 1998 secure-system site, see below) |
 | Blog | **List**, **Cards** (grid with each post's image), **Magazine** (cards with the newest post featured, post pages open with their image), **Archive** (one line per post, grouped by year) |
 | Wiki | **Classic**, **Docs** (quiet sidebar, open articles, table of contents in a right-hand rail), **Handbook** (search and sections as a menu bar of dropdowns), **Right sidebar** |
 | Stories | **Classic**, **Book** (paper pages with a Contents dropdown, no sidebar), **Bookshelf** (cover wall, chapters as tiles), **Serial** (latest chapters first, navigation above and below each chapter), **Spotlight** (first story featured, story pages open on a blurred cover) |
@@ -170,6 +171,26 @@ The post image for cards and the post hero is the post's social image field, so 
 How it works: the layout's rules are written to `layout.css` on every build, and every page loads it before `style.css`. Layout rules start with a body class such as `body.layout-magazine` or `body.wiki-layout-docs`, so they outrank the base styles in your `style.css`, while a rule you write in `style.css` with the same weight still wins because it loads later. Do not edit `layout.css`; it is rewritten every build.
 
 Classic is the default, and an existing site keeps its old look until you pick something else. The only change to its pages is the extra `layout.css` link and a few body classes.
+
+### Secure portal
+
+Secure portal turns the site into a late-90s page for a secret government office you weren't supposed to find. Red classification banners sit at the top and bottom, a box of warning lines sits over a framed page, the title gets a chrome gradient between a waving flag and a seal, the menu runs down a column on the left, and the bottom has a webring, a hit counter and 88x31 badges. Headings go red, code blocks go phosphor green and blockquotes become dashed alert boxes, so a trace log is just a fenced code block. It is HTML and CSS only, like every other layout.
+
+It is a site layout, so it exists in all four tools. Pick it under **Layout and CSS**, and pair it with the **Secure portal** theme for the look it was made with. Any other theme works too: the theme still sets the page, panel, text, link and font colors.
+
+Everything it shows is set in **Settings** under **Secure portal layout**, and the preview updates as you type:
+
+- **Classification banner**, and whether it repeats at the bottom.
+- **Warning box:** each line in the box is its own line on the page, so the line breaks are yours. The first line can be larger and can blink.
+- **Title row:** chrome gradient on or off, the flag, the seal, up to three lines of seal text and the caption under it. Empty seal text uses SEAL OF, a star and the site's initials.
+- **Menu column:** its heading and the note under it.
+- **Under construction strip**, **webring name**, **hit counter** (label, digits and the text after them) and **badges**, one per line. Leave any of these empty to hide it.
+- **Frame width** in pixels.
+- **Colors** for the banner background, edges and text, the warning text, headings and bullets, highlights, visited links, code text and frame lines.
+
+**Reset these settings** puts every value back to the default. The webring links all point to `#`, the same as half the links on any real 1998 site.
+
+In the wiki and the library, the wiki sidebar and the chapter list move into a box above the article, since there is no room for two columns inside the frame. WikiGen puts its sidebar, search included, in the menu column instead. WikiGen's older **Portal** layout, the one with the big search box, is a different layout and is unchanged.
 
 ## Output
 
@@ -204,8 +225,8 @@ Pages and a blog, with no JavaScript in the output.
 - **Blog:** a feed page, posts with drafts and publishing, tags with tag pages, and an RSS feed at `/rss` and `/rss.xml`.
 - **SEO:** per-page and per-post fields with a live search-result preview, site-wide defaults, `sitemap.xml` and `robots.txt`.
 - **Menu:** an editor that hides pages without deleting them and adds custom links.
-- **Themes:** all 26 (Site group first) and a CSS editor.
-- **Layouts:** Classic, Sidebar, Magazine (card feed with a featured post and post images), Journal (dated archive by year) and Landing (hero band, raised panels, card feed).
+- **Themes:** all 27 (Site group first) and a CSS editor.
+- **Layouts:** Classic, Sidebar, Magazine (card feed with a featured post and post images), Journal (dated archive by year), Landing (hero band, raised panels, card feed) and Secure portal.
 
 Output: pages at the root, and posts and tag pages under `blog/`. Sources are in `.sitegen/`.
 
@@ -218,8 +239,8 @@ A wiki: the site title across the top, a left sidebar with search and one dropdo
 - **Markdown extras:** `[[wiki links]]` between articles and callout boxes.
 - **Workflow:** drafts, plus rescanning Markdown written in another editor.
 - **Search:** three modes, set in Settings. **Built-in** is instant, via one generated `search.js`. **Web** is a DuckDuckGo form limited to your domain, with no JavaScript. **Off** means the site contains no JavaScript at all. Built-in search indexes the first 8,000 characters of each article.
-- **Themes:** all 26 (Wiki group first).
-- **Layouts:** Classic, Docs (search in the top bar, contents in a right rail), Handbook (sections as a dropdown menu bar, centered column), Rail (no top bar, dark full-height rail) and Portal (home page hero with a big search box, sections on the right).
+- **Themes:** all 27 (Wiki group first).
+- **Layouts:** Classic, Docs (search in the top bar, contents in a right rail), Handbook (sections as a dropdown menu bar, centered column), Rail (no top bar, dark full-height rail), Portal (home page hero with a big search box, sections on the right) and Secure portal (the sidebar becomes the menu column).
 
 Output: `index.html`, then `<section>/index.html` and `<section>/<article>.html`. Sources are in `.wikigen/`.
 
@@ -232,8 +253,8 @@ Fiction sites, with no JavaScript in the output.
 - **Chapter pages:** the chapter list in a sidebar, numbering, previous and next links, and author's notes.
 - **Typography:** indented or spaced paragraphs, optional drop capitals, `* * *` scene breaks, and reading time estimates.
 - **Also:** genre pages, drafts, extra pages, and an RSS feed of new chapters.
-- **Themes:** all 26 (Reading group first).
-- **Layouts:** Classic, Book, Bookshelf, Serial and Spotlight, the same set as SiteForge's Stories layouts.
+- **Themes:** all 27 (Reading group first).
+- **Layouts:** Classic, Book, Bookshelf, Serial and Spotlight, the same set as SiteForge's Stories layouts, plus Secure portal.
 
 Output: `index.html`, then `<story>/index.html` and `<story>/<chapter>.html`, plus `genre/`. Sources are in `.storygen/`.
 
@@ -254,7 +275,7 @@ Links and images use paths from the site root, such as `about.html` or `assets/p
 
 ## Layout and CSS
 
-**Layout and CSS** (formerly Edit CSS) has the layout picker at the top, then the theme variables at the top of `style.css` and your own rules at the bottom, with a list of the body classes you can target to style one page or one section. None of the tools overwrites `style.css`; **Apply theme** only replaces the variables block. `layout.css` belongs to the tool and is rewritten on every build, see [Layouts](#layouts).
+**Layout and CSS** (formerly Edit CSS) has the layout picker at the top, then the theme variables at the top of `style.css` and your own rules at the bottom, with a list of the body classes you can target to style one page or one section. None of the tools overwrites `style.css`; **Apply theme** only replaces the variables block. Picking a theme in the dropdown previews it straight away without touching your CSS, and **Apply theme** is what writes it in. The dropdown starts on the theme your stylesheet already uses. `layout.css` belongs to the tool and is rewritten on every build, see [Layouts](#layouts).
 
 ## Publishing to a server
 

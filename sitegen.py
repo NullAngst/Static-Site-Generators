@@ -637,9 +637,10 @@ ALL_THEMES = {
     "book-sepia": ("Sepia", "Reading", {"bg": "#efe3d0", "bg-image": "none", "surface": "#f9f0e1", "surface-opacity": "1", "text": "#3b2f22", "muted": "#7b6a55", "accent": "#9a4f24", "border": "#dac9ae", "code-bg": "#eadcc4", "header-bg": "#f9f0e1", "header-text": "#3b2f22", "sidebar-bg": "#ecdfca", "sidebar-text": "#453726", "sidebar-active": "#e0cfb2", "font-body": "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "4px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
     "book-noir": ("Noir", "Reading", {"bg": "#0c0c0d", "bg-image": "none", "surface": "#141415", "surface-opacity": "1", "text": "#e8e6e3", "muted": "#8e8b86", "accent": "#c3453b", "border": "#27272a", "code-bg": "#0a0a0b", "header-bg": "#0c0c0d", "header-text": "#e8e6e3", "sidebar-bg": "#0f0f10", "sidebar-text": "#cfcdc9", "sidebar-active": "#1d1d20", "font-body": "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "0px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
     "book-pulp": ("Pulp", "Reading", {"bg": "#1b1712", "bg-image": "none", "surface": "#241e17", "surface-opacity": "1", "text": "#f2e6d2", "muted": "#b3a48c", "accent": "#e0a63c", "border": "#3a3126", "code-bg": "#171310", "header-bg": "#1b1712", "header-text": "#f2e6d2", "sidebar-bg": "#1f1a14", "sidebar-text": "#e2d6c0", "sidebar-active": "#312819", "font-body": "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "4px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.4em"}),
+    "retro-portal": ("Secure portal", "Retro", {"bg": "#141414", "bg-image": "none", "surface": "#050505", "surface-opacity": "1", "text": "#c0c0c0", "muted": "#808080", "accent": "#6699ff", "border": "#555555", "code-bg": "#000000", "header-bg": "#0a0a0a", "header-text": "#e8e8e8", "sidebar-bg": "#0b0b12", "sidebar-text": "#c0c0c0", "sidebar-active": "#1a1a26", "font-body": "\"Times New Roman\", Times, serif", "font-heading": "Arial, Helvetica, sans-serif", "font-ui": "Verdana, Geneva, Arial, sans-serif", "font-mono": "\"Courier New\", Courier, monospace", "base-size": "16px", "line-height": "1.45", "max-width": "46rem", "measure": "38rem", "sidebar-width": "15rem", "radius": "0px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
 }
 OWN_GROUP = 'Site'
-GROUP_ORDER = [OWN_GROUP] + [g for g in ("Site", "Wiki", "Reading") if g != OWN_GROUP]
+GROUP_ORDER = [OWN_GROUP] + [g for g in ("Site", "Wiki", "Reading", "Retro") if g != OWN_GROUP]
 VAR_ORDER = ['bg', 'bg-image', 'surface', 'surface-opacity', 'text', 'muted', 'accent', 'border', 'header-bg', 'header-text', 'sidebar-bg', 'sidebar-text', 'sidebar-active', 'code-bg', 'font-body', 'font-heading', 'font-ui', 'font-mono', 'base-size', 'line-height', 'max-width', 'radius', 'heading-weight', 'heading-transform', 'letter-spacing']
 VAR_CONSTS = {}
 
@@ -978,6 +979,307 @@ body.layout-landing .site-footer { border-top: 0; text-align: center; }
 body.layout-landing .site-footer .wrap { padding-top: 2.5rem; padding-bottom: 3rem; }
 """ + _cards_css("body.layout-landing")
 
+# ----------------------------------------------------------------------------
+# Secure portal layout
+#
+# A late-90s "secure system" site: classification banners above and below, a stack of warning
+# lines, a framed page with a chrome title, a flag and a seal, the menu in a column on the left,
+# and a webring, hit counter and 88x31 badges at the bottom. What it shows is set in Settings
+# under "Secure portal layout": the text, the line breaks in the warning box, which pieces appear and
+# the layout's own colors. The theme still sets the page, panel, text, link and font colors.
+# "Secure portal" in the Retro group is the palette it was made with, but any theme works.
+# ----------------------------------------------------------------------------
+
+PORTAL_COLORS = (
+    ("banner_bg", "#7a0e0e", "Banner background"),
+    ("banner_line", "#ff2a2a", "Banner edges"),
+    ("banner_text", "#ffffff", "Banner text"),
+    ("warn_text", "#ff2a2a", "Warning text"),
+    ("heading", "#ff2a2a", "Headings and bullets"),
+    ("highlight", "#ffcc00", "Highlights"),
+    ("visited", "#9966cc", "Visited links"),
+    ("term", "#b8d8c0", "Code text"),
+    ("frame", "#555555", "Frame lines"),
+)
+PORTAL_TEXT = (("banner", 200), ("warning", 2000), ("seal_text", 120), ("seal_caption", 60), ("nav_title", 60),
+               ("nav_note", 300), ("construction", 200), ("webring", 120), ("counter_label", 80), ("counter", 12),
+               ("counter_note", 120), ("badges", 600))
+PORTAL_BOOLS = ("banner_bottom", "warning_big", "blink", "chrome", "flag", "seal")
+PORTAL_DEFAULTS = {
+    "banner": "TOP SECRET // SCI // NOFORN // ORCON",
+    "banner_bottom": True,
+    "warning": ("*** WARNING ***\n"
+                "*** UNAUTHORIZED ACCESS TO THIS SYSTEM IS A FEDERAL OFFENSE ***\n"
+                "*** THIS SESSION IS BEING MONITORED, RECORDED, AND NARRATED ***\n"
+                "*** A SATELLITE HAS BEEN REPOSITIONED OVER YOUR GENERAL AREA ***\n"
+                "*** DO NOT UNPLUG YOUR MODEM ***"),
+    "warning_big": True,
+    "blink": True,
+    "chrome": True,
+    "flag": True,
+    "seal": True,
+    "seal_text": "",
+    "seal_caption": "NOT A REAL SEAL",
+    "nav_title": "NAVIGATION",
+    "nav_note": "This site is best viewed with Netscape Navigator 4.0 at 800x600 in 256 colors.",
+    "construction": "THIS SECTION UNDER CONSTRUCTION SINCE 1998",
+    "webring": "The Secret Government Webring",
+    "counter_label": "You are visitor number",
+    "counter": "0000007",
+    "counter_note": "since 04/12/98",
+    "badges": "Y2K COMPLIANT\nBEST VIEWED AT 800x600\nMADE WITH NOTEPAD.EXE\nSIGN OUR GUESTBOOK",
+    "width": 860,
+}
+PORTAL_DEFAULTS.update({k: v for k, v, _ in PORTAL_COLORS})
+_PORTAL_HEX = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+_PORTAL_SMALL = {"a", "an", "and", "at", "by", "for", "in", "of", "on", "or", "the", "to"}
+
+
+def clean_portal(d, current=None):
+    """Secure portal settings with every value checked: text trimmed to length, colors as #hex only."""
+    out = dict(PORTAL_DEFAULTS)
+    if isinstance(current, dict):
+        out.update({k: v for k, v in current.items() if k in PORTAL_DEFAULTS})
+    if isinstance(d, dict):
+        out.update({k: v for k, v in d.items() if k in PORTAL_DEFAULTS})
+    for k, limit in PORTAL_TEXT:
+        out[k] = str(out[k] if out[k] is not None else "").replace("\r\n", "\n").replace("\r", "\n")[:limit]
+    for k in PORTAL_BOOLS:
+        out[k] = bool(out[k])
+    for k, default, _ in PORTAL_COLORS:
+        v = str(out[k] or "").strip()
+        out[k] = v.lower() if _PORTAL_HEX.match(v) else default
+    try:
+        out["width"] = max(640, min(1600, int(out["width"])))
+    except (TypeError, ValueError):
+        out["width"] = PORTAL_DEFAULTS["width"]
+    return out
+
+
+def portal_vars_css(p):
+    lines = ["body.layout-secure {", "  --pt-width: %dpx;" % p["width"]]
+    lines += ["  --pt-%s: %s;" % (k.replace("_", "-"), p[k]) for k, _, _ in PORTAL_COLORS]
+    return "\n/* Portal width and colors, from Settings > Secure portal layout */\n" + "\n".join(lines) + "\n}\n"
+
+
+def _portal_lines(text):
+    return [ln.strip() for ln in str(text or "").split("\n") if ln.strip()]
+
+
+def portal_seal(p, title):
+    lines = _portal_lines(p["seal_text"])[:3]
+    if not lines:
+        words = [w for w in re.findall(r"[A-Za-z0-9]+", title or "") if w.lower() not in _PORTAL_SMALL]
+        initials = ".".join(w[0] for w in words[:5]).upper()
+        lines = ["SEAL OF", "★", (initials + ".") if initials else "THIS SITE"]
+    parts = []
+    for ln in lines:
+        parts.append(("<b>%s</b>" if len(ln) <= 2 else "<span>%s</span>") % esc(ln))
+    cap = '<div class="pt-seal-cap">%s</div>' % esc(p["seal_caption"]) if p["seal_caption"].strip() else ""
+    return ('<div class="pt-seal-box"><div class="pt-seal" aria-hidden="true"><div>%s</div></div>%s</div>'
+            % ("".join(parts), cap))
+
+
+def portal_body(p, *, title, brand, nav, main, footer):
+    """The body of a Secure portal page. brand: the title link and tagline. nav: the menu (or a wiki
+    sidebar), shown in the left column. main and footer: what the page would show anyway."""
+    out = []
+    banner = p["banner"].strip()
+    if banner:
+        out.append('<div class="pt-banner">%s</div>' % esc(banner))
+    lines = _portal_lines(p["warning"])
+    if lines:
+        cls = "pt-warn" + (" big" if p["warning_big"] else "") + (" blink" if p["blink"] else "")
+        out.append('<div class="%s" role="note">\n%s\n</div>' % (cls, "\n".join("<p>%s</p>" % esc(ln) for ln in lines)))
+    head = []
+    if p["flag"]:
+        head.append('<div class="pt-flagpole" aria-hidden="true"><div class="pt-flag"></div></div>')
+    head.append('<div class="pt-brand%s">%s</div>' % (" chrome" if p["chrome"] else "", brand))
+    if p["seal"]:
+        head.append(portal_seal(p, title))
+    out.append('<div class="pt-frame">\n<header class="pt-head%s">\n%s\n</header>'
+               % ("" if p["flag"] or p["seal"] else " solo", "\n".join(head)))
+    side = ""
+    if nav.strip():
+        t = '<div class="pt-nav-title">%s</div>\n' % esc(p["nav_title"]) if p["nav_title"].strip() else ""
+        note = '\n<p class="pt-note">%s</p>' % esc(p["nav_note"]) if p["nav_note"].strip() else ""
+        side = '<aside class="pt-nav">\n%s%s%s\n</aside>\n' % (t, nav, note)
+    cons = ('\n<div class="pt-construction"><p>%s</p></div>' % esc(p["construction"])
+            if p["construction"].strip() else "")
+    out.append('<div class="pt-body%s">\n%s<div class="pt-main">\n%s%s\n</div>\n</div>'
+               % ("" if side else " no-nav", side, main, cons))
+    foot = []
+    if p["webring"].strip():
+        foot.append('<div class="pt-ring"><strong>%s</strong><a href="#">&lt;&lt; Prev</a> | <a href="#">Random</a> | '
+                    '<a href="#">List Sites</a> | <a href="#">Next &gt;&gt;</a></div>' % esc(p["webring"]))
+    digits = re.sub(r"\s+", "", p["counter"])
+    if digits:
+        foot.append('<p class="pt-counter">%s <span class="pt-digits">%s</span> %s</p>'
+                    % (esc(p["counter_label"]), "".join("<span>%s</span>" % esc(ch) for ch in digits),
+                       esc(p["counter_note"])))
+    badges = _portal_lines(p["badges"])[:12]
+    if badges:
+        foot.append('<div class="pt-badges">%s</div>'
+                    % "".join('<span class="pt-badge b%d">%s</span>' % (i % 5 + 1, esc(b)) for i, b in enumerate(badges)))
+    if foot or footer.strip():
+        out.append('<div class="pt-foot">\n%s%s\n</div>' % ("\n".join(foot), footer))
+    out.append("</div>")
+    if banner and p["banner_bottom"]:
+        out.append('<div class="pt-banner bottom">%s</div>' % esc(banner))
+    return "\n".join(out)
+
+
+PORTAL_CSS = """
+/* Site layout, Secure portal: a late-90s secure system page. Colors under --pt-* come from Settings. */
+body.layout-secure { padding-bottom: 1.25rem; }
+body.layout-secure a:visited { color: var(--pt-visited); }
+body.layout-secure .pt-banner {
+  background: var(--pt-banner-bg); color: var(--pt-banner-text); text-align: center;
+  font: 700 0.8125rem/1.4 var(--font-heading); letter-spacing: 0.2em; padding: 0.3rem 0.6rem;
+  border-top: 1px solid var(--pt-banner-line); border-bottom: 1px solid var(--pt-banner-line);
+}
+body.layout-secure .pt-banner.bottom { margin-top: 1.25rem; }
+body.layout-secure .pt-warn, body.layout-secure .pt-frame { width: min(var(--pt-width), calc(100% - 2rem)); margin: 1.25rem auto 0; }
+body.layout-secure .pt-warn {
+  padding: 0.65rem 0.9rem; background: var(--code-bg); color: var(--pt-warn-text); text-align: center;
+  font: 700 0.875rem/1.6 var(--font-mono); border: 2px ridge var(--pt-frame); border-bottom: 0;
+}
+body.layout-secure .pt-warn p { margin: 0; }
+body.layout-secure .pt-warn.big p:first-child { font-size: 1.15em; margin-bottom: 0.25rem; }
+body.layout-secure .pt-warn.big.blink p:first-child { animation: pt-blink 1.2s steps(1) infinite; }
+body.layout-secure .pt-warn + .pt-frame { margin-top: 0; }
+body.layout-secure .pt-frame { border: 2px ridge var(--pt-frame); background: var(--surface); color: var(--text); }
+body.layout-secure .pt-head {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 1rem;
+  padding: 0.9rem 1rem; background: var(--header-bg); color: var(--header-text); border-bottom: 2px ridge var(--pt-frame);
+}
+body.layout-secure .pt-head.solo { grid-template-columns: minmax(0, 1fr); }
+body.layout-secure .pt-brand { grid-column: 2; text-align: center; min-width: 0; }
+body.layout-secure .pt-head.solo .pt-brand { grid-column: 1; }
+body.layout-secure .pt-brand .site-title {
+  display: inline-block; font: 900 clamp(1.4rem, 3.6vw, 2rem)/1.08 "Arial Black", Impact, var(--font-heading);
+  letter-spacing: 0.02em; color: var(--header-text); text-decoration: none; overflow-wrap: anywhere;
+}
+body.layout-secure .pt-brand.chrome .site-title {
+  background: linear-gradient(#ffffff 0%, #bdbdbd 44%, #3a3a3a 50%, #9a9a9a 62%, #ffffff 100%);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+  filter: drop-shadow(2px 2px 0 var(--pt-banner-bg));
+}
+body.layout-secure .pt-brand .tagline { display: block; margin: 0.45rem 0 0; font-style: italic; color: var(--muted); }
+body.layout-secure .pt-flagpole { grid-column: 1; display: flex; align-items: flex-start; }
+body.layout-secure .pt-flagpole::before { content: ""; width: 4px; height: 92px; margin-right: 2px; background: linear-gradient(90deg, #444, #bbb, #444); }
+body.layout-secure .pt-flag {
+  position: relative; width: 104px; height: 56px; border: 1px solid #222;
+  background: repeating-linear-gradient(to bottom, #a01a1a 0 7.6923%, #d8d8d8 7.6923% 15.3846%);
+  transform-origin: left center; animation: pt-wave 1.6s ease-in-out infinite alternate;
+}
+body.layout-secure .pt-flag::before {
+  content: ""; position: absolute; left: 0; top: 0; width: 40%; height: 53.85%; background-color: #2a2a5e;
+  background-image: radial-gradient(#ddd 0.9px, transparent 1.3px); background-size: 6.9px 6px; background-position: 1px 1px;
+}
+body.layout-secure .pt-seal-box { grid-column: 3; }
+body.layout-secure .pt-seal {
+  position: relative; width: 92px; height: 92px; margin: 0 auto; border-radius: 50%; border: 2px solid #8a7420;
+  background: radial-gradient(circle, #141a33 0 44%, #8a7420 45% 48%, #141a33 49% 68%, #8a7420 69% 72%, #0a0a0a 73%);
+  display: flex; align-items: center; justify-content: center; text-align: center;
+  color: #c9a227; font: 700 8px/1.15 Arial, Helvetica, sans-serif; letter-spacing: 0.06em;
+}
+body.layout-secure .pt-seal::before { content: ""; position: absolute; inset: 7px; border-radius: 50%; border: 1px dashed #8a7420; animation: pt-spin 14s linear infinite; }
+body.layout-secure .pt-seal span, body.layout-secure .pt-seal b { display: block; max-width: 54px; overflow-wrap: anywhere; }
+body.layout-secure .pt-seal b { font-size: 18px; line-height: 1; margin: 1px auto; }
+body.layout-secure .pt-seal-cap { margin-top: 0.3rem; font: 700 9px Arial, Helvetica, sans-serif; color: var(--muted); text-align: center; }
+body.layout-secure .pt-body { display: grid; grid-template-columns: 11rem minmax(0, 1fr); align-items: stretch; }
+body.layout-secure .pt-body.no-nav { grid-template-columns: minmax(0, 1fr); }
+body.layout-secure .pt-nav {
+  min-width: 0; padding: 0.9rem 0.75rem; background: var(--sidebar-bg); color: var(--sidebar-text);
+  border-right: 2px ridge var(--pt-frame); font: 0.8125rem/1.45 var(--font-ui);
+}
+body.layout-secure .pt-nav-title {
+  margin: 0 0 0.55rem; padding-bottom: 0.2rem; border-bottom: 1px solid var(--pt-frame);
+  color: var(--pt-highlight); font: 700 0.75rem/1.3 var(--font-ui); letter-spacing: 0.04em;
+}
+body.layout-secure .pt-nav .site-nav { display: block; width: auto; margin: 0; font: inherit; }
+body.layout-secure .pt-nav .site-nav ul { display: block; margin: 0; padding: 0; list-style: none; }
+body.layout-secure .pt-nav .site-nav li { position: relative; margin: 0 0 0.35rem; padding-left: 0.8rem; }
+body.layout-secure .pt-nav .site-nav li::before { content: ""; position: absolute; left: 0; top: 0.45em; width: 0.4rem; height: 0.4rem; background: var(--pt-heading); }
+body.layout-secure .pt-nav .site-nav a { display: inline; padding: 0; border: 0; border-radius: 0; background: none; color: var(--accent); text-decoration: underline; }
+body.layout-secure .pt-nav .site-nav a:visited { color: var(--pt-visited); }
+body.layout-secure .pt-nav .site-nav a:hover { color: var(--pt-highlight); background: none; }
+body.layout-secure .pt-nav .site-nav a[aria-current="page"], body.layout-secure .pt-nav .site-nav a.active { color: var(--pt-highlight); font-weight: 700; }
+body.layout-secure .pt-note { margin: 1.1rem 0 0; font-size: 0.6875rem; color: var(--muted); }
+body.layout-secure .pt-main { min-width: 0; padding: 1.1rem 1.35rem 1.35rem; }
+body.layout-secure .pt-main h1, body.layout-secure .pt-main h2, body.layout-secure .pt-main h3 { color: var(--pt-heading); font-family: var(--font-heading); }
+body.layout-secure .pt-main h1 a, body.layout-secure .pt-main h2 a, body.layout-secure .pt-main h3 a { color: inherit; }
+body.layout-secure .pt-main hr { height: 0; border: 0; border-top: 1px solid var(--pt-frame); border-bottom: 1px solid var(--code-bg); background: none; margin: 1.25rem 0; }
+body.layout-secure .pt-main pre { background: var(--code-bg); color: var(--pt-term); border: 1px solid var(--pt-frame); border-radius: 0; }
+body.layout-secure .pt-main code { color: var(--pt-term); }
+body.layout-secure .pt-main blockquote {
+  margin: 1rem 0; padding: 0.5rem 0.8rem; border: 1px dashed var(--pt-highlight); border-radius: 0;
+  background: none; color: var(--text); font-style: normal;
+}
+body.layout-secure .pt-main blockquote strong { color: var(--pt-highlight); }
+body.layout-secure .pt-main table { border-collapse: collapse; border: 1px solid var(--pt-frame); }
+body.layout-secure .pt-main th, body.layout-secure .pt-main td { border: 1px solid var(--pt-frame); }
+body.layout-secure .pt-main th { background: var(--header-bg); color: var(--header-text); }
+body.layout-secure .pt-construction { margin-top: 1.5rem; padding: 5px; background: repeating-linear-gradient(45deg, #000 0 14px, var(--pt-highlight) 14px 28px); }
+body.layout-secure .pt-construction p { margin: 0; padding: 0.4rem; background: #000; color: var(--pt-highlight); text-align: center; font: 700 0.875rem/1.4 var(--font-heading); }
+body.layout-secure .pt-foot {
+  padding: 1rem; border-top: 2px ridge var(--pt-frame); background: var(--header-bg); color: var(--muted);
+  text-align: center; font: 0.75rem/1.5 var(--font-ui);
+}
+body.layout-secure .pt-ring { display: inline-block; padding: 0.4rem 0.75rem; border: 2px outset var(--pt-frame); background: var(--code-bg); }
+body.layout-secure .pt-ring strong { display: block; margin-bottom: 0.15rem; color: var(--pt-highlight); }
+body.layout-secure .pt-counter { margin: 0.85rem 0 0; }
+body.layout-secure .pt-digits span {
+  display: inline-block; margin: 0 1px; padding: 0 3px; background: #000; color: var(--pt-heading);
+  border: 1px solid var(--pt-frame); font: 700 1rem/1.3 var(--font-mono);
+}
+body.layout-secure .pt-badges { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin-top: 0.85rem; }
+body.layout-secure .pt-badge {
+  display: flex; align-items: center; justify-content: center; width: 88px; height: 31px; padding: 2px;
+  border: 1px solid var(--pt-frame); text-align: center; font: 700 9px/1.1 Arial, Helvetica, sans-serif; overflow: hidden;
+}
+body.layout-secure .pt-badge.b1 { background: linear-gradient(#001, #004); color: var(--pt-highlight); }
+body.layout-secure .pt-badge.b2 { background: #000; color: var(--pt-term); font-family: "Courier New", Courier, monospace; }
+body.layout-secure .pt-badge.b3 { background: linear-gradient(#333, #111); color: #ddd; }
+body.layout-secure .pt-badge.b4 { background: linear-gradient(#300, #800); color: #fff; }
+body.layout-secure .pt-badge.b5 { background: var(--pt-highlight); color: #000; }
+body.layout-secure .pt-foot .site-footer { margin: 0.85rem 0 0; padding: 0; border: 0; background: none; color: var(--muted); }
+body.layout-secure .pt-foot .site-footer > * { max-width: none; margin: 0; padding: 0; }
+body.layout-secure .pt-foot .site-footer p { margin: 0; }
+@keyframes pt-blink { 50% { visibility: hidden; } }
+@keyframes pt-wave { from { transform: skewY(-3deg) scaleX(0.97); } to { transform: skewY(3deg) scaleX(1); } }
+@keyframes pt-spin { to { transform: rotate(360deg); } }
+@media (max-width: 720px) {
+  body.layout-secure .pt-head { grid-template-columns: minmax(0, 1fr); }
+  body.layout-secure .pt-brand { grid-column: 1; }
+  body.layout-secure .pt-flagpole, body.layout-secure .pt-seal-box { display: none; }
+  body.layout-secure .pt-body { display: block; }
+  body.layout-secure .pt-nav { border-right: 0; border-bottom: 2px ridge var(--pt-frame); }
+  body.layout-secure .pt-main { padding: 0.9rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  body.layout-secure .pt-warn p, body.layout-secure .pt-flag, body.layout-secure .pt-seal::before { animation: none !important; }
+}
+@media print {
+  body.layout-secure .pt-banner, body.layout-secure .pt-warn, body.layout-secure .pt-nav, body.layout-secure .pt-foot { display: none; }
+  body.layout-secure .pt-frame { border: 0; width: auto; }
+}
+"""
+
+PORTAL_DESC = ("A 1998 secure-system site: classification banners, a box of warning lines, a framed page with a chrome "
+               "title, flag and seal, the menu in a column on the left and a webring, hit counter and badges at the "
+               "bottom. Set its text, line breaks and colors in Settings under Secure portal layout. Pairs with the "
+               "Secure portal theme.")
+
+SECURE_TOOL_CSS = """
+/* SiteGen pages inside the Secure portal frame */
+body.layout-secure .pt-main > main.wrap { max-width: none; margin: 0; padding: 0; }
+body.layout-secure .pt-main .content {
+  --pad-y: 0px; --pad-x: 0px; max-width: none; margin: 0; padding: 0; background: none; border: 0; border-radius: 0; box-shadow: none;
+}
+"""
+
 # feed: "list" (the classic list), "cards" (a grid of cards, with the post image when it has one),
 # "archive" (one line per post, grouped by year). feature: the newest post spans the whole row.
 # hero: a post page shows its image across the top.
@@ -992,6 +1294,7 @@ LAYOUTS = {
                 "desc": "No boxes, a narrow column and a small header. The blog is a dated archive grouped by year."},
     "landing": {"label": "Landing", "feed": "cards", "hero": True, "css": LAYOUT_LANDING_CSS,
                 "desc": "A tinted hero with a large title and the menu on top. Pages sit in raised panels and the blog uses cards."},
+    "secure": {"label": "Secure portal", "feed": "list", "css": PORTAL_CSS + SECURE_TOOL_CSS, "desc": PORTAL_DESC},
 }
 DEFAULT_LAYOUT = "classic"
 
@@ -1001,7 +1304,7 @@ def layout_of(cfg):
     return lid if lid in LAYOUTS else DEFAULT_LAYOUT
 
 
-def layout_css(lid):
+def _layout_css_base(lid):
     lay = LAYOUTS[lid]
     return (
         "/*\n  layout.css: written by %s on every build, so edits here are lost.\n"
@@ -1009,6 +1312,14 @@ def layout_css(lid):
         "  Your own rules go in style.css, which loads after this file and wins any tie.\n*/\n%s"
         % (APP, lay["label"], lay["css"] or "\n/* Classic needs no extra rules: style.css already describes it. */\n")
     )
+
+
+def layout_css(lid, cfg=None):
+    text = _layout_css_base(lid)
+    if lid == "secure":
+        site = cfg.get("site") if isinstance(cfg, dict) and isinstance(cfg.get("site"), dict) else {}
+        text += portal_vars_css(clean_portal(site.get("secure")))
+    return text
 
 
 def layout_list():
@@ -1223,6 +1534,7 @@ class Site:
         c.setdefault("site", {})
         for k, v in d["site"].items():
             c["site"].setdefault(k, v)
+        c["site"]["secure"] = clean_portal(c["site"].get("secure"))
         c.setdefault("pages", [])
         c.setdefault("posts", [])
         c.setdefault("nav", [])
@@ -1246,6 +1558,7 @@ class Site:
         return {
             "folder": str(self.root),
             "site": c["site"],
+            "secure_defaults": PORTAL_DEFAULTS,
             "pages": c["pages"],
             "posts": c["posts"],
             "nav": c["nav"],
@@ -1373,7 +1686,7 @@ class Site:
             head.append('<link rel="stylesheet" href="%slayout.css">' % prefix)
             head.append('<link rel="stylesheet" href="%sstyle.css">' % prefix)
         else:
-            head.append("<style>\n%s\n</style>" % (layout_css(lid) + "\n" + css).replace("</", "<\\/"))
+            head.append("<style>\n%s\n</style>" % (layout_css(lid, cfg) + "\n" + css).replace("</", "<\\/"))
         body_class = "layout-%s %s" % (lid, body_class)
         tagline = '<p class="tagline">%s</p>' % esc(site["tagline"]) if site.get("tagline") else ""
         nav = self.nav_html(cfg, prefix, current, exact)
@@ -1387,6 +1700,14 @@ class Site:
         footer = ""
         if foot.strip():
             footer = '<footer class="site-footer"><div class="wrap"><p>%s</p></div></footer>' % Markdown(prefix).inline(foot)
+        if lid == "secure":
+            brand = '<a class="site-title" href="%sindex.html">%s</a>%s' % (prefix, esc(st), tagline)
+            main = '<main id="main" class="wrap">\n%s\n</main>' % body
+            inner = portal_body(clean_portal(site.get("secure")), title=st, brand=brand, nav=nav_block, main=main,
+                                footer=footer)
+            return ('<!DOCTYPE html>\n<html lang="%s">\n<head>\n%s\n</head>\n<body class="%s">\n'
+                    '<a class="skip" href="#main">Skip to content</a>\n%s\n</body>\n</html>\n'
+                    % (attr(site.get("lang") or "en"), "\n".join(head), attr(body_class), inner))
         return (
             '<!DOCTYPE html>\n<html lang="%s">\n<head>\n%s\n</head>\n<body class="%s">\n'
             '<a class="skip" href="#main">Skip to content</a>\n%s\n<main id="main" class="wrap">\n%s\n</main>\n%s\n</body>\n</html>\n'
@@ -1618,7 +1939,7 @@ class Site:
 
     def write_layout_css(self):
         f = self.root / "layout.css"
-        text = layout_css(layout_of(self.cfg))
+        text = layout_css(layout_of(self.cfg), self.cfg)
         if not f.is_dir() and read_text(f) != text:
             write_text(f, text)
 
@@ -1877,6 +2198,8 @@ class Site:
             out["sitemap"] = bool(d["sitemap"])
         if d.get("layout") in LAYOUTS:
             out["layout"] = d["layout"]
+        if isinstance(d.get("secure"), dict):
+            out["secure"] = clean_portal(d["secure"], current.get("secure"))
         out["title"] = out.get("title") or current.get("title") or "My site"
         out["lang"] = out.get("lang") or "en"
         return out
@@ -3349,6 +3672,7 @@ const SET_TPL = `
     <label class="field">Twitter / X handle <input id="s-twitter" placeholder="@yourhandle" style="max-width:220px"></label>
     <label><input type="checkbox" id="s-noindex"> Ask search engines not to index this site<span class="hint" style="display:block">Adds a noindex tag to every page and makes robots.txt disallow crawling. Use for a staging site.</span></label>
     <label class="field">Language code <input id="s-lang" placeholder="en" style="max-width:100px"></label>
+    PORTALBOX
   </div>
 </div>`;
 
@@ -3644,7 +3968,7 @@ function previewPayload() {
   switch (view.type) {
     case "page": return { view: "page", slug: view.slug, title: $("#p-title").value, show_title: $("#p-show").checked, markdown: $("#md").value, ...seoVals("p") };
     case "post": return { view: "post", slug: $("#t-slug").value || slugify($("#t-title").value), title: $("#t-title").value, date: $("#t-date").value, summary: $("#t-summary").value, tags: $("#t-tags").value, markdown: $("#md").value, ...seoVals("t") };
-    case "css": return { view: "css", target: $("#css-target").value, css: $("#css").value, layout: $("#layout").value };
+    case "css": return { view: "css", target: $("#css-target").value, css: themeCss($("#css").value), layout: $("#layout").value };
     case "menu": return { view: "menu", target: "page:index", nav: navDraft };
     case "settings": return { view: "settings", target: "page:index", site: readSettings() };
   }
@@ -3950,6 +4274,7 @@ async function openCss() {
   S.posts.forEach((p) => { const o = document.createElement("option"); o.value = "post:" + p.slug; o.textContent = "Post: " + p.title; tg.appendChild(o); });
   $("#css").value = d.css;
   $("#css").addEventListener("input", markDirty);
+  themeWire();
   tg.addEventListener("change", renderPreview);
   $("#css-save").addEventListener("click", saveCss);
   $("#apply-theme").addEventListener("click", applyTheme);
@@ -3981,12 +4306,127 @@ function layoutPicker() {
   });
 }
 
+/* ---------- portal layout settings ---------- */
+const PT_COLORS = [["banner_bg", "Banner background"], ["banner_line", "Banner edges"], ["banner_text", "Banner text"],
+  ["warn_text", "Warning text"], ["heading", "Headings and bullets"], ["highlight", "Highlights"],
+  ["visited", "Visited links"], ["term", "Code text"], ["frame", "Frame lines"]];
+const PT_TEXT = ["banner", "warning", "seal_text", "seal_caption", "nav_title", "nav_note", "construction", "webring",
+  "counter_label", "counter", "counter_note", "badges"];
+const PT_BOOL = ["banner_bottom", "warning_big", "blink", "chrome", "flag", "seal"];
+const PORTAL_TPL = `
+<style>#pt-box{margin:18px 0 0;padding:10px 14px 14px;border:1px solid rgba(127,127,127,.4);border-radius:8px}#pt-box legend{font-weight:600;padding:0 4px}#pt-box>label:not(.field){display:block;margin:6px 0}#pt-box textarea{display:block;width:100%;box-sizing:border-box;padding:6px 8px;border-radius:6px;font:inherit}#pt-box .field{display:block;margin:10px 0}</style>
+<fieldset id="pt-box"><legend>Secure portal layout</legend>
+  <p class="hint">These apply when the layout is Secure portal, which you pick under Layout and CSS. Leave a box empty to hide that part of the page.</p>
+  <label class="field">Classification banner <input id="pt-banner" maxlength="200"></label>
+  <label><input type="checkbox" id="pt-banner_bottom"> Repeat the banner at the bottom of the page</label>
+  <label class="field">Warning box <textarea id="pt-warning" rows="6" wrap="off" spellcheck="false" style="font-family:ui-monospace,monospace"></textarea><span class="hint">Each line here is its own line on the page. Blank lines are skipped.</span></label>
+  <label><input type="checkbox" id="pt-warning_big"> Make the first warning line larger</label>
+  <label><input type="checkbox" id="pt-blink"> Blink the first warning line</label>
+  <label><input type="checkbox" id="pt-chrome"> Chrome gradient on the site title</label>
+  <label><input type="checkbox" id="pt-flag"> Waving flag left of the title</label>
+  <label><input type="checkbox" id="pt-seal"> Seal right of the title</label>
+  <label class="field">Seal text <textarea id="pt-seal_text" rows="3" placeholder="SEAL OF&#10;&#9733;&#10;O.S.M.O."></textarea><span class="hint">Up to three short lines. A line of one or two characters is drawn large. Empty uses SEAL OF, a star and the site's initials.</span></label>
+  <label class="field">Seal caption <input id="pt-seal_caption" maxlength="60"></label>
+  <label class="field">Menu heading <input id="pt-nav_title" maxlength="60"></label>
+  <label class="field">Note under the menu <textarea id="pt-nav_note" rows="2"></textarea></label>
+  <label class="field">Under construction strip <input id="pt-construction" maxlength="200"></label>
+  <label class="field">Webring name <input id="pt-webring" maxlength="120"><span class="hint">Its Prev, Random, List Sites and Next links all point to #.</span></label>
+  <label class="field">Hit counter label <input id="pt-counter_label" maxlength="80"></label>
+  <label class="field">Hit counter digits <input id="pt-counter" maxlength="12" style="max-width:160px"></label>
+  <label class="field">Text after the counter <input id="pt-counter_note" maxlength="120"></label>
+  <label class="field">Badges <textarea id="pt-badges" rows="4"></textarea><span class="hint">One 88x31 badge per line, up to 12.</span></label>
+  <label class="field">Frame width in pixels <input type="number" id="pt-width" min="640" max="1600" step="10" style="max-width:120px"></label>
+  <div class="field"><span>Colors</span><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:6px 14px;margin-top:4px">PTCOLORS</div>
+  <span class="hint">The page, panel, text, link and font colors come from the theme. The Secure portal theme is the one this layout was made with.</span></div>
+  <p><button type="button" id="pt-reset">Reset these settings</button></p>
+</fieldset>`;
+
+function portalFieldset() {
+  return PORTAL_TPL.replace("PTCOLORS", PT_COLORS.map(([k, l]) =>
+    '<label style="display:flex;align-items:center;gap:8px"><input type="color" id="pt-' + k + '" style="width:44px;height:28px;padding:0"> ' + l + "</label>").join(""));
+}
+
+function portalFill(p) {
+  p = p || {};
+  const g = (k) => document.getElementById("pt-" + k);
+  PT_TEXT.forEach((k) => { if (g(k)) g(k).value = p[k] == null ? "" : p[k]; });
+  PT_BOOL.forEach((k) => { if (g(k)) g(k).checked = !!p[k]; });
+  PT_COLORS.forEach(([k]) => { if (g(k)) g(k).value = /^#[0-9a-f]{6}$/i.test(p[k] || "") ? p[k] : "#000000"; });
+  if (g("width")) g("width").value = p.width || 860;
+}
+
+function portalRead() {
+  const g = (k) => document.getElementById("pt-" + k);
+  if (!g("banner")) return undefined;
+  const o = {};
+  PT_TEXT.forEach((k) => { o[k] = g(k).value; });
+  PT_BOOL.forEach((k) => { o[k] = g(k).checked; });
+  PT_COLORS.forEach(([k]) => { o[k] = g(k).value; });
+  o.width = parseInt(g("width").value, 10) || 860;
+  return o;
+}
+
+function portalWire(onChange) {
+  const box = document.getElementById("pt-box");
+  if (!box) return;
+  portalFill(S.site.secure || S.secure_defaults);
+  box.querySelectorAll("input, textarea").forEach((i) => i.addEventListener(i.type === "checkbox" ? "change" : "input", onChange));
+  document.getElementById("pt-reset").addEventListener("click", () => {
+    if (!window.confirm("Put every Secure portal setting back to its default? Save settings afterwards to keep it.")) return;
+    portalFill(S.secure_defaults);
+    onChange();
+  });
+}
+
+/* ---------- theme preview: show the picked theme before it is applied ---------- */
+let themePick = false;
+
+function themeCss(css) {
+  const sel = document.getElementById("theme");
+  if (!themePick || !sel) return css;
+  const t = S.themes.find((x) => x.id === sel.value);
+  if (!t) return css;
+  const re = /:root\s*\{[^}]*\}/;
+  return re.test(css) ? css.replace(re, () => t.block) : t.block + "\n\n" + css;
+}
+
+function themeCurrent(css) {
+  const m = /:root\s*\{\s*\/\*\s*Theme:\s*(.+?)\s*\(([^)]+)\)/.exec(css || "");
+  if (!m) return "";
+  const t = S.themes.find((x) => x.label === m[1] && x.group === m[2]);
+  return t ? t.id : "";
+}
+
+function themeWire() {
+  const sel = document.getElementById("theme");
+  themePick = false;
+  const cur = themeCurrent(document.getElementById("css").value);
+  if (cur) sel.value = cur;
+  const note = document.createElement("span");
+  note.className = "hint";
+  note.id = "theme-note";
+  document.getElementById("apply-theme").after(note);
+  sel.addEventListener("change", () => {
+    themePick = sel.value !== themeCurrent(document.getElementById("css").value);
+    const t = S.themes.find((x) => x.id === sel.value);
+    note.textContent = themePick && t ? "Previewing " + t.label + ". Apply theme to keep it." : "";
+    renderPreview();
+  });
+}
+
+function themeApplied() {
+  themePick = false;
+  const note = document.getElementById("theme-note");
+  if (note) note.textContent = "";
+}
+
 function applyTheme() {
   const t = S.themes.find((x) => x.id === $("#theme").value);
   const ta = $("#css");
   if (!window.confirm("Replace the theme variables at the top of your CSS with \"" + t.label + "\"?\n\nAny edits you made inside that top :root block are overwritten. Your base styles and page specific rules stay as they are.")) return;
   const re = /:root\s*\{[^}]*\}/;
   ta.value = re.test(ta.value) ? ta.value.replace(re, () => t.block) : t.block + "\n\n" + ta.value;
+  themeApplied();
   markDirty();
 }
 
@@ -4068,12 +4508,14 @@ function readSettings() {
     footer: $("#s-footer").value, author: $("#s-author").value, lang: $("#s-lang").value,
     url: $("#s-url").value, rss: $("#s-rss").checked, sitemap: $("#s-sitemap").checked,
     image: $("#s-image").value, twitter: $("#s-twitter").value, noindex: $("#s-noindex").checked,
+    secure: portalRead(),
   };
 }
 
 async function openSettings() {
   view = { type: "settings" };
-  $("#left").innerHTML = SET_TPL;
+  $("#left").innerHTML = SET_TPL.replace("PORTALBOX", portalFieldset());
+  portalWire(markDirty);
   const s = S.site;
   $("#s-title").value = s.title; $("#s-tagline").value = s.tagline; $("#s-footer").value = s.footer;
   $("#s-author").value = s.author; $("#s-lang").value = s.lang;
