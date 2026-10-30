@@ -1232,13 +1232,13 @@ body.layout-secure .pt-flag::before {
 }
 body.layout-secure .pt-seal-box { grid-column: 3; }
 body.layout-secure .pt-seal {
-  position: relative; width: 92px; height: 92px; margin: 0 auto; border-radius: 50%; border: 2px solid #8a7420;
+  position: relative; width: max(92px, 11.5em); height: max(92px, 11.5em); margin: 0 auto; border-radius: 50%; border: 2px solid #8a7420;
   background: radial-gradient(circle, #141a33 0 44%, #8a7420 45% 48%, #141a33 49% 68%, #8a7420 69% 72%, #0a0a0a 73%);
   display: flex; align-items: center; justify-content: center; text-align: center;
   color: #c9a227; font: 700 8px/1.15 Arial, Helvetica, sans-serif; letter-spacing: 0.06em;
 }
 body.layout-secure .pt-seal::before { content: ""; position: absolute; inset: 7px; border-radius: 50%; border: 1px dashed #8a7420; animation: pt-spin 14s linear infinite; }
-body.layout-secure .pt-seal span, body.layout-secure .pt-seal b { display: block; max-width: 54px; overflow-wrap: anywhere; }
+body.layout-secure .pt-seal span, body.layout-secure .pt-seal b { display: block; max-width: 6.75em; overflow-wrap: anywhere; }
 body.layout-secure .pt-seal b { font-size: 18px; line-height: 1; margin: 1px auto; }
 body.layout-secure .pt-seal-cap { margin-top: 0.3rem; font: 700 9px Arial, Helvetica, sans-serif; color: var(--muted); text-align: center; }
 body.layout-secure .pt-body { display: grid; grid-template-columns: 11rem minmax(0, 1fr); align-items: stretch; }
@@ -1289,7 +1289,7 @@ body.layout-secure .pt-digits span {
 }
 body.layout-secure .pt-badges { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin-top: 0.85rem; }
 body.layout-secure .pt-badge {
-  display: flex; align-items: center; justify-content: center; width: 88px; height: 31px; padding: 2px;
+  display: flex; align-items: center; justify-content: center; width: max(88px, 9.8em); min-height: 31px; padding: 2px;
   border: 1px solid var(--pt-frame); text-align: center; font: 700 9px/1.1 Arial, Helvetica, sans-serif; overflow: hidden;
 }
 body.layout-secure .pt-badge.b1 { background: linear-gradient(#001, #004); color: var(--pt-highlight); }
@@ -1514,6 +1514,171 @@ FRAME_DESC = ("The Secure portal's page structure with an ordinary look: an opti
               "box, then one framed page with the title row on top, the menu in a column on the left and the footer "
               "along the bottom. Colors and fonts come from the theme. Set its text and images in Settings under "
               "Framed layout.")
+
+# ----------------------------------------------------------------------------
+# Text size
+#
+# Two site-wide settings that work with every theme and layout:
+#   scale  makes all text bigger or smaller, as a percentage
+#   min    the smallest text the site may show, in pixels (0 means no floor)
+# Themes and layouts size text in rem, em and the odd px, in style.css and layout.css. Most of
+# it follows the root size, so the scale sets that. For the rest, and for the floor, every rule
+# in those two files that sets a font size is repeated in text.css with its size wrapped in
+# max(floor, size), px sizes also multiplied by the scale. text.css loads after style.css, so
+# with the same selector it wins. It is written on every build, and only when a setting is on.
+# ----------------------------------------------------------------------------
+
+TEXT_DEFAULTS = {"scale": 100, "min": 0}
+TEXT_FILE = "text.css"
+TEXT_MARK = "/* text.css: written by"
+_FONT_KEYWORDS = {"inherit", "initial", "unset", "revert", "revert-layer", "smaller", "larger", "xx-small", "x-small",
+                  "small", "medium", "large", "x-large", "xx-large", "xxx-large", "math"}
+_SIZE_TOKEN = re.compile(r"^(?:\d*\.)?\d+(?:px|rem|em|%|pt|pc|vw|vh|vmin|vmax|ch|ex|lh|rlh)$", re.I)
+_SIZE_FUNC = re.compile(r"^(?:calc|clamp|min|max)\(.*\)$", re.I | re.S)
+
+
+def clean_text(d, current=None):
+    out = dict(TEXT_DEFAULTS)
+    for src in (current, d):
+        if isinstance(src, dict):
+            out.update({k: v for k, v in src.items() if k in TEXT_DEFAULTS})
+    try:
+        out["scale"] = max(70, min(200, int(out["scale"])))
+    except (TypeError, ValueError):
+        out["scale"] = 100
+    try:
+        n = int(out["min"])
+        out["min"] = 0 if n <= 0 else max(9, min(28, n))
+    except (TypeError, ValueError):
+        out["min"] = 0
+    return out
+
+
+def text_active(t):
+    t = clean_text(t)
+    return t["scale"] != 100 or t["min"] > 0
+
+
+def _css_split(s, seps):
+    """Split s on any char in seps that sits outside brackets and quotes."""
+    out, buf, depth, quote = [], [], 0, ""
+    for ch in s:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in "\"'":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif ch in seps and depth == 0:
+            out.append("".join(buf))
+            buf = []
+            if not ch.isspace():
+                out.append(ch)
+            continue
+        buf.append(ch)
+    out.append("".join(buf))
+    return [x for x in (y.strip() for y in out) if x]
+
+
+def _font_size_value(prop, value):
+    """The font size a font or font-size declaration sets, or "" when it sets none we can use."""
+    value = value.strip()
+    if not value or "!important" in value.lower():
+        return ""
+    if prop == "font-size":
+        if value.lower() in _FONT_KEYWORDS:
+            return ""
+        return value if (_SIZE_TOKEN.match(value) or _SIZE_FUNC.match(value) or value.lower().startswith("var(")) else ""
+    toks = _css_split(value, " \t\n/")
+    for i, tok in enumerate(toks):
+        if tok == "/":
+            continue
+        if _SIZE_TOKEN.match(tok) or _SIZE_FUNC.match(tok):
+            return tok
+        if tok.lower().startswith("var(") and i + 1 < len(toks) and toks[i + 1] == "/":
+            return tok
+    return ""
+
+
+def _css_rules(css):
+    """(at-rule preludes, selector, body) for every plain style rule, inside @media and @supports
+    blocks too. Keyframes, font faces and other at-rules are skipped."""
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    rules, stack, buf, quote = [], [], [], ""
+    for ch in css:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in "\"'":
+            quote = ch
+            buf.append(ch)
+        elif ch == "{":
+            pre = "".join(buf).strip()
+            buf = []
+            if pre.lower().startswith(("@media", "@supports", "@container", "@layer")):
+                stack.append(("at", pre))
+            elif pre.startswith("@") or any(k == "skip" for k, _ in stack) or any(k == "rule" for k, _ in stack):
+                stack.append(("skip", pre))
+            else:
+                stack.append(("rule", pre))
+        elif ch == "}":
+            if stack:
+                kind, pre = stack.pop()
+                if kind == "rule" and pre:
+                    rules.append((tuple(p for k, p in stack if k == "at"), pre, "".join(buf)))
+            buf = []
+        elif ch == ";" and not stack:
+            buf = []
+        else:
+            buf.append(ch)
+    return rules
+
+
+def _scaled(size, factor):
+    """px and pt sizes do not follow the root size, so they get the scale too."""
+    if factor == 1 or not re.search(r"\d(?:px|pt)\b", size):
+        return size
+    return "calc(%s * var(--text-scale))" % size
+
+
+def text_css(css, t):
+    """text.css for the given stylesheet text (layout.css plus style.css), or "" when off."""
+    t = clean_text(t)
+    if not text_active(t):
+        return ""
+    factor = t["scale"] / 100.0
+    floor = "%dpx" % t["min"] if t["min"] else "0px"
+    out = ["%s %s on every build from Settings > Text size, so edits here are lost. */" % (TEXT_MARK, APP),
+           ":root { --text-scale: %s; --text-min: %s; }" % (("%.2f" % factor).rstrip("0").rstrip("."), floor),
+           "html { font-size: max(var(--text-min), calc(var(--base-size, 16px) * var(--text-scale))); }"]
+    for ats, sel, body in _css_rules(css):
+        if sel.strip().lower() in ("html", ":root"):
+            continue
+        size = ""
+        for decl in _css_split(body, ";"):
+            if decl == ";" or ":" not in decl:
+                continue
+            prop, _, val = decl.partition(":")
+            prop = prop.strip().lower()
+            if prop in ("font", "font-size"):
+                v = _font_size_value(prop, val)
+                if v or prop == "font-size":
+                    size = v
+        if not size:
+            continue
+        rule = "%s { font-size: max(var(--text-min), %s); }" % (sel, _scaled(size, factor))
+        for at in reversed(ats):
+            rule = "%s { %s }" % (at, rule)
+        out.append(rule)
+    return "\n".join(out) + "\n"
+
 
 
 SECURE_TOOL_CSS = """
@@ -1806,6 +1971,7 @@ class Wiki:
             c["site"].setdefault(k, v)
         c["site"]["secure"] = clean_portal(c["site"].get("secure"))
         c["site"]["frame"] = clean_frame(c["site"].get("frame"))
+        c["site"]["text"] = clean_text(c["site"].get("text"))
         if c["site"].get("search") not in SEARCH_MODES:
             c["site"]["search"] = "builtin"
         if not isinstance(c.get("generated"), list):
@@ -2071,11 +2237,15 @@ class Wiki:
         if css is None:
             head.append('<link rel="stylesheet" href="%slayout.css">' % prefix)
             head.append('<link rel="stylesheet" href="%sstyle.css">' % prefix)
+            if text_active(site.get("text")):
+                head.append('<link rel="stylesheet" href="%s%s">' % (prefix, TEXT_FILE))
             if site.get("search") == "builtin":
                 head.append('<script src="%ssearch.js" defer></script>' % prefix)
                 head.append("<noscript><style>.search { display: none; }</style></noscript>")
         else:
-            head.append("<style>\n%s\n</style>" % (layout_css(lid, cfg) + "\n" + css).replace("</", "<\\/"))
+            full = layout_css(lid, cfg) + "\n" + css
+            full += "\n" + text_css(full, site.get("text"))
+            head.append("<style>\n%s\n</style>" % full.replace("</", "<\\/"))
         body_class = "layout-%s %s" % (lid, body_class)
         tagline = '\n<span class="tagline">%s</span>' % esc(site["tagline"]) if site.get("tagline") else ""
         top_search = ""
@@ -2260,6 +2430,13 @@ class Wiki:
         text = layout_css(layout_of(self.cfg), self.cfg)
         if not f.is_dir() and read_text(f) != text:
             write_text(f, text)
+        tf = self.root / TEXT_FILE
+        if text_active(self.cfg["site"].get("text")):
+            tt = text_css(text + "\n" + read_text(self.css_path()), self.cfg["site"]["text"])
+            if not tf.is_dir() and read_text(tf) != tt:
+                write_text(tf, tt)
+        elif tf.is_file() and read_text(tf).startswith(TEXT_MARK):
+            tf.unlink()
 
     def build(self):
         c = self.cfg
@@ -2357,6 +2534,7 @@ class Wiki:
 
     def save_css(self, css):
         write_text(self.css_path(), str(css))
+        self.write_layout_css()  # text.css follows the font sizes in style.css
         return {"ok": True}
 
     # ---- home
@@ -2502,6 +2680,8 @@ class Wiki:
             out["secure"] = clean_portal(d["secure"], current.get("secure"))
         if isinstance(d.get("frame"), dict):
             out["frame"] = clean_frame(d["frame"], current.get("frame"))
+        if isinstance(d.get("text"), dict):
+            out["text"] = clean_text(d["text"], current.get("text"))
         out["title"] = out.get("title") or current.get("title") or "My wiki"
         out["lang"] = out.get("lang") or "en"
         return out
@@ -4752,6 +4932,48 @@ function layoutPicker() {
   });
 }
 
+/* ---------- text size settings ---------- */
+const TEXT_TPL = `
+<style>#tx-box{margin:18px 0 0;padding:10px 14px 14px;border:1px solid rgba(127,127,127,.4);border-radius:8px}#tx-box legend{font-weight:600;padding:0 4px}#tx-box .field{display:block;margin:10px 0}</style>
+<fieldset id="tx-box"><legend>Text size</legend>
+  <p class="hint">These work with every theme and layout. Use them when a theme's font reads small, or to make the whole site easier to read.</p>
+  <label class="field">Text size <span style="display:flex;align-items:center;gap:10px;margin-top:4px"><input type="range" id="tx-scale-r" min="70" max="200" step="5" style="flex:1"><input type="number" id="tx-scale" min="70" max="200" step="5" style="max-width:90px"> %</span><span class="hint">Grows or shrinks every piece of text by the same amount. 100% is the theme's own size.</span></label>
+  <label class="field">Smallest text <select id="tx-min">MINOPTS</select><span class="hint">Nothing on the site is drawn smaller than this, including small print like dates, captions, menu notes and badges. Bigger text is left alone.</span></label>
+  <p><button type="button" id="tx-reset">Back to 100% with no minimum</button></p>
+</fieldset>`;
+
+function textFieldset() {
+  const sizes = [0, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 22, 24];
+  return TEXT_TPL.replace("MINOPTS", sizes.map((n) => '<option value="' + n + '">' + (n ? n + " px" : "No minimum") + "</option>").join(""));
+}
+
+function textFill(t) {
+  t = t || {};
+  const sc = parseInt(t.scale, 10) || 100;
+  document.getElementById("tx-scale").value = sc;
+  document.getElementById("tx-scale-r").value = sc;
+  const sel = document.getElementById("tx-min");
+  const want = String(parseInt(t.min, 10) || 0);
+  if (![...sel.options].some((o) => o.value === want)) sel.appendChild(new Option(want + " px", want));
+  sel.value = want;
+}
+
+function textRead() {
+  const n = document.getElementById("tx-scale");
+  if (!n) return undefined;
+  return { scale: Math.max(70, Math.min(200, parseInt(n.value, 10) || 100)), min: parseInt(document.getElementById("tx-min").value, 10) || 0 };
+}
+
+function textWire(onChange) {
+  if (!document.getElementById("tx-box")) return;
+  textFill(S.site.text);
+  const n = document.getElementById("tx-scale"), r = document.getElementById("tx-scale-r");
+  r.addEventListener("input", () => { n.value = r.value; onChange(); });
+  n.addEventListener("input", () => { r.value = n.value; onChange(); });
+  document.getElementById("tx-min").addEventListener("change", onChange);
+  document.getElementById("tx-reset").addEventListener("click", () => { textFill({ scale: 100, min: 0 }); onChange(); });
+}
+
 /* ---------- framed layout settings ---------- */
 const FR_TEXT = ["top_bar", "notice", "left_image", "right_image", "nav_title", "nav_note"];
 const FRAME_TPL = `
@@ -4955,6 +5177,7 @@ function readSettings() {
     search: ($("input[name=st-search]:checked") || { value: "builtin" }).value,
     secure: portalRead(),
     frame: frameRead(),
+    text: textRead(),
   };
   BOOLS.forEach((k) => { o[k] = $("#st-" + k).checked; });
   return o;
@@ -4962,9 +5185,10 @@ function readSettings() {
 
 async function openSettings() {
   view = { type: "settings" };
-  $("#left").innerHTML = SET_TPL.replace("PORTALBOX", portalFieldset() + frameFieldset());
+  $("#left").innerHTML = SET_TPL.replace("PORTALBOX", textFieldset() + portalFieldset() + frameFieldset());
   portalWire(markDirty);
   frameWire(markDirty);
+  textWire(markDirty);
   const s = S.site;
   ["title", "tagline", "description", "footer", "author", "lang", "url"].forEach((k) => { $("#st-" + k).value = s[k] || ""; });
   BOOLS.forEach((k) => { $("#st-" + k).checked = !!s[k]; });

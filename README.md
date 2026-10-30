@@ -221,6 +221,7 @@ my-site/
   sitemap.xml, robots.txt    when enabled
   style.css                  your stylesheet
   layout.css                 the chosen layouts, rewritten on every build
+  text.css                   text size and smallest text, only while either is on
   assets/                    images
   .siteforge/                markdown sources, settings, trash
 ```
@@ -288,6 +289,17 @@ All four use the same Markdown renderer. It covers a practical subset of CommonM
 WikiGen and SiteForge add `[[wiki links]]` and callouts (`> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`).
 
 Links and images use paths from the site root, such as `about.html` or `assets/photo.png`, and are adjusted automatically for pages in subfolders. Raw HTML passes through an allowlist sanitizer that keeps common layout and formatting tags and removes anything unsafe (see [Security](#security)).
+
+## Text size
+
+Every tool has a **Text size** section in **Settings**. It works the same with every theme and layout, and the preview updates as you change it.
+
+- **Text size** grows or shrinks all text by a percentage, from 70% to 200%. 100% is the theme's own size. Use it when a theme's font reads small.
+- **Smallest text** is a floor, from 10 to 24 px. Nothing on the site is drawn smaller than it, including small print like dates, captions, menu notes and badges. Text that is already bigger is left alone.
+
+Most text in the themes and layouts is sized relative to the page's base size, so the percentage mostly works by scaling that. The rest, and the floor, are handled by `text.css`, which the tool writes on every build and every CSS save while either setting is on. It repeats each rule from `layout.css` and `style.css` that sets a font size, with the size wrapped in `max(floor, size)` and pixel sizes multiplied by the percentage. It loads after `style.css`, so it wins. Turn both settings back to 100% and no minimum and the file is removed and no longer linked.
+
+The floor applies to decorative text too. In Secure portal the seal and the 88x31 badges grow to fit bigger text, so a high floor makes them larger than the originals.
 
 ## Layout and CSS
 
