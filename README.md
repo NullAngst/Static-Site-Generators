@@ -128,7 +128,7 @@ Use the import box on the setup screen to start a new site from an old one, or *
 | WikiGen | Sections, articles and drafts, the wiki home, and the search, contents and sidebar settings |
 | StoryGen | Stories, chapters and drafts, the library page, extra pages, and the reading settings |
 
-From all three, images in `assets/` are copied. The site title, URL and similar settings also come across when importing into a new site, or when you tick that option in Site structure.
+From all three, images in `assets/` and fonts in `assets/fonts/` are copied. The site title, URL, logo and font settings and similar also come across when importing into a new site, or when you tick that option in Site structure.
 
 **URLs.** Imported into a new site with **Serve it from the site root** ticked, a WikiGen or StoryGen site keeps every URL it had. A SiteGen site keeps its URLs without that option, including the `/rss` and `/rss.xml` feed addresses.
 
@@ -222,7 +222,7 @@ my-site/
   style.css                  your stylesheet
   layout.css                 the chosen layouts, rewritten on every build
   text.css                   text size and smallest text, only while either is on
-  assets/                    images
+  assets/                    images, and fonts/ for uploaded fonts
   .siteforge/                markdown sources, settings, trash
 ```
 
@@ -289,6 +289,32 @@ All four use the same Markdown renderer. It covers a practical subset of CommonM
 WikiGen and SiteForge add `[[wiki links]]` and callouts (`> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`).
 
 Links and images use paths from the site root, such as `about.html` or `assets/photo.png`, and are adjusted automatically for pages in subfolders. Raw HTML passes through an allowlist sanitizer that keeps common layout and formatting tags and removes anything unsafe (see [Security](#security)).
+
+## Images, logo and fonts
+
+All four tools handle these the same way.
+
+**Images in the text.** The editor toolbar has an **Upload image** button. Put the cursor where the image should go, press it, and pick one or more files. Each one is copied to `assets/` and the Markdown for it, `![name](assets/name.png)`, goes in at the cursor. You can also paste an image from the clipboard or drag image files onto the text. If the cursor sits inside a line of text the image goes in inline, right there. On an empty line, or at the start or end of a line, it becomes its own paragraph so it does not run into the text around it. The alt text starts as the file name; change it between the square brackets.
+
+**Logo.** **Settings > Logo and fonts** has an **Upload logo** button, or you can type an `assets/...` path or a full web address. Then pick where it goes in the header:
+
+- left or right of the site title
+- above the site title
+- in place of the site title, with the alt text read out instead
+- as a banner across the top of the header, with the title still shown below it
+- not in the header
+
+Separately you can show it in the footer and use it as the browser tab icon. The header and footer heights are set in pixels. It works with every layout, including Secure portal and Framed, and the preview updates as you change it. Next to the title the logo is treated as decoration so screen readers do not read the name twice.
+
+**Fonts.** **Upload font** takes woff2, woff, ttf or otf files and saves them to `assets/fonts/`. The family name, weight and style are guessed from the file name (`OpenSans-SemiBoldItalic.woff2` becomes Open Sans, 600, italic) and you can change all three. Upload one file per weight or style and give them the same family name, and the browser picks the right file for bold and italic text. Then choose which family to use for body text, headings and the site title, menus and small text, and code. Theme font leaves that part alone.
+
+The picks go into `layout.css` as `@font-face` rules plus an override of the theme's font variables, so they survive a theme change. A `font-family` rule you write in `style.css` still wins.
+
+Things to know:
+
+- **Use woff2 where you can.** It is a fraction of the size of ttf or otf. Font files over 10 MB are refused.
+- **Check the license.** Self-hosting a font on a website needs a license that allows web embedding. Fonts from Google Fonts and most other open font projects allow it; many desktop font licenses do not.
+- **Removing is not deleting.** Removing a font from the list, or clearing the logo, leaves the file in `assets/`. Delete it there if you want it gone from the published site.
 
 ## Text size
 

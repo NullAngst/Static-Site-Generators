@@ -1365,6 +1365,225 @@ def frame_body(f, *, prefix, title, brand, nav, main, footer):
     return "\n".join(out)
 
 
+# ----------------------------------------------------------------------------
+# Logo and fonts (Settings > Logo and fonts)
+#
+# The logo is any image in assets/ or a full URL. It can sit left or right of the site title,
+# above it, in place of it, or as a banner across the top of the header, and it can repeat in the
+# footer and serve as the browser tab icon.
+#
+# Uploaded fonts go to assets/fonts/ and get @font-face rules in layout.css. Each one can be
+# picked for body text, headings, menus and small text, or code. The picks override the theme's
+# --font-* variables with an html:root rule, which outranks the :root block in style.css, so
+# changing the theme keeps your fonts. A font-family rule you write yourself in style.css still
+# wins, since it targets elements directly.
+# ----------------------------------------------------------------------------
+
+FONT_EXT = {".woff2": "woff2", ".woff": "woff", ".ttf": "truetype", ".otf": "opentype"}
+FONT_MAGIC = {".woff2": (b"wOF2",), ".woff": (b"wOFF",), ".ttf": (b"\x00\x01\x00\x00", b"true", b"ttcf"),
+              ".otf": (b"OTTO", b"\x00\x01\x00\x00")}
+MAX_FONT = 10 * 1024 * 1024
+FONT_PATH = re.compile(r"^assets/fonts/[A-Za-z0-9_.-]+\.(?:woff2|woff|ttf|otf)$")
+FONT_WEIGHTS = ("100", "200", "300", "400", "500", "600", "700", "800", "900", "100 900")
+LOGO_PLACES = ("left", "right", "above", "replace", "banner", "none")
+FONT_ROLES = (("font_body", "font-body", "system-ui, sans-serif"),
+              ("font_heading", "font-heading", "system-ui, sans-serif"),
+              ("font_ui", "font-ui", "system-ui, sans-serif"),
+              ("font_mono", "font-mono", "ui-monospace, monospace"))
+BRAND_DEFAULTS = {"logo": "", "logo_alt": "", "logo_place": "left", "logo_height": 48, "logo_footer": False,
+                  "footer_height": 32, "favicon": False, "fonts": [], "font_body": "", "font_heading": "",
+                  "font_ui": "", "font_mono": ""}
+_WEIGHT_WORDS = (("extralight", "200"), ("ultralight", "200"), ("semibold", "600"), ("demibold", "600"),
+                 ("extrabold", "800"), ("ultrabold", "800"), ("hairline", "100"), ("thin", "100"),
+                 ("light", "300"), ("regular", "400"), ("book", "400"), ("normal", "400"), ("medium", "500"),
+                 ("bold", "700"), ("heavy", "900"), ("black", "900"))
+LOGO_CSS = """
+.site-title.has-logo { display: inline-flex; align-items: center; gap: 0.6rem; }
+.site-logo { display: block; height: var(--logo-height); width: auto; max-width: 100%; }
+.site-title.logo-replace .site-logo { max-width: min(100%, 80vw); object-fit: contain; }
+.site-title.logo-above { display: inline-block; }
+.site-title.logo-above .site-logo { display: inline-block; vertical-align: top; }
+.site-title.logo-above .site-title-text { display: block; margin-top: 0.35rem; }
+html body a.site-title.has-logo.has-logo.has-logo { display: inline-flex; }
+html body a.site-title.logo-above.logo-above.logo-above { display: inline-block; }
+.site-banner { line-height: 0; text-align: center; padding: 0.5rem 0 0; }
+.site-banner a { display: inline-block; max-width: 100%; }
+.site-banner img { display: inline-block; max-width: 100%; height: auto; max-height: var(--logo-height); }
+.footer-logo-link { display: inline-block; line-height: 0; margin: 0 0 0.5rem; }
+.footer-logo { display: inline-block; height: var(--logo-footer-height); width: auto; max-width: 100%; }
+@media (max-width: 640px) { .site-logo { max-height: min(var(--logo-height), 56px); } }
+"""
+
+
+def _clamp_int(v, lo, hi, default):
+    try:
+        return max(lo, min(hi, int(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+def clean_family(s):
+    """A font family name that is safe inside CSS quotes: letters, digits, space, dot, dash, underscore."""
+    s = re.sub(r"[^A-Za-z0-9 _.-]+", "", str(s or ""))
+    return re.sub(r"\s+", " ", s).strip()[:60]
+
+
+def guess_font(filename):
+    """Family, weight and style guessed from a font file name such as OpenSans-SemiBoldItalic.woff2."""
+    stem = os.path.splitext(os.path.basename(str(filename)))[0]
+    squashed = re.sub(r"[-_ ]+", "", stem.lower())
+    style = "italic" if ("italic" in squashed or "oblique" in squashed) else "normal"
+    if "variable" in squashed or "wght" in squashed:
+        weight = "100 900"
+    else:
+        weight = next((w for word, w in _WEIGHT_WORDS if word in squashed), "400")
+    keep = []
+    for part in re.split(r"[-_ \[\]()]+", stem):
+        low = part.lower()
+        if not low:
+            continue
+        if (any(low.startswith(word) for word, _ in _WEIGHT_WORDS) or low.startswith(("italic", "oblique", "variable", "webfont"))
+                or re.fullmatch(r"v?\d+|wght|ital|vf|latin|subset|opsz", low)):
+            break
+        keep.append(part)
+    fam = re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", " ".join(keep) or stem)
+    return clean_family(fam) or "Custom font", weight, style
+
+
+def clean_brand(d, current=None):
+    out = copy.deepcopy(BRAND_DEFAULTS)
+    for src in (current, d):
+        if isinstance(src, dict):
+            out.update({k: copy.deepcopy(v) for k, v in src.items() if k in BRAND_DEFAULTS})
+    out["logo"] = str(out["logo"] or "").strip()[:400]
+    out["logo_alt"] = str(out["logo_alt"] or "").strip()[:120]
+    if out["logo_place"] not in LOGO_PLACES:
+        out["logo_place"] = "left"
+    out["logo_height"] = _clamp_int(out["logo_height"], 16, 400, 48)
+    out["footer_height"] = _clamp_int(out["footer_height"], 12, 200, 32)
+    out["logo_footer"] = bool(out["logo_footer"])
+    out["favicon"] = bool(out["favicon"])
+    fonts, seen = [], set()
+    for f in out["fonts"] if isinstance(out["fonts"], list) else []:
+        if not isinstance(f, dict):
+            continue
+        path = str(f.get("file") or "").strip()
+        if not FONT_PATH.match(path) or path in seen:
+            continue
+        g_fam, g_weight, g_style = guess_font(path)
+        weight = str(f.get("weight") or g_weight)
+        fonts.append({"file": path, "family": clean_family(f.get("family")) or g_fam,
+                      "weight": weight if weight in FONT_WEIGHTS else "400",
+                      "style": "italic" if f.get("style") == "italic" else "normal"})
+        seen.add(path)
+        if len(fonts) >= 32:
+            break
+    out["fonts"] = fonts
+    families = {f["family"] for f in fonts}
+    for key, _, _ in FONT_ROLES:
+        fam = clean_family(out[key])
+        out[key] = fam if fam in families else ""
+    return out
+
+
+def brand_css(b, root=""):
+    """@font-face rules, font picks and logo sizing for layout.css. root leads from the page to
+    the site root; it is empty in layout.css itself, which sits at the root."""
+    b = clean_brand(b)
+    out = []
+    for f in b["fonts"]:
+        fmt = FONT_EXT[os.path.splitext(f["file"])[1].lower()]
+        out.append('@font-face { font-family: "%s"; src: url("%s%s") format("%s"); font-weight: %s; '
+                   "font-style: %s; font-display: swap; }" % (f["family"], root, f["file"], fmt, f["weight"], f["style"]))
+    roles = ['  --%s: "%s", %s;' % (var, b[key], fallback) for key, var, fallback in FONT_ROLES if b[key]]
+    if roles:
+        out.append("html:root {\n%s\n}" % "\n".join(roles))
+    if b["logo"]:
+        out.append("html:root { --logo-height: %dpx; --logo-footer-height: %dpx; }%s"
+                   % (b["logo_height"], b["footer_height"], LOGO_CSS))
+    if not out:
+        return ""
+    return "\n/* Logo and fonts, from Settings > Logo and fonts */\n%s\n" % "\n".join(out)
+
+
+def _logo_src(b, prefix):
+    return safe_url(b["logo"], prefix, "src") if b["logo"] else ""
+
+
+def brand_title(site, prefix, cls="site-title"):
+    """The site title link, with the logo where Settings put it."""
+    b = clean_brand(site.get("brand"))
+    title = site.get("title") or ""
+    href = prefix + "index.html"
+    src = _logo_src(b, prefix)
+    place = b["logo_place"] if src else "none"
+    if place in ("none", "banner"):
+        return '<a class="%s" href="%s">%s</a>' % (cls, attr(href), esc(title))
+    if place == "replace":
+        return ('<a class="%s has-logo logo-replace" href="%s"><img class="site-logo" src="%s" alt="%s"></a>'
+                % (cls, attr(href), attr(src), attr(b["logo_alt"] or title)))
+    img = '<img class="site-logo" src="%s" alt="">' % attr(src)
+    text = '<span class="site-title-text">%s</span>' % esc(title)
+    return ('<a class="%s has-logo logo-%s" href="%s">%s</a>'
+            % (cls, place, attr(href), text + img if place == "right" else img + text))
+
+
+def brand_banner(site, prefix):
+    b = clean_brand(site.get("brand"))
+    src = _logo_src(b, prefix)
+    if not src or b["logo_place"] != "banner":
+        return ""
+    return ('<div class="site-banner"><a href="%sindex.html"><img src="%s" alt="%s"></a></div>\n'
+            % (attr(prefix), attr(src), attr(b["logo_alt"] or site.get("title") or "")))
+
+
+def brand_footer(site, prefix):
+    b = clean_brand(site.get("brand"))
+    src = _logo_src(b, prefix)
+    if not src or not b["logo_footer"]:
+        return ""
+    return ('<a class="footer-logo-link" href="%sindex.html"><img class="footer-logo" src="%s" alt="%s"></a>'
+            % (attr(prefix), attr(src), attr(b["logo_alt"] or site.get("title") or "")))
+
+
+def brand_favicon(site, prefix):
+    b = clean_brand(site.get("brand"))
+    src = _logo_src(b, prefix)
+    if not src or not b["favicon"]:
+        return ""
+    kind = mimetypes.guess_type(b["logo"].split("?")[0])[0]
+    return '<link rel="icon" href="%s"%s>' % (attr(src), ' type="%s"' % attr(kind) if kind else "")
+
+
+def save_font_file(root, name, data):
+    """Store an uploaded font in assets/fonts/ and guess its family, weight and style."""
+    stem, ext = os.path.splitext(os.path.basename(str(name)))
+    ext = ext.lower()
+    if ext not in FONT_EXT:
+        raise ApiError("Only font files can be added here (woff2, woff, ttf, otf).")
+    if not data:
+        raise ApiError("That file is empty.")
+    if len(data) > MAX_FONT:
+        raise ApiError("That font is over 10 MB. Use a woff2 version or a subset.")
+    if not data.startswith(FONT_MAGIC[ext]):
+        raise ApiError("That file does not look like a %s font." % ext[1:])
+    family, weight, style = guess_font(stem + ext)
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", stem).strip("-.") or "font"
+    folder = root / "assets" / "fonts"
+    folder.mkdir(parents=True, exist_ok=True)
+    fn, n = stem + ext, 2
+    while (folder / fn).exists():
+        fn = "%s-%d%s" % (stem, n, ext)
+        n += 1
+    (folder / fn).write_bytes(data)
+    return {"file": "assets/fonts/" + fn, "family": family, "weight": weight, "style": style}
+
+
+for _ext, _type in ((".woff2", "font/woff2"), (".woff", "font/woff"), (".ttf", "font/ttf"), (".otf", "font/otf"),
+                    (".avif", "image/avif"), (".webp", "image/webp"), (".svg", "image/svg+xml")):
+    mimetypes.add_type(_type, _ext)
+
+
 def special_body(lid, site, prefix, **kw):
     """The body for the Secure portal and Framed layouts, which build their own page frame."""
     if lid == "frame":
@@ -1672,14 +1891,14 @@ def _layout_css_base(lid):
     )
 
 
-def layout_css(lid, cfg=None):
+def layout_css(lid, cfg=None, root=""):
     text = _layout_css_base(lid)
     site = cfg.get("site") if isinstance(cfg, dict) and isinstance(cfg.get("site"), dict) else {}
     if lid == "secure":
         text += portal_vars_css(clean_portal(site.get("secure")))
     elif lid == "frame":
         text += frame_vars_css(clean_frame(site.get("frame")))
-    return text
+    return text + brand_css(site.get("brand"), root)
 
 
 def layout_list():
@@ -2042,6 +2261,9 @@ class Site:
             head.append('<base href="%s">' % attr(base))
         head.append('<meta name="viewport" content="width=device-width, initial-scale=1">')
         head.extend(self.head_seo(cfg, seo, prefix))
+        fav = brand_favicon(site, prefix)
+        if fav:
+            head.append(fav)
         if site.get("rss") and site.get("url"):
             head.append('<link rel="alternate" type="application/rss+xml" title="%s" href="%srss">' % (attr(st), prefix))
         lid = layout_of(cfg)
@@ -2051,7 +2273,7 @@ class Site:
             if text_active(site.get("text")):
                 head.append('<link rel="stylesheet" href="%s%s">' % (prefix, TEXT_FILE))
         else:
-            full = layout_css(lid, cfg) + "\n" + css
+            full = layout_css(lid, cfg, prefix) + "\n" + css
             full += "\n" + text_css(full, site.get("text"))
             head.append("<style>\n%s\n</style>" % full.replace("</", "<\\/"))
         body_class = "layout-%s %s" % (lid, body_class)
@@ -2059,16 +2281,18 @@ class Site:
         nav = self.nav_html(cfg, prefix, current, exact)
         nav_block = '\n<nav class="site-nav" aria-label="Main"><ul>\n%s\n</ul></nav>' % nav if nav else ""
         header = (
-            '<header class="site-header"><div class="wrap">\n'
-            '<div class="brand"><a class="site-title" href="%sindex.html">%s</a>%s</div>%s\n</div></header>'
-            % (prefix, esc(st), tagline, nav_block)
+            '<header class="site-header">%s<div class="wrap">\n'
+            '<div class="brand">%s%s</div>%s\n</div></header>'
+            % (brand_banner(site, prefix), brand_title(site, prefix), tagline, nav_block)
         )
         foot = site.get("footer", "").replace("{year}", str(datetime.date.today().year)).replace("{title}", st)
         footer = ""
-        if foot.strip():
-            footer = '<footer class="site-footer"><div class="wrap"><p>%s</p></div></footer>' % Markdown(prefix).inline(foot)
+        flogo = brand_footer(site, prefix)
+        if foot.strip() or flogo:
+            footer = ('<footer class="site-footer"><div class="wrap">%s%s</div></footer>'
+                      % (flogo, "<p>%s</p>" % Markdown(prefix).inline(foot) if foot.strip() else ""))
         if lid in SPECIAL_LAYOUTS:
-            brand = '<a class="site-title" href="%sindex.html">%s</a>%s' % (prefix, esc(st), tagline)
+            brand = brand_banner(site, prefix) + brand_title(site, prefix) + tagline
             main = '<main id="main" class="wrap">\n%s\n</main>' % body
             inner = special_body(lid, site, prefix, title=st, brand=brand, nav=nav_block, main=main,
                                 footer=footer)
@@ -2579,6 +2803,8 @@ class Site:
             out["frame"] = clean_frame(d["frame"], current.get("frame"))
         if isinstance(d.get("text"), dict):
             out["text"] = clean_text(d["text"], current.get("text"))
+        if isinstance(d.get("brand"), dict):
+            out["brand"] = clean_brand(d["brand"], current.get("brand"))
         out["title"] = out.get("title") or current.get("title") or "My site"
         out["lang"] = out.get("lang") or "en"
         return out
@@ -2808,6 +3034,8 @@ def api(method, route, query, h):
         return site.preview(h.read_json())
     if parts == ["upload"] and method == "POST":
         return site.upload(q.get("name", ["image"])[0], h.read_body(MAX_UPLOAD))
+    if parts == ["upload-font"] and method == "POST":
+        return save_font_file(site.root, q.get("name", ["font"])[0], h.read_body(MAX_FONT + 1))
     if parts == ["build"] and method == "POST":
         site.build()
         return {"ok": True}
@@ -3964,7 +4192,7 @@ const MD_TOOLS = `
   <button data-md="italic"><i>Italic</i></button>
   <button data-md="heading">Heading</button>
   <button data-md="link">Link</button>
-  <button data-md="image">Image</button>
+  <button data-md="image" title="Upload an image and insert it at the cursor. You can also paste or drag images into the text.">Upload image</button>
   <button data-md="code">Code</button>
   <button data-md="list">List</button>
   <button data-md="quote">Quote</button>
@@ -4410,13 +4638,9 @@ function bindEditor() {
   const ta = $("#md");
   ta.addEventListener("input", markDirty);
   $$(".md-tools button").forEach((b) => b.addEventListener("click", () => {
-    if (b.dataset.md === "image") $("#img-file").click(); else applyMd(ta, b.dataset.md);
+    if (b.dataset.md === "image") pickImages(ta); else applyMd(ta, b.dataset.md);
   }));
-  $("#img-file").addEventListener("change", async (ev) => {
-    const f = ev.target.files[0];
-    ev.target.value = "";
-    if (f) { try { await uploadImage(f, ta); } catch (e) { toast(e.message, "bad"); } }
-  });
+  wireImages(ta);
 }
 
 /* ---------- sidebar and top bar ---------- */
@@ -4976,6 +5200,273 @@ async function saveMenu() {
   } catch (e) { toast(e.message, "bad"); }
 }
 
+/* ---------- images in the editor: upload and insert at the cursor ---------- */
+let imgAt = null;
+
+function isImageFile(f) { return /^image\//.test(f.type || "") || /\.(png|jpe?g|gif|webp|svg|avif)$/i.test(f.name || ""); }
+
+function imageAlt(name) {
+  const t = String(name || "").replace(/\.[^.]+$/, "").replace(/[-_]+/g, " ").replace(/[\[\]\\\r\n]/g, "").trim();
+  return t || "image";
+}
+
+async function postFile(route, file) {
+  const r = await fetch("/api/" + route + "?name=" + encodeURIComponent(file.name || "file"), { method: "POST", headers: { "X-Token": TOKEN }, body: file });
+  let d = {};
+  try { d = await r.json(); } catch (e) { /* not json */ }
+  if (!r.ok) throw new Error(d.error || "Upload failed");
+  return d;
+}
+
+// Inside a line of text the image goes inline, right at the cursor. On an empty line, or at the
+// start or end of a line, it becomes its own paragraph so it is not glued to the text around it.
+function imageSnippet(v, s, e, imgs) {
+  const before = v.slice(0, s), after = v.slice(e);
+  const lb = before.slice(before.lastIndexOf("\n") + 1), la = after.split("\n")[0];
+  if (lb.trim() && la.trim()) return imgs.join(" ");
+  let pre = "", post = "";
+  if (lb.trim()) pre = "\n\n";
+  else if (before.trim() && !/\n[ \t]*\n[ \t]*$/.test(before)) pre = "\n";
+  if (la.trim()) post = "\n\n";
+  else if (after.trim() && !/^[ \t]*\n[ \t]*\n/.test(after)) post = "\n";
+  return pre + imgs.join("\n\n") + post;
+}
+
+function pickImages(ta) {
+  imgAt = [ta.selectionStart, ta.selectionEnd];
+  $("#img-file").click();
+}
+
+async function insertImages(ta, files) {
+  const at = imgAt || [ta.selectionStart, ta.selectionEnd];
+  imgAt = null;
+  const list = [...files].filter(isImageFile);
+  if (!list.length) { toast("Only image files can be inserted (png, jpg, gif, webp, svg, avif).", "bad"); return; }
+  const out = [];
+  for (const f of list) {
+    try { const d = await postFile("upload", f); out.push("![" + imageAlt(f.name) + "](" + d.path + ")"); }
+    catch (e) { toast(f.name + ": " + e.message, "bad"); }
+  }
+  if (!out.length) return;
+  const len = ta.value.length, s = Math.min(at[0], len), e = Math.min(at[1], len);
+  ta.focus();
+  ta.setRangeText(imageSnippet(ta.value, s, e, out), s, e, "end");
+  ta.dispatchEvent(new Event("input"));
+  toast(out.length === 1 ? "Image uploaded and inserted at the cursor" : out.length + " images uploaded and inserted at the cursor");
+}
+
+function wireImages(ta) {
+  const pick = $("#img-file");
+  if (!pick) return;
+  pick.multiple = true;
+  pick.addEventListener("change", () => {
+    const fs = [...pick.files];
+    pick.value = "";
+    if (fs.length) insertImages(ta, fs); else imgAt = null;
+  });
+  ta.addEventListener("paste", (ev) => {
+    const cd = ev.clipboardData;
+    if (!cd || [...cd.types].includes("text/plain")) return;
+    const fs = [...cd.files].filter(isImageFile);
+    if (!fs.length) return;
+    ev.preventDefault();
+    imgAt = null;
+    insertImages(ta, fs);
+  });
+  ta.addEventListener("dragover", (ev) => {
+    if (ev.dataTransfer && [...ev.dataTransfer.types].includes("Files")) { ev.preventDefault(); ev.dataTransfer.dropEffect = "copy"; }
+  });
+  ta.addEventListener("drop", (ev) => {
+    const fs = [...((ev.dataTransfer && ev.dataTransfer.files) || [])];
+    if (!fs.length) return;
+    ev.preventDefault();
+    imgAt = null;
+    insertImages(ta, fs);
+  });
+}
+
+/* ---------- logo and fonts settings ---------- */
+const BR_PLACES = [["left", "Left of the site title"], ["right", "Right of the site title"], ["above", "Above the site title"],
+  ["replace", "In place of the site title"], ["banner", "Banner across the top of the header"], ["none", "Not in the header"]];
+const BR_ROLES = [["font_body", "Body text"], ["font_heading", "Headings and site title"], ["font_ui", "Menus, dates and small text"], ["font_mono", "Code"]];
+const BR_WEIGHTS = [["100", "100 Thin"], ["200", "200 Extra light"], ["300", "300 Light"], ["400", "400 Regular"], ["500", "500 Medium"],
+  ["600", "600 Semibold"], ["700", "700 Bold"], ["800", "800 Extra bold"], ["900", "900 Black"], ["100 900", "Variable, 100 to 900"]];
+const BR_DEFAULTS = { logo: "", logo_alt: "", logo_place: "left", logo_height: 48, logo_footer: false, footer_height: 32, favicon: false,
+  fonts: [], font_body: "", font_heading: "", font_ui: "", font_mono: "" };
+let brFonts = [];
+const BRAND_TPL = `
+<style>#br-box{margin:18px 0 0;padding:10px 14px 14px;border:1px solid rgba(127,127,127,.4);border-radius:8px}#br-box legend{font-weight:600;padding:0 4px}#br-box>label:not(.field){display:block;margin:6px 0}#br-box .field{display:block;margin:10px 0}#br-box .br-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0;padding:6px 0;border-bottom:1px solid rgba(127,127,127,.25)}#br-box .br-row>*{width:auto;flex:0 0 auto;margin:0}#br-box .br-row input[type=text]{flex:1 1 180px;min-width:0}#br-box .field>.hint{display:block}#br-box .br-file{font-size:12px;opacity:.75;flex:1 1 100%;word-break:break-all}#br-thumb{margin-top:8px;padding:8px;display:inline-block;border:1px dashed rgba(127,127,127,.5);border-radius:6px;background:repeating-conic-gradient(rgba(127,127,127,.18) 0 25%,transparent 0 50%) 0 0/16px 16px}#br-thumb img{display:block;max-height:72px;max-width:260px}#br-roles{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:6px 14px}#br-roles .field{margin:4px 0}</style>
+<fieldset id="br-box"><legend>Logo and fonts</legend>
+  <div class="field"><span>Logo</span>
+    <div style="display:flex;gap:6px;align-items:center"><input id="br-logo" style="flex:1" maxlength="400" placeholder="assets/logo.png or a full URL"><button type="button" id="br-logo-up">Upload logo</button><button type="button" id="br-logo-clear">Remove</button></div>
+    <input type="file" id="br-logo-file" accept="image/*" hidden>
+    <div id="br-thumb" hidden><img alt="Logo preview"></div>
+  </div>
+  <label class="field">Where it goes in the header <select id="br-logo_place"></select></label>
+  <label class="field">Height in the header, in pixels <input type="number" id="br-logo_height" min="16" max="400" step="2" style="max-width:120px"><span class="hint">For the banner this is the tallest it gets; it shrinks to fit narrow screens.</span></label>
+  <label class="field">Alt text <input id="br-logo_alt" maxlength="120" placeholder="Empty uses the site title"><span class="hint">Read out by screen readers when the logo stands in for the title, is the banner, or sits in the footer. Next to the title it is decoration.</span></label>
+  <label><input type="checkbox" id="br-logo_footer"> Also show it in the footer</label>
+  <label class="field">Height in the footer, in pixels <input type="number" id="br-footer_height" min="12" max="200" step="2" style="max-width:120px"></label>
+  <label><input type="checkbox" id="br-favicon"> Use it as the browser tab icon (favicon)</label>
+  <div class="field"><span>Fonts</span>
+    <div id="br-fonts"></div>
+    <p style="margin:6px 0"><button type="button" id="br-font-up">Upload font</button></p>
+    <span class="hint">woff2, woff, ttf or otf, saved to assets/fonts. Upload one file per weight or style (Regular, Bold, Italic) and give them the same family name; the browser picks the right file. Removing a font from this list leaves its file in assets/fonts.</span>
+    <input type="file" id="br-font-file" accept=".woff2,.woff,.ttf,.otf" multiple hidden>
+  </div>
+  <div id="br-roles"></div>
+  <span class="hint">Theme font keeps what the theme sets. A pick here overrides the theme, so it stays when you change themes.</span>
+</fieldset>`;
+
+function brandFieldset() { return BRAND_TPL; }
+
+function brEl(tag, props, text) {
+  const e = document.createElement(tag);
+  Object.entries(props || {}).forEach(([k, v]) => e.setAttribute(k, v));
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+function brSrc(p) { return /^([a-z][a-z0-9+.-]*:|\/\/)/i.test(p) ? p : "/site/" + p.replace(/^\.?\//, ""); }
+
+function brThumb() {
+  const v = document.getElementById("br-logo").value.trim(), box = document.getElementById("br-thumb");
+  box.hidden = !v;
+  if (v) box.querySelector("img").src = brSrc(v);
+}
+
+function brFamilies() { return [...new Set(brFonts.map((f) => f.family).filter(Boolean))]; }
+
+function brRoles(keep) {
+  const box = document.getElementById("br-roles"), fams = brFamilies();
+  box.innerHTML = "";
+  BR_ROLES.forEach(([k, l]) => {
+    const sel = brEl("select", { id: "br-" + k });
+    sel.appendChild(new Option("Theme font", ""));
+    fams.forEach((f) => sel.appendChild(new Option(f, f)));
+    sel.value = fams.includes(keep[k]) ? keep[k] : "";
+    sel.addEventListener("change", brChanged);
+    const lab = brEl("label", { class: "field" });
+    lab.append(l + " ", sel);
+    box.appendChild(lab);
+  });
+}
+
+function brRoleVals() {
+  const o = {};
+  BR_ROLES.forEach(([k]) => { const s = document.getElementById("br-" + k); o[k] = s ? s.value : ""; });
+  return o;
+}
+
+let brOnChange = () => {};
+function brChanged() { brOnChange(); }
+
+function brFontRows() {
+  const box = document.getElementById("br-fonts");
+  box.innerHTML = "";
+  if (!brFonts.length) { box.appendChild(brEl("p", { class: "hint", style: "margin:4px 0" }, "No fonts uploaded.")); return; }
+  brFonts.forEach((f, i) => {
+    const fam = brEl("input", { type: "text", maxlength: "60", value: f.family, "aria-label": "Font family name" });
+    const wt = brEl("select", { "aria-label": "Weight" });
+    BR_WEIGHTS.forEach(([v, l]) => wt.appendChild(new Option(l, v)));
+    wt.value = f.weight;
+    const st = brEl("select", { "aria-label": "Style" });
+    st.appendChild(new Option("Normal", "normal"));
+    st.appendChild(new Option("Italic", "italic"));
+    st.value = f.style;
+    const rm = brEl("button", { type: "button" }, "Remove");
+    fam.addEventListener("change", () => {
+      const before = brRoleVals(), old = f.family;
+      f.family = fam.value.replace(/[^A-Za-z0-9 _.-]+/g, "").replace(/\s+/g, " ").trim().slice(0, 60) || old;
+      fam.value = f.family;
+      if (!brFonts.some((x) => x.family === old)) BR_ROLES.forEach(([k]) => { if (before[k] === old) before[k] = f.family; });
+      brRoles(before);
+      brChanged();
+    });
+    wt.addEventListener("change", () => { f.weight = wt.value; brChanged(); });
+    st.addEventListener("change", () => { f.style = st.value; brChanged(); });
+    rm.addEventListener("click", () => { const before = brRoleVals(); brFonts.splice(i, 1); brFontRows(); brRoles(before); brChanged(); });
+    const row = brEl("div", { class: "br-row" });
+    row.append(fam, wt, st, rm, brEl("span", { class: "br-file" }, f.file));
+    box.appendChild(row);
+  });
+}
+
+function brandFill(b) {
+  b = Object.assign({}, BR_DEFAULTS, b || {});
+  const g = (k) => document.getElementById("br-" + k);
+  ["logo", "logo_alt", "logo_height", "footer_height"].forEach((k) => { g(k).value = b[k] == null ? "" : b[k]; });
+  g("logo_place").value = b.logo_place;
+  g("logo_footer").checked = !!b.logo_footer;
+  g("favicon").checked = !!b.favicon;
+  brFonts = (b.fonts || []).map((f) => Object.assign({}, f));
+  brFontRows();
+  brRoles(b);
+  brThumb();
+}
+
+function brandRead() {
+  const g = (k) => document.getElementById("br-" + k);
+  if (!g("logo")) return undefined;
+  return Object.assign({
+    logo: g("logo").value.trim(), logo_alt: g("logo_alt").value, logo_place: g("logo_place").value,
+    logo_height: parseInt(g("logo_height").value, 10) || 48, logo_footer: g("logo_footer").checked,
+    footer_height: parseInt(g("footer_height").value, 10) || 32, favicon: g("favicon").checked,
+    fonts: brFonts.map((f) => ({ file: f.file, family: f.family, weight: f.weight, style: f.style })),
+  }, brRoleVals());
+}
+
+function brandWire(onChange) {
+  const box = document.getElementById("br-box");
+  if (!box) return;
+  // sit near the top, right after the title and footer fields
+  const foot = document.querySelector("#st-footer, #s-footer");
+  const host = foot && foot.closest("fieldset");
+  if (host && host !== box) host.after(box);
+  else {
+    const first = [...document.querySelectorAll("#left fieldset")].find((f) => !["br-box", "tx-box", "pt-box", "fr-box"].includes(f.id));
+    if (first) first.before(box);
+  }
+  brOnChange = onChange;
+  const g = (k) => document.getElementById("br-" + k);
+  BR_PLACES.forEach(([v, l]) => g("logo_place").appendChild(new Option(l, v)));
+  brandFill(S.site.brand);
+  ["logo", "logo_alt", "logo_height", "footer_height"].forEach((k) => g(k).addEventListener("input", () => { if (k === "logo") brThumb(); onChange(); }));
+  ["logo_place", "logo_footer", "favicon"].forEach((k) => g(k).addEventListener("change", onChange));
+  g("logo-up").addEventListener("click", () => g("logo-file").click());
+  g("logo-clear").addEventListener("click", () => { g("logo").value = ""; brThumb(); onChange(); });
+  g("logo-file").addEventListener("change", async () => {
+    const f = g("logo-file").files[0];
+    g("logo-file").value = "";
+    if (!f) return;
+    try {
+      const d = await postFile("upload", f);
+      g("logo").value = d.path;
+      brThumb();
+      onChange();
+      toast("Logo uploaded. Save settings to keep it.");
+    } catch (e) { toast(e.message, "bad"); }
+  });
+  g("font-up").addEventListener("click", () => g("font-file").click());
+  g("font-file").addEventListener("change", async () => {
+    const files = [...g("font-file").files];
+    g("font-file").value = "";
+    if (!files.length) return;
+    const before = brRoleVals();
+    let added = 0;
+    for (const f of files) {
+      try { brFonts.push(await postFile("upload-font", f)); added += 1; } catch (e) { toast(f.name + ": " + e.message, "bad"); }
+    }
+    if (!added) return;
+    const fams = brFamilies();
+    if (!BR_ROLES.some(([k]) => before[k]) && fams.length === 1) { before.font_body = fams[0]; before.font_heading = fams[0]; }
+    brFontRows();
+    brRoles(before);
+    onChange();
+    toast((added === 1 ? "Font uploaded" : added + " fonts uploaded") + ". Pick where to use it, then save settings.");
+  });
+}
+
 /* ---------- settings ---------- */
 function readSettings() {
   return {
@@ -4986,15 +5477,17 @@ function readSettings() {
     secure: portalRead(),
     frame: frameRead(),
     text: textRead(),
+    brand: brandRead(),
   };
 }
 
 async function openSettings() {
   view = { type: "settings" };
-  $("#left").innerHTML = SET_TPL.replace("PORTALBOX", textFieldset() + portalFieldset() + frameFieldset());
+  $("#left").innerHTML = SET_TPL.replace("PORTALBOX", brandFieldset() + textFieldset() + portalFieldset() + frameFieldset());
   portalWire(markDirty);
   frameWire(markDirty);
   textWire(markDirty);
+  brandWire(markDirty);
   const s = S.site;
   $("#s-title").value = s.title; $("#s-tagline").value = s.tagline; $("#s-footer").value = s.footer;
   $("#s-author").value = s.author; $("#s-lang").value = s.lang;
