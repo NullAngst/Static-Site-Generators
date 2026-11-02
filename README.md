@@ -15,10 +15,14 @@ None of them needs anything beyond Python itself. Each file is the whole program
 
 | Program | Builds | JavaScript in the built site | Default port | Sources kept in |
 |---|---|---|---|---|
-| SiteForge | Pages plus any mix of blog, wiki and library | None, unless the wiki's built-in search is on | 8768 | `.siteforge/` |
-| SiteGen | Pages and a blog | None | 8765 | `.sitegen/` |
-| WikiGen | A wiki | None, unless built-in search is on | 8766 | `.wikigen/` |
-| StoryGen | A story library | None | 8767 | `.storygen/` |
+| SiteForge | Pages plus any mix of blog, wiki and library | Menu helper on pages with a side or dropdown menu, plus the wiki's built-in search if on | 8768 | `.siteforge/` |
+| SiteGen | Pages and a blog | Menu helper in the Sidebar, Secure portal and Framed layouts | 8765 | `.sitegen/` |
+| WikiGen | A wiki | Menu helper, plus built-in search if on | 8766 | `.wikigen/` |
+| StoryGen | A story library | Menu helper on pages with a chapter sidebar or the Book Contents dropdown | 8767 | `.storygen/` |
+
+The menu helper is a few lines of inline script. It remembers whether you hid the side menu, and it closes an open dropdown menu when you open another, click elsewhere or press Escape. The menus themselves are plain HTML and CSS, so they still work with JavaScript off; they just forget the hidden state on each page and stay open until clicked again.
+
+Every layout with a menu down the side has a **Hide menu** button above the content on wide screens (narrow screens keep the Menu button). In SiteGen's and SiteForge's Sidebar layout it reads **Collapse sidebar** and moves the menu into the Classic header on top. In Secure portal and Framed it hides the menu column at any width.
 
 For a new site, use SiteForge. The different default ports let every tool run at the same time.
 
@@ -236,7 +240,7 @@ These are the programs SiteForge grew out of. They work on their own, and each h
 
 ## SiteGen
 
-Pages and a blog, with no JavaScript in the output.
+Pages and a blog, with no JavaScript in the output apart from the menu helper in the Sidebar, Secure portal and Framed layouts.
 
 - **Pages:** home, about and privacy templates, and custom pages.
 - **Blog:** a feed page, posts with drafts and publishing, tags with tag pages, and an RSS feed at `/rss` and `/rss.xml`.
@@ -257,13 +261,13 @@ A wiki: the site title across the top, a left sidebar with search and one dropdo
 - **Workflow:** drafts, plus rescanning Markdown written in another editor.
 - **Search:** three modes, set in Settings. **Built-in** is instant, via one generated `search.js`. **Web** is a DuckDuckGo form limited to your domain, with no JavaScript. **Off** means the site contains no JavaScript at all. Built-in search indexes the first 8,000 characters of each article.
 - **Themes:** all 27 (Wiki group first).
-- **Layouts:** Classic, Docs (search in the top bar, contents in a right rail), Handbook (sections as a dropdown menu bar, centered column), Rail (no top bar, dark full-height rail), Portal (home page hero with a big search box, sections on the right), Secure portal and Framed (in both, the sidebar becomes the menu column).
+- **Layouts:** Classic, Docs (search in the top bar, contents in a right rail), Handbook (sections as a dropdown menu bar, centered column), Rail (no top bar, a full-height rail in the theme's sidebar colors with an accent edge), Portal (home page hero with a big search box, sections on the right), Secure portal and Framed (in both, the sidebar becomes the menu column).
 
 Output: `index.html`, then `<section>/index.html` and `<section>/<article>.html`. Sources are in `.wikigen/`.
 
 ## StoryGen
 
-Fiction sites, with no JavaScript in the output.
+Fiction sites, with no JavaScript in the output apart from the menu helper.
 
 - **Library page:** covers, blurbs, status, genres and word counts.
 - **Story pages:** a chapter list, or the full text for a single piece.

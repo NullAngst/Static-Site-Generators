@@ -9,7 +9,9 @@ Run it:
 
 It needs Python 3.8 or newer and nothing else (standard library only). It starts a small web
 server on 127.0.0.1 and opens the editor in your browser. The editor uses JavaScript. The site
-it builds is HTML and CSS; the only script it can emit is the wiki's optional search.js.
+it builds is HTML and CSS, plus two kinds of script: the wiki's optional search.js, and a few
+lines of inline script on pages with a side menu or a dropdown menu, which remember "Hide menu"
+between pages and close dropdowns when you click elsewhere. Both menus work without it.
 
 A site always has pages. On top of that you can switch on any of three modules:
     Blog      posts, drafts, tags, a feed page and RSS
@@ -998,6 +1000,118 @@ def default_css(theme="site-clean"):
 
 
 # ----------------------------------------------------------------------------
+# Side menu collapse and dropdown menus
+#
+# Layouts with a menu down one side get a "Hide menu" button. It is a hidden checkbox and a
+# label, so it works with JavaScript off: the CSS keys off html:has(#menu-collapse:checked).
+# NAV_JS is a small inline script. It remembers the choice between pages (localStorage), and it
+# closes dropdown menus (any <details data-drop>) when another one opens, when you click
+# outside them, or when you press Escape. Without it the dropdowns still open and close, they
+# just stay open until clicked again, and the menu shows again on every new page.
+# ----------------------------------------------------------------------------
+
+COLLAPSE_INPUT = '<input type="checkbox" id="menu-collapse" class="menu-collapse" aria-label="Hide the menu">'
+
+
+def collapse_button(where="", hide="Hide menu", show="Show menu"):
+    return ('<label for="menu-collapse" class="collapse-button%s"><span class="cb-hide">%s</span>'
+            '<span class="cb-show">%s</span></label>' % (" " + where if where else "", hide, show))
+
+
+NAV_JS = """<script>
+(function () {
+  var d = document, t = d.getElementById("menu-collapse"), key = "menu-collapsed";
+  if (t) {
+    try { if (localStorage.getItem(key) === "1") { t.checked = true; } } catch (e) {}
+    t.addEventListener("change", function () {
+      try { localStorage.setItem(key, t.checked ? "1" : "0"); } catch (e) {}
+    });
+  }
+  function openDrops() { return d.querySelectorAll("details[data-drop][open]"); }
+  d.addEventListener("toggle", function (e) {
+    var el = e.target;
+    if (!el.open || !el.hasAttribute || !el.hasAttribute("data-drop")) { return; }
+    openDrops().forEach(function (o) { if (o !== el) { o.open = false; } });
+  }, true);
+  d.addEventListener("click", function (e) {
+    openDrops().forEach(function (o) { if (!o.contains(e.target)) { o.open = false; } });
+  });
+  d.addEventListener("keydown", function (e) {
+    if (e.key !== "Escape") { return; }
+    openDrops().forEach(function (o) {
+      var had = o.contains(d.activeElement), s = o.querySelector("summary");
+      o.open = false;
+      if (had && s) { s.focus(); }
+    });
+  });
+})();
+</script>"""
+
+_COLLAPSED = "html:has(#menu-collapse:checked)"
+
+COLLAPSE_BASE_CSS = """
+/* Hide menu button: a checkbox and a label, no script needed */
+.menu-collapse { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }
+.collapse-button {
+  display: none; align-items: center; gap: 0.5rem; width: max-content; cursor: pointer; user-select: none;
+  padding: 0.25rem 0.7rem; font: 600 0.8rem/1.3 var(--font-ui, inherit); color: var(--muted);
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.collapse-button:hover { color: var(--accent); border-color: var(--accent); }
+.collapse-button::before {
+  content: ""; flex: none; width: 0.4em; height: 0.4em; margin-left: 0.15em;
+  border-left: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: rotate(45deg);
+}
+.collapse-button .cb-show { display: none; }
+.in-main.collapse-button { margin: 0 0 1rem; }
+html:has(#menu-collapse:focus-visible) .collapse-button { outline: 2px solid var(--accent); outline-offset: 2px; }
+COLLAPSED .collapse-button::before { margin-left: 0; margin-right: 0.15em; transform: rotate(-135deg); }
+COLLAPSED .collapse-button .cb-hide { display: none; }
+COLLAPSED .collapse-button .cb-show { display: inline; }
+/* Secure portal and Framed: the menu column hides at any width */
+.collapse-button.always { display: inline-flex; }
+COLLAPSED .pt-body { grid-template-columns: minmax(0, 1fr); }
+COLLAPSED .pt-nav { display: none; }
+@media print { .collapse-button { display: none !important; } }
+""".replace("COLLAPSED", _COLLAPSED)
+
+_MENU_OPEN = "html:where(:not(:has(#menu-collapse:checked)))"
+
+
+def page_scripts(side, html=""):
+    """The very top of <body>: the Hide menu checkbox when the page has a side menu, then NAV_JS
+    when there is a side menu or a dropdown (Handbook sections, the Book Contents) to look after."""
+    out = COLLAPSE_INPUT + "\n" if side else ""
+    if side or "data-drop" in html:
+        out += NAV_JS + "\n"
+    return out
+
+
+_MAIN_OPEN = re.compile(r"<main\b[^>]*>")
+
+
+def with_button(html, button):
+    """html with button placed just inside its first <main>."""
+    return _MAIN_OPEN.sub(lambda m: m.group(0) + "\n" + button, html, count=1)
+
+
+SF_COLLAPSE_CSS = COLLAPSE_BASE_CSS + """
+/* SiteForge: the wiki sections and a story's chapter list (.with-sidebar.collapsible) hide on wide
+   screens. The Sidebar site layout falls back to the Classic header on top while collapsed. */
+@media (min-width: 821px) {
+  .with-sidebar.collapsible .collapse-button { display: inline-flex; }
+  COLLAPSED .with-sidebar.collapsible { grid-template-columns: minmax(0, 1fr); }
+  COLLAPSED .with-sidebar.collapsible > .side { display: none; }
+  COLLAPSED .with-sidebar.collapsible > main > .content { margin-left: auto; margin-right: auto; }
+}
+@media (min-width: 900px) {
+  body.layout-sidebar .collapse-button { display: inline-flex; }
+}
+COLLAPSED .pt-main .with-sidebar.collapsible > .side { display: block; }
+""".replace("COLLAPSED", _COLLAPSED)
+
+
+# ----------------------------------------------------------------------------
 # Layouts
 #
 # A layout changes how the site is put together, not its colors. There are four choices, one
@@ -1017,33 +1131,34 @@ def default_css(theme="site-clean"):
 LAYOUT_SHARED_CSS = """
 /* every layout: panel padding as variables, so full-width images can line up with it */
 .content { --pad-y: 1.75rem; --pad-x: clamp(1rem, 3vw, 2.25rem); }
-"""
+""" + SF_COLLAPSE_CSS
 
 SITE_SIDEBAR_CSS = """
-/* Site layout, Sidebar: title, tagline and menu in a column on the left */
+/* Site layout, Sidebar: title, tagline and menu in a column on the left. Every rule waits on the menu
+   not being collapsed (html:where(...) adds no weight), so collapsing falls back to the Classic header. */
 @media (min-width: 900px) {
-  body.layout-sidebar { display: grid; grid-template-columns: minmax(14rem, 17rem) minmax(0, 1fr); grid-template-rows: auto 1fr auto; min-height: 100vh; }
-  body.layout-sidebar > .site-header {
+  MENU_OPEN body.layout-sidebar { display: grid; grid-template-columns: minmax(14rem, 17rem) minmax(0, 1fr); grid-template-rows: auto 1fr auto; min-height: 100vh; }
+  MENU_OPEN body.layout-sidebar > .site-header {
     grid-column: 1; grid-row: 1 / -1; position: sticky; top: 0; height: 100vh; overflow-y: auto;
     background: var(--sidebar-bg); color: var(--sidebar-text); border-bottom: 0; border-right: 1px solid var(--border);
   }
-  body.layout-sidebar .site-header .bar { flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: 2.25rem; padding: 2.75rem 1.4rem 2rem; }
-  body.layout-sidebar .site-title { font-size: 1.6rem; line-height: 1.15; color: var(--sidebar-text); }
-  body.layout-sidebar .tagline { margin-top: 0.55rem; line-height: 1.45; }
-  body.layout-sidebar .site-nav { margin-left: 0; }
-  body.layout-sidebar .site-nav ul { flex-direction: column; flex-wrap: nowrap; gap: 0.15rem; }
-  body.layout-sidebar .site-nav a {
+  MENU_OPEN body.layout-sidebar .site-header .bar { flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: 2.25rem; padding: 2.75rem 1.4rem 2rem; }
+  MENU_OPEN body.layout-sidebar .site-title { font-size: 1.6rem; line-height: 1.15; color: var(--sidebar-text); }
+  MENU_OPEN body.layout-sidebar .tagline { margin-top: 0.55rem; line-height: 1.45; }
+  MENU_OPEN body.layout-sidebar .site-nav { margin-left: 0; }
+  MENU_OPEN body.layout-sidebar .site-nav ul { flex-direction: column; flex-wrap: nowrap; gap: 0.15rem; }
+  MENU_OPEN body.layout-sidebar .site-nav a {
     display: block; padding: 0.4rem 0.75rem; color: var(--sidebar-text);
     border-bottom: 0; border-left: 3px solid transparent; border-radius: 0 var(--radius) var(--radius) 0;
   }
-  body.layout-sidebar .site-nav a:hover { background: var(--sidebar-active); }
-  body.layout-sidebar .site-nav a[aria-current="page"] { color: var(--accent); border-left-color: var(--accent); background: var(--sidebar-active); }
-  body.layout-sidebar > .story-backdrop { grid-column: 2; grid-row: 1; }
-  body.layout-sidebar > main, body.layout-sidebar > .with-sidebar { grid-column: 2; grid-row: 2; min-width: 0; width: 100%; }
-  body.layout-sidebar > main.page-main { max-width: calc(var(--max-width) + 4rem); padding-top: 3rem; }
-  body.layout-sidebar > .site-footer { grid-column: 2; grid-row: 3; }
+  MENU_OPEN body.layout-sidebar .site-nav a:hover { background: var(--sidebar-active); }
+  MENU_OPEN body.layout-sidebar .site-nav a[aria-current="page"] { color: var(--accent); border-left-color: var(--accent); background: var(--sidebar-active); }
+  MENU_OPEN body.layout-sidebar > .story-backdrop { grid-column: 2; grid-row: 1; }
+  MENU_OPEN body.layout-sidebar > main, MENU_OPEN body.layout-sidebar > .with-sidebar { grid-column: 2; grid-row: 2; min-width: 0; width: 100%; }
+  MENU_OPEN body.layout-sidebar > main.page-main { max-width: calc(var(--max-width) + 4rem); padding-top: 3rem; }
+  MENU_OPEN body.layout-sidebar > .site-footer { grid-column: 2; grid-row: 3; }
 }
-"""
+""".replace("MENU_OPEN", _MENU_OPEN)
 
 SITE_MAGAZINE_CSS = """
 /* Site layout, Magazine: big centered masthead over a ruled menu bar, a wider page */
@@ -2951,28 +3066,41 @@ class SiteBase:
                       % (flogo, "<p>%s</p>" % Markdown(prefix).inline(foot) if foot.strip() else ""))
         body = main if full else '<main id="main" class="wrap page-main">\n%s\n</main>' % main
         site_lid = layout_id(c, "site")
+        has_side = 'class="collapse-button' in body
         if site_lid in SPECIAL_LAYOUTS:
             brand = brand_banner(site, prefix) + brand_title(site, prefix) + tagline
+            side = bool(nav.strip()) or has_side
+            if has_side:
+                body = collapse_button("in-main always") + "\n" + body.replace(collapse_button("in-main") + "\n", "", 1)
+            elif side:
+                body = with_button(body, collapse_button("in-main always"))
             inner = special_body(site_lid, site, prefix, title=st, brand=brand, nav=nav, main=body, footer=footer)
             return ('<!DOCTYPE html>\n<html lang="%s">\n<head>\n%s\n</head>\n<body class="%s">\n'
-                    '<a class="skip" href="#main">Skip to content</a>\n%s\n</body>\n</html>\n'
-                    % (attr(site.get("lang") or "en"), "\n".join(head), attr(classes), inner))
+                    '<a class="skip" href="#main">Skip to content</a>\n%s%s\n</body>\n</html>\n'
+                    % (attr(site.get("lang") or "en"), "\n".join(head), attr(classes), page_scripts(side, body), inner))
+        side = has_side or (site_lid == "sidebar" and bool(nav))
+        if side and not has_side:
+            body = with_button(body, collapse_button("in-main", "Collapse sidebar", "Expand sidebar"))
         return (
             '<!DOCTYPE html>\n<html lang="%s">\n<head>\n%s\n</head>\n<body class="%s">\n'
-            '<a class="skip" href="#main">Skip to content</a>\n'
+            '<a class="skip" href="#main">Skip to content</a>\n%s'
             '<input type="checkbox" id="nav-toggle" class="nav-toggle" aria-label="Show menu">\n'
             '<header class="site-header">%s<div class="bar">\n<div class="brand">%s%s</div>\n'
             '%s%s\n</div></header>\n%s%s\n</body>\n</html>\n'
-            % (attr(site.get("lang") or "en"), "\n".join(head), attr(classes), brand_banner(site, prefix),
+            % (attr(site.get("lang") or "en"), "\n".join(head), attr(classes), page_scripts(side, body),
+               brand_banner(site, prefix),
                brand_title(site, prefix), tagline,
                '<label for="nav-toggle" class="nav-button">Menu</label>\n' if nav else "", nav, body, footer)
         )
 
-    def sidebar_layout(self, side_html, main_html, button="Browse"):
+    def sidebar_layout(self, side_html, main_html, button="Browse", collapsible=True):
+        """collapsible: the side column can be hidden with the Hide menu button on wide screens.
+        Off for the Handbook wiki, where the side column is a menu bar."""
         return ('<input type="checkbox" id="side-toggle" class="side-toggle" aria-label="Show %s">\n'
                 '<label for="side-toggle" class="side-button">%s</label>\n'
-                '<div class="with-sidebar">\n%s\n<main id="main">\n%s\n</main>\n</div>'
-                % (attr(button.lower()), esc(button), side_html, main_html))
+                '<div class="with-sidebar%s">\n%s\n<main id="main">\n%s%s\n</main>\n</div>'
+                % (attr(button.lower()), esc(button), " collapsible" if collapsible else "", side_html,
+                   collapse_button("in-main") + "\n" if collapsible else "", main_html))
 
     # ---- pages
     def render_page(self, c, page, markdown, css=None, base=None):
@@ -3871,7 +3999,8 @@ class WikiMixin:
                 items.append('<li><a href="%s%s"%s>%s</a></li>' % (prefix, self.wart_rel(s["slug"], a["slug"], c), cur, esc(a["title"])))
             bar = layout_opt(c, "wiki").get("bar")
             out.append('<details class="nav-section%s"%s>\n<summary>%s<span class="nav-count">%d</span></summary>\n<ul>\n%s\n</ul>\n</details>'
-                       % (" is-current" if is_cur else "", " open" if (c["site"].get("expand") or is_cur) and not bar else "",
+                       % (" is-current" if is_cur else "",
+                          " data-drop" if bar else (" open" if c["site"].get("expand") or is_cur else ""),
                           esc(s["title"]), len(arts), "\n".join(items)))
         out.append("</nav>")
         return "\n".join(x for x in out if x)
@@ -3912,7 +4041,8 @@ class WikiMixin:
         article = '<article class="content">\n%s\n</article>' % "\n".join(x for x in parts if x)
         if rail:
             article = '<div class="wiki-body has-rail">\n<aside class="toc-rail">%s</aside>\n%s\n</div>' % (rail, article)
-        main = self.sidebar_layout(side, article, button="Browse the " + self.module_label("wiki", c).lower())
+        main = self.sidebar_layout(side, article, button="Browse the " + self.module_label("wiki", c).lower(),
+                                   collapsible=not layout_opt(c, "wiki").get("bar"))
         return self.doc(c, rel=rel, main=main, full=True, current_mod="wiki", head_extra=self.wiki_head(c, prefix), **kw)
 
     def wiki_landing(self, c, rel, css=None, base=None, intro=None):
@@ -4674,7 +4804,7 @@ class LibraryMixin:
         if lay.get("chapters") == "solo":
             drop = ""
             if lay.get("drop"):
-                drop = ('<details class="contents-drop"><summary>Contents</summary>\n%s\n</details>\n'
+                drop = ('<details class="contents-drop" data-drop><summary>Contents</summary>\n%s\n</details>\n'
                         % self.chapters_nav(c, story, prefix, ch["slug"]))
             main = '<main id="main" class="solo">\n<div class="sheet">\n%s%s\n</div>\n</main>' % (drop, "\n".join(parts))
         else:

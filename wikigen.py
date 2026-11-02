@@ -11,9 +11,12 @@ It needs Python 3.8 or newer and nothing else (standard library only).
 It starts a small web server on 127.0.0.1 and opens the editor in your browser.
 
 The generated wiki is HTML and CSS. The sidebar sections are plain <details> dropdowns and the
-mobile menu is a CSS toggle, so both work with JavaScript turned off. The one exception is the
-built-in search, which is a single small script (search.js). Search can be switched to a
-no-JavaScript web search form, or turned off, in Settings.
+mobile menu and the desktop "Hide menu" button are CSS toggles, so all of them work with
+JavaScript turned off. The built-in search is a single small script (search.js); it can be
+switched to a no-JavaScript web search form, or turned off, in Settings. Pages with a side menu
+or dropdowns also carry a few lines of inline script that remember "Hide menu" between pages
+and close an open dropdown when you open another or click elsewhere. Without it those still
+work, they just do not remember or close on their own.
 
 Folder layout (inside the wiki folder you choose):
     index.html                      generated home page
@@ -902,6 +905,109 @@ def default_css(theme="clean"):
 
 
 # ----------------------------------------------------------------------------
+# Side menu collapse and dropdown menus
+#
+# Layouts with a menu down one side get a "Hide menu" button. It is a hidden checkbox and a
+# label, so it works with JavaScript off: the CSS keys off html:has(#menu-collapse:checked).
+# NAV_JS is a small inline script. It remembers the choice between pages (localStorage), and it
+# closes dropdown menus (any <details data-drop>) when another one opens, when you click
+# outside them, or when you press Escape. Without it the dropdowns still open and close, they
+# just stay open until clicked again, and the menu shows again on every new page.
+# ----------------------------------------------------------------------------
+
+COLLAPSE_INPUT = '<input type="checkbox" id="menu-collapse" class="menu-collapse" aria-label="Hide the menu">'
+
+
+def collapse_button(where="", hide="Hide menu", show="Show menu"):
+    return ('<label for="menu-collapse" class="collapse-button%s"><span class="cb-hide">%s</span>'
+            '<span class="cb-show">%s</span></label>' % (" " + where if where else "", hide, show))
+
+
+NAV_JS = """<script>
+(function () {
+  var d = document, t = d.getElementById("menu-collapse"), key = "menu-collapsed";
+  if (t) {
+    try { if (localStorage.getItem(key) === "1") { t.checked = true; } } catch (e) {}
+    t.addEventListener("change", function () {
+      try { localStorage.setItem(key, t.checked ? "1" : "0"); } catch (e) {}
+    });
+  }
+  function openDrops() { return d.querySelectorAll("details[data-drop][open]"); }
+  d.addEventListener("toggle", function (e) {
+    var el = e.target;
+    if (!el.open || !el.hasAttribute || !el.hasAttribute("data-drop")) { return; }
+    openDrops().forEach(function (o) { if (o !== el) { o.open = false; } });
+  }, true);
+  d.addEventListener("click", function (e) {
+    openDrops().forEach(function (o) { if (!o.contains(e.target)) { o.open = false; } });
+  });
+  d.addEventListener("keydown", function (e) {
+    if (e.key !== "Escape") { return; }
+    openDrops().forEach(function (o) {
+      var had = o.contains(d.activeElement), s = o.querySelector("summary");
+      o.open = false;
+      if (had && s) { s.focus(); }
+    });
+  });
+})();
+</script>"""
+
+_COLLAPSED = "html:has(#menu-collapse:checked)"
+
+
+def page_scripts(side, html=""):
+    """What goes at the very top of <body>: the Hide menu checkbox when the page has a side menu,
+    then NAV_JS when there is a side menu or a dropdown to look after. The checkbox comes first so
+    the script can restore it before the menu is drawn."""
+    out = COLLAPSE_INPUT + "\n" if side else ""
+    if side or "data-drop" in html:
+        out += NAV_JS + "\n"
+    return out
+
+COLLAPSE_BASE_CSS = """
+/* Hide menu button: a checkbox and a label, no script needed */
+.menu-collapse { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }
+.collapse-button {
+  display: none; align-items: center; gap: 0.5rem; width: max-content; cursor: pointer; user-select: none;
+  padding: 0.25rem 0.7rem; font: 600 0.8rem/1.3 var(--font-ui, inherit); color: var(--muted);
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.collapse-button:hover { color: var(--accent); border-color: var(--accent); }
+.collapse-button::before {
+  content: ""; flex: none; width: 0.4em; height: 0.4em; margin-left: 0.15em;
+  border-left: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: rotate(45deg);
+}
+.collapse-button .cb-show { display: none; }
+.in-main.collapse-button { margin: 0 0 1rem; }
+html:has(#menu-collapse:focus-visible) .collapse-button { outline: 2px solid var(--accent); outline-offset: 2px; }
+COLLAPSED .collapse-button::before { margin-left: 0; margin-right: 0.15em; transform: rotate(-135deg); }
+COLLAPSED .collapse-button .cb-hide { display: none; }
+COLLAPSED .collapse-button .cb-show { display: inline; }
+/* Secure portal and Framed: the menu column hides at any width */
+.collapse-button.always { display: inline-flex; }
+COLLAPSED .pt-body { grid-template-columns: minmax(0, 1fr); }
+COLLAPSED .pt-nav { display: none; }
+@media print { .collapse-button { display: none !important; } }
+""".replace("COLLAPSED", _COLLAPSED)
+
+WIKI_COLLAPSE_CSS = COLLAPSE_BASE_CSS + """
+/* WikiGen: the button sits in the top bar (in the article column for Rail) on wide screens.
+   Narrow screens keep the Menu button instead. Rail brings its top bar back while the rail is
+   hidden, so the site title stays on the page. */
+@media (min-width: 821px) {
+  .collapse-button { display: inline-flex; }
+  .topbar .collapse-button { align-self: center; }
+  COLLAPSED .layout { grid-template-columns: minmax(0, 1fr); }
+  COLLAPSED .layout > .sidebar { display: none; }
+  COLLAPSED .layout > .main > .content { margin-left: auto; margin-right: auto; }
+  COLLAPSED .layout > .main.has-rail { justify-content: center; }
+  COLLAPSED body.layout-rail .site-footer { margin-left: 0; }
+  COLLAPSED body.layout-rail .topbar { display: flex; }
+}
+""".replace("COLLAPSED", _COLLAPSED)
+
+
+# ----------------------------------------------------------------------------
 # Layouts
 #
 # A layout changes how the wiki is put together: where the search box and the section menu
@@ -916,7 +1022,7 @@ def default_css(theme="clean"):
 LAYOUT_SHARED_CSS = """
 /* every layout: theme values the base styles in style.css do not use */
 .site-title, .content h1, .content h2, .content h3, .content h4 { text-transform: var(--heading-transform, none); letter-spacing: var(--letter-spacing, 0); }
-"""
+""" + WIKI_COLLAPSE_CSS
 
 LAYOUT_TOPSEARCH_CSS = """
 /* search box in the top bar */
@@ -984,23 +1090,19 @@ LAYOUT_HANDBOOK_CSS = """
 """ + LAYOUT_TOPSEARCH_CSS
 
 LAYOUT_RAIL_CSS = """
-/* Rail: no top bar; title, search and sections in a dark full-height rail, open pages */
+/* Rail: no top bar; title, search and sections in a full-height rail in the theme's sidebar
+   colors with an accent edge, open pages */
 .rail-brand { display: none; }
 @media (min-width: 821px) {
   body.layout-rail .topbar { display: none; }
   body.layout-rail .rail-brand { display: block; margin: 0 0.6rem 1.5rem; }
-  body.layout-rail .sidebar .rail-brand .site-title { display: block; padding: 0; font-size: 1.4rem; line-height: 1.2; color: var(--bg); background: none; }
-  body.layout-rail .rail-brand .tagline { display: block; margin-top: 0.35rem; color: color-mix(in srgb, var(--bg) 70%, transparent); }
-  body.layout-rail .sidebar { min-height: 100vh; padding: 2rem 0.9rem; background: var(--text); color: var(--bg); border-right: 0; }
-  body.layout-rail .sidebar a, body.layout-rail .nav-section > summary { color: var(--bg); }
-  body.layout-rail .sidebar a:hover, body.layout-rail .nav-section > summary:hover { background: color-mix(in srgb, var(--bg) 12%, transparent); }
-  body.layout-rail .sidebar a[aria-current="page"] { color: var(--bg); background: color-mix(in srgb, var(--bg) 20%, transparent); box-shadow: inset 3px 0 0 var(--accent); }
-  body.layout-rail .nav-count { color: color-mix(in srgb, var(--bg) 60%, transparent); }
-  body.layout-rail .nav-section ul { border-left-color: color-mix(in srgb, var(--bg) 25%, transparent); }
-  body.layout-rail .sidebar .search input { background: color-mix(in srgb, var(--bg) 10%, transparent); color: var(--bg); border-color: color-mix(in srgb, var(--bg) 30%, transparent); }
-  body.layout-rail .sidebar .search input::placeholder { color: color-mix(in srgb, var(--bg) 60%, transparent); }
-  body.layout-rail .sidebar .search-results a { color: var(--text); }
-  body.layout-rail .sidebar .search-results a:hover, body.layout-rail .sidebar .search-results a.active { background: var(--sidebar-active); }
+  body.layout-rail .sidebar .rail-brand .site-title { display: block; padding: 0; font-size: 1.4rem; line-height: 1.2; color: var(--sidebar-text); background: none; }
+  body.layout-rail .rail-brand .tagline { display: block; margin-top: 0.35rem; color: var(--muted); }
+  body.layout-rail .sidebar {
+    min-height: 100vh; padding: 2rem 0.9rem; border-right: 3px solid var(--accent);
+    background: color-mix(in srgb, var(--accent) 7%, var(--sidebar-bg)); color: var(--sidebar-text);
+  }
+  body.layout-rail .sidebar a[aria-current="page"] { box-shadow: inset 3px 0 0 var(--accent); }
   body.layout-rail .main { padding: 3rem clamp(1.25rem, 5vw, 4.5rem) 4rem; }
   body.layout-rail .content { max-width: var(--content-width); padding: 0; background: none; border: 0; border-radius: 0; }
   body.layout-rail .content h1 { font-size: 2.5rem; border-bottom: 0; }
@@ -1454,8 +1556,9 @@ LOGO_CSS = """
 .site-title.has-logo { display: inline-flex; align-items: center; gap: 0.6rem; }
 .site-logo { display: block; height: var(--logo-height); width: auto; max-width: 100%; }
 .site-title.logo-replace .site-logo { max-width: min(100%, 80vw); object-fit: contain; }
-.site-title.logo-above { display: inline-block; }
+.site-title.logo-above { display: inline-block; text-align: center; }
 .site-title.logo-above .site-logo { display: inline-block; vertical-align: top; }
+html body .topbar { align-items: last baseline; }
 .site-title.logo-above .site-title-text { display: block; margin-top: 0.35rem; }
 html body a.site-title.has-logo.has-logo.has-logo { display: inline-flex; }
 html body a.site-title.logo-above.logo-above.logo-above { display: inline-block; }
@@ -1926,7 +2029,7 @@ LAYOUTS = {
     "handbook": {"label": "Handbook", "search": "top", "bar": True, "css": LAYOUT_HANDBOOK_CSS,
                  "desc": "A centered title and search box, the sections as a menu bar of dropdowns, and one centered column."},
     "rail": {"label": "Rail", "search": "side", "brand": True, "css": LAYOUT_RAIL_CSS,
-             "desc": "No top bar. The title, search and sections sit in a dark full-height rail and articles fill the rest."},
+             "desc": "No top bar. The title, search and sections sit in a full-height rail in the theme's sidebar colors and articles fill the rest."},
     "portal": {"label": "Portal", "search": "top", "hero": True, "css": LAYOUT_PORTAL_CSS,
                "desc": "The home page opens with a big search box over the section cards. Other pages keep the sections on the right."},
     "secure": {"label": "Secure portal", "search": "side", "css": PORTAL_CSS + SECURE_TOOL_CSS, "desc": PORTAL_DESC},
@@ -2413,7 +2516,8 @@ class Wiki:
                 items.append('<li><a href="%s%s/%s.html"%s>%s</a></li>' % (prefix, s["slug"], a["slug"], cur, esc(a["title"])))
             out.append(
                 '<details class="nav-section%s"%s>\n<summary>%s<span class="nav-count">%d</span></summary>\n<ul>\n%s\n</ul>\n</details>'
-                % (" is-current" if is_cur else "", " open" if (site.get("expand") or is_cur) and not lay.get("bar") else "",
+                % (" is-current" if is_cur else "",
+                   " data-drop" if lay.get("bar") else (" open" if site.get("expand") or is_cur else ""),
                    esc(s["title"]), len(arts),
                    "\n".join(items))
             )
@@ -2483,23 +2587,35 @@ class Wiki:
                     '<div class="content">\n%s\n</div>\n</main>' % (rail_html, main_html))
         else:
             main = '<main class="main" id="content">\n<div class="content">\n%s\n</div>\n</main>' % main_html
+        side = bool(sidebar_html.strip()) and not lay.get("bar")
         if lid in SPECIAL_LAYOUTS:
             brand = brand_banner(site, prefix) + brand_title(site, prefix) + tagline
+            if side:
+                main = main.replace('<main class="main" id="content">',
+                                    '<main class="main" id="content">\n' + collapse_button("in-main always"), 1)
             inner = special_body(lid, site, prefix, title=st, brand=brand, nav=sidebar_html,
                                 main=hero_html + main, footer=footer)
             return ('<!DOCTYPE html>\n<html lang="%s">\n<head>\n%s\n</head>\n<body class="%s">\n'
-                    '<a class="skip" href="#content">Skip to content</a>\n%s\n</body>\n</html>\n'
-                    % (attr(site.get("lang") or "en"), "\n".join(head), attr(body_class), inner))
+                    '<a class="skip" href="#content">Skip to content</a>\n%s%s\n</body>\n</html>\n'
+                    % (attr(site.get("lang") or "en"), "\n".join(head), attr(body_class),
+                       page_scripts(side, sidebar_html), inner))
+        top_button = ""
+        if side and lay.get("brand"):
+            main = main.replace('<main class="main%s" id="content">' % (" has-rail" if rail_html else ""),
+                                '<main class="main%s" id="content">\n%s' % (" has-rail" if rail_html else "",
+                                                                         collapse_button("in-main")), 1)
+        elif side:
+            top_button = collapse_button() + "\n"
         return (
             '<!DOCTYPE html>\n<html lang="%s">\n<head>\n%s\n</head>\n<body class="%s">\n'
             '<a class="skip" href="#content">Skip to content</a>\n'
-            '<input type="checkbox" id="nav-toggle" class="nav-toggle" aria-label="Show navigation">\n'
+            '%s<input type="checkbox" id="nav-toggle" class="nav-toggle" aria-label="Show navigation">\n'
             '%s<header class="topbar">\n<label for="nav-toggle" class="nav-button">Menu</label>\n'
-            '%s%s%s\n</header>\n%s'
+            '%s%s%s%s\n</header>\n%s'
             '<div class="layout">\n%s\n%s\n</div>%s\n'
             "</body>\n</html>\n"
-            % (attr(site.get("lang") or "en"), "\n".join(head), attr(body_class), brand_banner(site, prefix),
-               brand_title(site, prefix), tagline, top_search,
+            % (attr(site.get("lang") or "en"), "\n".join(head), attr(body_class), page_scripts(side, sidebar_html),
+               brand_banner(site, prefix), top_button, brand_title(site, prefix), tagline, top_search,
                hero_html, sidebar_html, main, footer)
         )
 

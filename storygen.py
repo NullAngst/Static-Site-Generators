@@ -9,7 +9,10 @@ Run it:
 
 It needs Python 3.8 or newer and nothing else (standard library only).
 It starts a small web server on 127.0.0.1 and opens the editor in your browser.
-The editor uses JavaScript. The sites it generates use none: only HTML and CSS.
+The editor uses JavaScript. The sites it generates are HTML and CSS, except that chapter pages
+with a chapter sidebar (and every page in Secure portal or Framed) carry a few lines of inline
+script that remember "Hide menu" between pages, and the Book layout's Contents dropdown uses it
+to close when you click elsewhere. Both still work without it.
 
 It is built for short stories, novellas and serials: one library page, one page per story,
 and one page per chapter with the chapter list down the left side.
@@ -869,6 +872,103 @@ def default_css(theme="paperback"):
 
 
 # ----------------------------------------------------------------------------
+# Side menu collapse and dropdown menus
+#
+# Layouts with a menu down one side get a "Hide menu" button. It is a hidden checkbox and a
+# label, so it works with JavaScript off: the CSS keys off html:has(#menu-collapse:checked).
+# NAV_JS is a small inline script. It remembers the choice between pages (localStorage), and it
+# closes dropdown menus (any <details data-drop>) when another one opens, when you click
+# outside them, or when you press Escape. Without it the dropdowns still open and close, they
+# just stay open until clicked again, and the menu shows again on every new page.
+# ----------------------------------------------------------------------------
+
+COLLAPSE_INPUT = '<input type="checkbox" id="menu-collapse" class="menu-collapse" aria-label="Hide the menu">'
+
+
+def collapse_button(where="", hide="Hide menu", show="Show menu"):
+    return ('<label for="menu-collapse" class="collapse-button%s"><span class="cb-hide">%s</span>'
+            '<span class="cb-show">%s</span></label>' % (" " + where if where else "", hide, show))
+
+
+NAV_JS = """<script>
+(function () {
+  var d = document, t = d.getElementById("menu-collapse"), key = "menu-collapsed";
+  if (t) {
+    try { if (localStorage.getItem(key) === "1") { t.checked = true; } } catch (e) {}
+    t.addEventListener("change", function () {
+      try { localStorage.setItem(key, t.checked ? "1" : "0"); } catch (e) {}
+    });
+  }
+  function openDrops() { return d.querySelectorAll("details[data-drop][open]"); }
+  d.addEventListener("toggle", function (e) {
+    var el = e.target;
+    if (!el.open || !el.hasAttribute || !el.hasAttribute("data-drop")) { return; }
+    openDrops().forEach(function (o) { if (o !== el) { o.open = false; } });
+  }, true);
+  d.addEventListener("click", function (e) {
+    openDrops().forEach(function (o) { if (!o.contains(e.target)) { o.open = false; } });
+  });
+  d.addEventListener("keydown", function (e) {
+    if (e.key !== "Escape") { return; }
+    openDrops().forEach(function (o) {
+      var had = o.contains(d.activeElement), s = o.querySelector("summary");
+      o.open = false;
+      if (had && s) { s.focus(); }
+    });
+  });
+})();
+</script>"""
+
+_COLLAPSED = "html:has(#menu-collapse:checked)"
+
+COLLAPSE_BASE_CSS = """
+/* Hide menu button: a checkbox and a label, no script needed */
+.menu-collapse { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }
+.collapse-button {
+  display: none; align-items: center; gap: 0.5rem; width: max-content; cursor: pointer; user-select: none;
+  padding: 0.25rem 0.7rem; font: 600 0.8rem/1.3 var(--font-ui, inherit); color: var(--muted);
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.collapse-button:hover { color: var(--accent); border-color: var(--accent); }
+.collapse-button::before {
+  content: ""; flex: none; width: 0.4em; height: 0.4em; margin-left: 0.15em;
+  border-left: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: rotate(45deg);
+}
+.collapse-button .cb-show { display: none; }
+.in-main.collapse-button { margin: 0 0 1rem; }
+html:has(#menu-collapse:focus-visible) .collapse-button { outline: 2px solid var(--accent); outline-offset: 2px; }
+COLLAPSED .collapse-button::before { margin-left: 0; margin-right: 0.15em; transform: rotate(-135deg); }
+COLLAPSED .collapse-button .cb-hide { display: none; }
+COLLAPSED .collapse-button .cb-show { display: inline; }
+/* Secure portal and Framed: the menu column hides at any width */
+.collapse-button.always { display: inline-flex; }
+COLLAPSED .pt-body { grid-template-columns: minmax(0, 1fr); }
+COLLAPSED .pt-nav { display: none; }
+@media print { .collapse-button { display: none !important; } }
+""".replace("COLLAPSED", _COLLAPSED)
+
+
+def page_scripts(side, html=""):
+    """The very top of <body>: the Hide menu checkbox when the page has a side menu, then NAV_JS
+    when there is a side menu or a dropdown (the Book layout's Contents) to look after."""
+    out = COLLAPSE_INPUT + "\n" if side else ""
+    if side or "data-drop" in html:
+        out += NAV_JS + "\n"
+    return out
+
+
+STORY_COLLAPSE_CSS = COLLAPSE_BASE_CSS + """
+/* StoryGen: on wide screens the chapter list beside a chapter can be hidden */
+@media (min-width: 821px) {
+  .reading .collapse-button { display: inline-flex; }
+  COLLAPSED .reading { grid-template-columns: minmax(0, 1fr); }
+  COLLAPSED .reading > .chapters-nav { display: none; }
+}
+COLLAPSED .pt-main .reading > .chapters-nav { display: block; }
+""".replace("COLLAPSED", _COLLAPSED)
+
+
+# ----------------------------------------------------------------------------
 # Layouts
 #
 # A layout changes how the library is put together: whether chapters keep the sidebar, how the
@@ -949,10 +1049,8 @@ body.layout-shelf .toc .ch-meta { flex-basis: 100%; padding-left: 2.35em; }
 
 LAYOUT_SERIAL_CSS = LAYOUT_SOLO_CSS + """
 /* Serial: built for web serials. Latest chapters lead, chapters have navigation top and bottom */
-body.layout-serial .site-header { background: var(--accent); border-bottom: 0; }
-body.layout-serial .site-header .site-title, body.layout-serial .site-nav a, body.layout-serial .site-header .tagline { color: var(--bg); }
-body.layout-serial .site-nav a[aria-current="page"] { color: var(--bg); border-bottom-color: var(--bg); }
-body.layout-serial .nav-button { color: var(--bg); border-color: var(--bg); }
+body.layout-serial .site-header { background: color-mix(in srgb, var(--accent) 16%, var(--header-bg)); border-bottom: 3px solid var(--accent); }
+body.layout-serial .site-nav a[aria-current="page"] { color: var(--accent); border-bottom-color: var(--accent); }
 body.layout-serial .plain { max-width: 58rem; }
 body.layout-serial .updates { margin: 0.75rem 0 0; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
 body.layout-serial .updates li { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0.25rem 1rem; padding: 0.7rem 1rem; }
@@ -1431,8 +1529,9 @@ LOGO_CSS = """
 .site-title.has-logo { display: inline-flex; align-items: center; gap: 0.6rem; }
 .site-logo { display: block; height: var(--logo-height); width: auto; max-width: 100%; }
 .site-title.logo-replace .site-logo { max-width: min(100%, 80vw); object-fit: contain; }
-.site-title.logo-above { display: inline-block; }
+.site-title.logo-above { display: inline-block; text-align: center; }
 .site-title.logo-above .site-logo { display: inline-block; vertical-align: top; }
+html body .site-header .wrap { align-items: last baseline; }
 .site-title.logo-above .site-title-text { display: block; margin-top: 0.35rem; }
 html body a.site-title.has-logo.has-logo.has-logo { display: inline-flex; }
 html body a.site-title.logo-above.logo-above.logo-above { display: inline-block; }
@@ -1921,7 +2020,7 @@ def _layout_css_base(lid):
         "/*\n  layout.css: written by %s on every build, so edits here are lost.\n"
         "  Layout: %s. Pick another one under \"Layout and CSS\" in the editor.\n"
         "  Your own rules go in style.css, which loads after this file and wins any tie.\n*/\n%s%s"
-        % (APP, lay["label"], LAYOUT_SHARED_CSS, lay["css"])
+        % (APP, lay["label"], LAYOUT_SHARED_CSS + STORY_COLLAPSE_CSS, lay["css"])
     )
 
 
@@ -2466,19 +2565,28 @@ class Library:
                       % (flogo, "<p>%s</p>" % Markdown(prefix).inline(foot) if foot.strip() else ""))
         if lid in SPECIAL_LAYOUTS:
             brand = brand_banner(site, prefix) + brand_title(site, prefix) + tagline
+            nav = self.nav_html(cfg, prefix, current)
+            side = bool(nav.strip())
+            if side:
+                main_html = collapse_button("in-main always") + "\n" + main_html
             inner = special_body(lid, site, prefix, title=st, brand=brand,
-                                nav=self.nav_html(cfg, prefix, current), main=main_html, footer=footer)
+                                nav=nav, main=main_html, footer=footer)
             return ('<!DOCTYPE html>\n<html lang="%s">\n<head>\n%s\n</head>\n<body class="%s">\n'
-                    '<a class="skip" href="#read">Skip to content</a>\n%s\n</body>\n</html>\n'
-                    % (attr(site.get("lang") or "en"), "\n".join(head), attr(body_class), inner))
+                    '<a class="skip" href="#read">Skip to content</a>\n%s%s\n</body>\n</html>\n'
+                    % (attr(site.get("lang") or "en"), "\n".join(head), attr(body_class),
+                       page_scripts(side, main_html), inner))
+        side = '<div class="reading">' in main_html
+        if side:
+            main_html = main_html.replace('<main id="read">', '<main id="read">\n' + collapse_button("in-main"), 1)
         return (
             '<!DOCTYPE html>\n<html lang="%s">\n<head>\n%s\n</head>\n<body class="%s">\n'
-            '<a class="skip" href="#read">Skip to content</a>\n'
+            '<a class="skip" href="#read">Skip to content</a>\n%s'
             '<input type="checkbox" id="nav-toggle" class="nav-toggle" aria-label="Show menu">\n'
             '<header class="site-header">%s<div class="wrap">\n'
             '%s%s\n'
             '<label for="nav-toggle" class="nav-button">Menu</label>\n%s\n</div></header>\n%s%s\n</body>\n</html>\n'
-            % (attr(site.get("lang") or "en"), "\n".join(head), attr(body_class), brand_banner(site, prefix),
+            % (attr(site.get("lang") or "en"), "\n".join(head), attr(body_class), page_scripts(side, main_html),
+               brand_banner(site, prefix),
                brand_title(site, prefix), tagline, self.nav_html(cfg, prefix, current), main_html, footer)
         )
 
@@ -2669,7 +2777,7 @@ class Library:
         if lay.get("chapters") == "solo":
             drop = ""
             if lay.get("drop"):
-                drop = ('<details class="contents-drop"><summary>Contents</summary>\n%s\n</details>\n'
+                drop = ('<details class="contents-drop" data-drop><summary>Contents</summary>\n%s\n</details>\n'
                         % self.chapters_nav(cfg, story, prefix, chapter["slug"]))
             main = '<main class="solo" id="read">\n<div class="sheet">\n%s%s\n</div>\n</main>' % (drop, "\n".join(parts))
         else:

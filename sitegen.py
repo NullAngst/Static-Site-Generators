@@ -9,7 +9,9 @@ Run it:
 
 It needs Python 3.8 or newer and nothing else (standard library only).
 It starts a small web server on 127.0.0.1 and opens the editor in your browser.
-The editor itself uses JavaScript. The sites it generates use none: only HTML and CSS.
+The editor itself uses JavaScript. The sites it generates are HTML and CSS, except that pages in
+the Sidebar, Secure portal and Framed layouts carry a few lines of inline script that remember
+the "Collapse sidebar" / "Hide menu" choice between pages. The button itself is pure CSS.
 
 Folder layout (inside the site folder you choose):
     index.html, about.html, ...     generated pages
@@ -810,6 +812,101 @@ def default_css(theme="clean"):
 
 
 # ----------------------------------------------------------------------------
+# Side menu collapse and dropdown menus
+#
+# Layouts with a menu down one side get a "Hide menu" button. It is a hidden checkbox and a
+# label, so it works with JavaScript off: the CSS keys off html:has(#menu-collapse:checked).
+# NAV_JS is a small inline script. It remembers the choice between pages (localStorage), and it
+# closes dropdown menus (any <details data-drop>) when another one opens, when you click
+# outside them, or when you press Escape. Without it the dropdowns still open and close, they
+# just stay open until clicked again, and the menu shows again on every new page.
+# ----------------------------------------------------------------------------
+
+COLLAPSE_INPUT = '<input type="checkbox" id="menu-collapse" class="menu-collapse" aria-label="Hide the menu">'
+
+
+def collapse_button(where="", hide="Hide menu", show="Show menu"):
+    return ('<label for="menu-collapse" class="collapse-button%s"><span class="cb-hide">%s</span>'
+            '<span class="cb-show">%s</span></label>' % (" " + where if where else "", hide, show))
+
+
+NAV_JS = """<script>
+(function () {
+  var d = document, t = d.getElementById("menu-collapse"), key = "menu-collapsed";
+  if (t) {
+    try { if (localStorage.getItem(key) === "1") { t.checked = true; } } catch (e) {}
+    t.addEventListener("change", function () {
+      try { localStorage.setItem(key, t.checked ? "1" : "0"); } catch (e) {}
+    });
+  }
+  function openDrops() { return d.querySelectorAll("details[data-drop][open]"); }
+  d.addEventListener("toggle", function (e) {
+    var el = e.target;
+    if (!el.open || !el.hasAttribute || !el.hasAttribute("data-drop")) { return; }
+    openDrops().forEach(function (o) { if (o !== el) { o.open = false; } });
+  }, true);
+  d.addEventListener("click", function (e) {
+    openDrops().forEach(function (o) { if (!o.contains(e.target)) { o.open = false; } });
+  });
+  d.addEventListener("keydown", function (e) {
+    if (e.key !== "Escape") { return; }
+    openDrops().forEach(function (o) {
+      var had = o.contains(d.activeElement), s = o.querySelector("summary");
+      o.open = false;
+      if (had && s) { s.focus(); }
+    });
+  });
+})();
+</script>"""
+
+_COLLAPSED = "html:has(#menu-collapse:checked)"
+
+COLLAPSE_BASE_CSS = """
+/* Hide menu button: a checkbox and a label, no script needed */
+.menu-collapse { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }
+.collapse-button {
+  display: none; align-items: center; gap: 0.5rem; width: max-content; cursor: pointer; user-select: none;
+  padding: 0.25rem 0.7rem; font: 600 0.8rem/1.3 var(--font-ui, inherit); color: var(--muted);
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.collapse-button:hover { color: var(--accent); border-color: var(--accent); }
+.collapse-button::before {
+  content: ""; flex: none; width: 0.4em; height: 0.4em; margin-left: 0.15em;
+  border-left: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: rotate(45deg);
+}
+.collapse-button .cb-show { display: none; }
+.in-main.collapse-button { margin: 0 0 1rem; }
+html:has(#menu-collapse:focus-visible) .collapse-button { outline: 2px solid var(--accent); outline-offset: 2px; }
+COLLAPSED .collapse-button::before { margin-left: 0; margin-right: 0.15em; transform: rotate(-135deg); }
+COLLAPSED .collapse-button .cb-hide { display: none; }
+COLLAPSED .collapse-button .cb-show { display: inline; }
+/* Secure portal and Framed: the menu column hides at any width */
+.collapse-button.always { display: inline-flex; }
+COLLAPSED .pt-body { grid-template-columns: minmax(0, 1fr); }
+COLLAPSED .pt-nav { display: none; }
+@media print { .collapse-button { display: none !important; } }
+""".replace("COLLAPSED", _COLLAPSED)
+
+_MENU_OPEN = "html:where(:not(:has(#menu-collapse:checked)))"
+
+
+def page_scripts(side, html=""):
+    """The very top of <body>: the Hide menu checkbox when the page has a side menu, then NAV_JS."""
+    out = COLLAPSE_INPUT + "\n" if side else ""
+    if side or "data-drop" in html:
+        out += NAV_JS + "\n"
+    return out
+
+
+SITEGEN_COLLAPSE_CSS = COLLAPSE_BASE_CSS + """
+/* Sidebar layout: "Collapse sidebar" turns the column back into the Classic header on top */
+@media (min-width: 900px) {
+  body.layout-sidebar .collapse-button { display: inline-flex; }
+}
+"""
+
+
+# ----------------------------------------------------------------------------
 # Layouts
 #
 # A layout changes how the site is put together: where the title and menu sit, whether pages
@@ -857,31 +954,32 @@ def _cards_css(L):
 
 
 LAYOUT_SIDEBAR_CSS = """
-/* Sidebar: title, tagline and menu in a column on the left */
+/* Sidebar: title, tagline and menu in a column on the left. Every rule waits on the menu not being
+   collapsed (html:where(...) adds no weight), so collapsing falls back to the Classic header. */
 @media (min-width: 900px) {
-  body.layout-sidebar { display: grid; grid-template-columns: minmax(14rem, 18rem) minmax(0, 1fr); grid-template-rows: 1fr auto; min-height: 100vh; }
-  body.layout-sidebar .site-header {
+  MENU_OPEN body.layout-sidebar { display: grid; grid-template-columns: minmax(14rem, 18rem) minmax(0, 1fr); grid-template-rows: 1fr auto; min-height: 100vh; }
+  MENU_OPEN body.layout-sidebar .site-header {
     grid-column: 1; grid-row: 1 / span 2; position: sticky; top: 0; height: 100vh; overflow-y: auto;
     background: var(--sidebar-bg, var(--surface)); color: var(--sidebar-text, var(--text));
     border-bottom: 0; border-right: 1px solid var(--border);
   }
-  body.layout-sidebar .site-header .wrap { flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: 2.25rem; max-width: none; padding: 2.75rem 1.5rem 2rem; }
-  body.layout-sidebar .site-title { display: block; font-size: 1.65rem; line-height: 1.15; color: var(--sidebar-text, var(--text)); }
-  body.layout-sidebar .tagline { margin-top: 0.6rem; line-height: 1.45; }
-  body.layout-sidebar .site-nav ul { flex-direction: column; flex-wrap: nowrap; gap: 0.15rem; }
-  body.layout-sidebar .site-nav a {
+  MENU_OPEN body.layout-sidebar .site-header .wrap { flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: 2.25rem; max-width: none; padding: 2.75rem 1.5rem 2rem; }
+  MENU_OPEN body.layout-sidebar .site-title { display: block; font-size: 1.65rem; line-height: 1.15; color: var(--sidebar-text, var(--text)); }
+  MENU_OPEN body.layout-sidebar .tagline { margin-top: 0.6rem; line-height: 1.45; }
+  MENU_OPEN body.layout-sidebar .site-nav ul { flex-direction: column; flex-wrap: nowrap; gap: 0.15rem; }
+  MENU_OPEN body.layout-sidebar .site-nav a {
     display: block; padding: 0.4rem 0.75rem; color: var(--sidebar-text, var(--text));
     border-bottom: 0; border-left: 3px solid transparent; border-radius: 0 var(--radius) var(--radius) 0;
   }
-  body.layout-sidebar .site-nav a:hover { background: var(--sidebar-active, var(--border)); }
-  body.layout-sidebar .site-nav a[aria-current="page"], body.layout-sidebar .site-nav a.active {
+  MENU_OPEN body.layout-sidebar .site-nav a:hover { background: var(--sidebar-active, var(--border)); }
+  MENU_OPEN body.layout-sidebar .site-nav a[aria-current="page"], MENU_OPEN body.layout-sidebar .site-nav a.active {
     color: var(--accent); border-left-color: var(--accent); background: var(--sidebar-active, transparent);
   }
-  body.layout-sidebar main.wrap { grid-column: 2; grid-row: 1; width: 100%; max-width: calc(var(--max-width) + 4rem); padding-top: 3rem; }
-  body.layout-sidebar .site-footer { grid-column: 2; grid-row: 2; }
-  body.layout-sidebar .site-footer .wrap { max-width: calc(var(--max-width) + 4rem); }
+  MENU_OPEN body.layout-sidebar main.wrap { grid-column: 2; grid-row: 1; width: 100%; max-width: calc(var(--max-width) + 4rem); padding-top: 3rem; }
+  MENU_OPEN body.layout-sidebar .site-footer { grid-column: 2; grid-row: 2; }
+  MENU_OPEN body.layout-sidebar .site-footer .wrap { max-width: calc(var(--max-width) + 4rem); }
 }
-"""
+""".replace("MENU_OPEN", _MENU_OPEN)
 
 LAYOUT_MAGAZINE_CSS = """
 /* Magazine: big centered masthead, a ruled menu bar, a wide page and a card grid feed */
@@ -1887,7 +1985,8 @@ def _layout_css_base(lid):
         "/*\n  layout.css: written by %s on every build, so edits here are lost.\n"
         "  Layout: %s. Pick another one under \"Layout and CSS\" in the editor.\n"
         "  Your own rules go in style.css, which loads after this file and wins any tie.\n*/\n%s"
-        % (APP, lay["label"], lay["css"] or "\n/* Classic needs no extra rules: style.css already describes it. */\n")
+        % (APP, lay["label"], (lay["css"] or "\n/* Classic needs no extra rules: style.css already describes it. */\n")
+           + SITEGEN_COLLAPSE_CSS)
     )
 
 
@@ -2291,18 +2390,23 @@ class Site:
         if foot.strip() or flogo:
             footer = ('<footer class="site-footer"><div class="wrap">%s%s</div></footer>'
                       % (flogo, "<p>%s</p>" % Markdown(prefix).inline(foot) if foot.strip() else ""))
+        side = bool(nav_block) and (lid in SPECIAL_LAYOUTS or lid == "sidebar")
         if lid in SPECIAL_LAYOUTS:
             brand = brand_banner(site, prefix) + brand_title(site, prefix) + tagline
-            main = '<main id="main" class="wrap">\n%s\n</main>' % body
+            main = '<main id="main" class="wrap">\n%s%s\n</main>' % (collapse_button("in-main always") + "\n" if side else "", body)
             inner = special_body(lid, site, prefix, title=st, brand=brand, nav=nav_block, main=main,
                                 footer=footer)
             return ('<!DOCTYPE html>\n<html lang="%s">\n<head>\n%s\n</head>\n<body class="%s">\n'
-                    '<a class="skip" href="#main">Skip to content</a>\n%s\n</body>\n</html>\n'
-                    % (attr(site.get("lang") or "en"), "\n".join(head), attr(body_class), inner))
+                    '<a class="skip" href="#main">Skip to content</a>\n%s%s\n</body>\n</html>\n'
+                    % (attr(site.get("lang") or "en"), "\n".join(head), attr(body_class), page_scripts(side), inner))
+        button = ""
+        if side:
+            button = collapse_button("in-main", "Collapse sidebar", "Expand sidebar") + "\n"
         return (
             '<!DOCTYPE html>\n<html lang="%s">\n<head>\n%s\n</head>\n<body class="%s">\n'
-            '<a class="skip" href="#main">Skip to content</a>\n%s\n<main id="main" class="wrap">\n%s\n</main>\n%s\n</body>\n</html>\n'
-            % (attr(site.get("lang") or "en"), "\n".join(head), attr(body_class), header, body, footer)
+            '<a class="skip" href="#main">Skip to content</a>\n%s%s\n<main id="main" class="wrap">\n%s%s\n</main>\n%s\n</body>\n</html>\n'
+            % (attr(site.get("lang") or "en"), "\n".join(head), attr(body_class), page_scripts(side), header,
+               button, body, footer)
         )
 
     def feed_html(self, cfg, posts=None, posts_href="posts/", tag_href="tag/", prefix="../"):
