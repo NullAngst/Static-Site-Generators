@@ -342,7 +342,7 @@ Every tool has a **Publish** button that builds the site and uploads it in one s
 ### Methods
 
 - **rsync over SSH** (default, recommended). Only sends what changed, so repeat publishes take a second or two. Needs `rsync` and `ssh` on your machine.
-- **SFTP**, using the OpenSSH `sftp` client. Uploads every file each time.
+- **SFTP**, using the OpenSSH `sftp` client.
 - **FTPS and FTP**, handled by Python itself. FTPS checks the server certificate by default, with an option to accept a self-signed one. Plain FTP sends your password and files in the clear.
 - **git push**, for GitHub Pages, GitLab Pages, or a bare repository on your server with a `post-receive` hook that checks the files out into the web root.
 - **Copy to a local folder**, for a path on this machine or a mounted share.
@@ -351,7 +351,9 @@ Every tool has a **Publish** button that builds the site and uploads it in one s
 
 Everything in the site folder except hidden files and folders, which covers the sources and any `.git` folder. `.htaccess` and `.well-known/` are published if you have them. **Symlinks are never published**; they are skipped and listed in the log.
 
-Files are copied to a private temporary folder before the transfer, so saving in the editor during an upload cannot change what is sent.
+Before the transfer the files are hard-linked into a private `staging` folder inside the sources folder, or copied where a link is not possible, so saving in the editor during an upload cannot change what is sent. A link takes no time or space, and it is a true snapshot because the tools always replace a file instead of changing it in place.
+
+SFTP, FTP, FTPS and the local folder method send only the files whose size or modification time changed since the last publish to the same target, so a repeat publish only sends what you edited. The first publish to a target sends everything, and so does ticking **Upload every file**, which is the thing to do if files on the server were changed or removed by hand. rsync makes the same comparison on its own.
 
 ### Passwords
 

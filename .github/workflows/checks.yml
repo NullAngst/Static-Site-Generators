@@ -1,0 +1,37 @@
+name: Checks
+
+# Checks only. The tools are single Python files, so there is nothing to build or release.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # Everything runs through python3, so it does not matter that files uploaded through
+      # GitHub's web page lose their executable bit.
+      - name: Compile every tool
+        run: python3 -W error::DeprecationWarning -m py_compile *.py
+
+      - name: Shared code has not drifted
+        run: python3 tools/check_shared.py
+
+      - name: Self-test
+        run: python3 tools/selftest.py -v
+
+      - name: Each tool starts
+        run: |
+          for f in *.py; do
+            python3 "$f" --help > /dev/null
+          done

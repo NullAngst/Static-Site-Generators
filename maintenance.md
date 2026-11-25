@@ -7,6 +7,8 @@ A check to run every couple of months. The four tools are single Python files wi
 1. `python3 --version` and make sure it is 3.8 or newer.
 2. `python3 -W error::DeprecationWarning -m py_compile siteforge.py sitegen.py wikigen.py storygen.py`, since new Python releases deprecate things before they remove them. Any warning here is the early notice.
 3. `python3 wikigen.py --help` (and the same for the other three) to make sure each one starts.
+4. `python3 tools/check_shared.py`. The tools carry copies of the same helpers and publish code, and this fails if a fix went into one copy and not the others.
+5. `python3 tools/selftest.py`. It starts each tool in a throwaway folder and checks the preview server, the feeds and the publish code. GitHub Actions runs both on every push to `main` and every pull request.
 
 ## 2. Build a test site with each tool
 
@@ -30,7 +32,8 @@ The Hide menu button relies on the CSS `:has()` selector, and the header alignme
 ## 5. Publishing
 
 1. Run a publish to your server from the Publish panel and load the live site.
-2. If you add a Content-Security-Policy header on the server, it has to allow inline scripts (`script-src 'self' 'unsafe-inline'`) or the menu helper is blocked. The menus still work without it, they just do not remember or auto-close.
+2. With SFTP, FTP or the folder method, publish a second time without changes. The log should say 0 of the files changed and send nothing. Then edit one page, publish, and check that one file went.
+3. If you add a Content-Security-Policy header on the server, it has to allow inline scripts (`script-src 'self' 'unsafe-inline'`) or the menu helper is blocked. The menus still work without it, they just do not remember or auto-close.
 
 ## 6. Record it
 

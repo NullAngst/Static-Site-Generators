@@ -118,11 +118,28 @@ def slugify(s):
 
 
 def write_text(path, text):
+    """Write through a hidden temporary file and swap it in, so a reader never sees half a file
+    and a publish walking the folder at the same moment never picks the temporary file up."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    tmp = path.with_name(".%s.%s.tmp" % (path.name, secrets.token_hex(4)))
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def md_files(folder):
+    """The .md files directly in a folder, leaving out symlinks. A symlinked folder gives none,
+    the same rule publishing and importing follow."""
+    if folder.is_symlink() or not folder.is_dir():
+        return []
+    return [f for f in folder.glob("*.md") if not f.is_symlink() and f.is_file()]
 
 
 def read_text(path):
@@ -2409,7 +2426,7 @@ class Library:
         result = {"stories_added": 0, "chapters_added": 0, "chapters_removed": 0}
         known = {s["slug"] for s in self.cfg["stories"]}
         for d in sorted(base.iterdir(), key=lambda p: p.name.lower()):
-            if not d.is_dir() or d.name.startswith(".") or d.name in known:
+            if not d.is_dir() or d.is_symlink() or d.name.startswith(".") or d.name in known:
                 continue
             slug = self.unique_story_slug(d.name, exclude=d.name if slugify(d.name) == d.name else None)
             if slug != d.name:
@@ -2428,7 +2445,7 @@ class Library:
             d = self.story_dir(st["slug"])
             d.mkdir(parents=True, exist_ok=True)
             chs = {c["slug"]: c for c in st["chapters"]}
-            for f in sorted(d.glob("*.md"), key=lambda p: p.name.lower()):
+            for f in sorted(md_files(d), key=lambda p: p.name.lower()):
                 if f.name == "_index.md" or f.name.startswith("."):
                     continue
                 if f.stem in chs:
@@ -2815,7 +2832,7 @@ class Library:
         items = []
         for s, c in self.recent_chapters(cfg, 50):
             link = "%s/%s/%s.html" % (url, s["slug"], c["slug"])
-            body = Markdown("").render(read_text(self.chapter_md(s["slug"], c["slug"])))
+            body = Markdown(url + "/").render(read_text(self.chapter_md(s["slug"], c["slug"])))
             when = email.utils.format_datetime(
                 datetime.datetime.combine(datetime.date.fromisoformat(c["date"]), datetime.time(12, 0),
                                           tzinfo=datetime.timezone.utc))
@@ -2825,7 +2842,7 @@ class Library:
                 "<content:encoded><![CDATA[%s]]></content:encoded>\n</item>"
                 % (_escape("%s: %s" % (s["title"], c["title"]), quote=False), _escape(link, quote=False),
                    _escape(link, quote=False), when, _escape(s["title"], quote=False),
-                   _escape(auto_summary(body), quote=False), body.replace("]]>", "]]&gt;"))
+                   _escape(auto_summary(body), quote=False), body.replace("]]>", "]]]]><![CDATA[>"))
             )
         return (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -3365,6 +3382,7 @@ def default_deploy():
         "save_password": False,
         "passive": True,
         "insecure_tls": False,
+        "full_upload": False,
     }
 
 
@@ -3384,7 +3402,7 @@ def clean_deploy(d, current):
     if "port" in d:
         out["port"] = str(d.get("port") or "").strip()[:5]
     out["port"] = str(out.get("port") or "")
-    for k in ("mirror", "include_sources", "save_password", "passive", "insecure_tls"):
+    for k in ("mirror", "include_sources", "save_password", "passive", "insecure_tls", "full_upload"):
         if k in d:
             out[k] = bool(d[k])
         out[k] = bool(out.get(k))
@@ -3600,13 +3618,41 @@ def safe_rel(rel):
 
 
 def stage(site, files):
-    """Copy the files into a private temporary folder and publish from there."""
-    tmp = Path(tempfile.mkdtemp(prefix="%s-publish-" % APP.lower()))
+    """Put the files in a private folder inside the sources folder and publish from there, so
+    saving in the editor during an upload cannot change what is sent. Hard links cost no time
+    or space, and they are a true snapshot because every writer here replaces a file with a new
+    one instead of changing it in place. Across filesystems, or where links are not allowed, the
+    file is copied. A file that disappeared since the folder was read is left out.
+    Returns the folder and the files that made it in."""
+    base = site.meta / "staging"
+    base.mkdir(parents=True, exist_ok=True)
+    for old in base.iterdir():
+        # Only one publish runs at a time, so anything here is left over from a crash.
+        if old.is_dir() and not old.is_symlink():
+            shutil.rmtree(old, ignore_errors=True)
+    tmp = Path(tempfile.mkdtemp(prefix="publish-", dir=str(base)))
+    kept, copied = [], 0
     for rel in files:
+        src = site.root / rel
         dst = tmp / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(site.root / rel, dst, follow_symlinks=False)
-    return tmp
+        try:
+            if src.is_symlink():
+                continue
+            try:
+                os.link(src, dst)
+            except FileNotFoundError:
+                raise
+            except OSError:
+                shutil.copy2(src, dst, follow_symlinks=False)
+                copied += 1
+        except FileNotFoundError:
+            job_say("Skipped %s: it was removed while the publish was starting." % rel)
+            continue
+        kept.append(rel)
+    if copied:
+        job_say("Copied %d file(s) for the upload (hard links were not possible for them)." % copied)
+    return tmp, kept
 
 
 def target_key(dep):
@@ -3626,9 +3672,47 @@ def load_published(site, dep):
     return [f for f in (d.get("files") or []) if safe_rel(f)]
 
 
-def save_published(site, dep, files):
+def load_published_sigs(site, dep):
+    """Size and modification time of every file the last publish to this exact target sent, or
+    None when there is no such record, so the first publish anywhere sends everything."""
+    try:
+        d = json.loads((site.meta / "published.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or d.get("target") != target_key(dep) or not isinstance(d.get("sigs"), dict):
+        return None
+    out = {}
+    for k, v in d["sigs"].items():
+        if safe_rel(k) and isinstance(v, list) and len(v) == 2 and all(isinstance(x, int) for x in v):
+            out[k] = v
+    return out
+
+
+def file_sigs(root, files):
+    out = {}
+    for rel in files:
+        try:
+            st = (Path(root) / rel).stat()
+        except OSError:
+            continue
+        out[rel] = [st.st_size, st.st_mtime_ns]
+    return out
+
+
+def changed_files(site, dep, files, sigs):
+    """Files to send: every file when that was asked for or on the first publish to a target,
+    otherwise those whose size or modification time differs from the last publish there."""
+    if dep.get("full_upload"):
+        return list(files)
+    before = load_published_sigs(site, dep)
+    if before is None:
+        return list(files)
+    return [f for f in files if before.get(f) != sigs.get(f)]
+
+
+def save_published(site, dep, files, sigs=None):
     write_text(site.meta / "published.json",
-               json.dumps({"target": target_key(dep), "files": sorted(files),
+               json.dumps({"target": target_key(dep), "files": sorted(files), "sigs": sigs or {},
                            "when": datetime.date.today().isoformat()}, indent=1))
 
 
@@ -3714,7 +3798,8 @@ def sftp_quote(s):
     return '"%s"' % s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def deploy_sftp(site, dep, password, files, staged, dry):
+def deploy_sftp(site, dep, password, files, staged, dry, send=None):
+    send = files if send is None else send
     if not shutil.which("sftp"):
         raise ApiError("The sftp program (part of OpenSSH) is not installed. Install it, or choose another method.")
     odd = [f for f in files if set(f) & set("*?[]\\\"")]
@@ -3730,19 +3815,19 @@ def deploy_sftp(site, dep, password, files, staged, dry):
     for part in [p for p in base.split("/") if p and p != "."]:
         walked.append(part)
         lines.append("-mkdir " + sftp_quote(prefix + "/".join(walked)))
-    for f in files:
+    for f in send:
         parts = f.split("/")[:-1]
         for i in range(len(parts)):
             sub = "/".join(parts[: i + 1])
             if sub not in made:
                 made.add(sub)
                 lines.append("-mkdir " + sftp_quote(base + "/" + sub))
-    for f in files:
+    for f in send:
         lines.append("put %s %s" % (sftp_quote(str(staged / f)), sftp_quote(base + "/" + f)))
     for f in stale:
         lines.append("-rm " + sftp_quote(base + "/" + f))
     if dry:
-        job_say("Dry run. %d file(s) would be uploaded and %d removed." % (len(files), len(stale)))
+        job_say("Dry run. %d file(s) would be uploaded and %d removed." % (len(send), len(stale)))
         for line in lines[:80]:
             job_say("  " + line)
         if len(lines) > 80:
@@ -3819,19 +3904,20 @@ def ftp_enter(ftp, path, create):
     return ftp.pwd()
 
 
-def deploy_ftp(site, dep, password, files, staged, dry):
+def deploy_ftp(site, dep, password, files, staged, dry, send=None):
+    send = files if send is None else send
     if not password:
         raise ApiError("FTP needs a password.")
     previous = load_published(site, dep) or []
     stale = [f for f in previous if f not in files] if dep.get("mirror") else []
     if dry:
-        job_say("Dry run. %d file(s) would be uploaded and %d removed." % (len(files), len(stale)))
+        job_say("Dry run. %d file(s) would be uploaded and %d removed." % (len(send), len(stale)))
         return
     ftp = ftp_connect(dep, password)
     try:
         home = ftp_enter(ftp, server_path(dep), create=True).rstrip("/")
         made = set()
-        for i, f in enumerate(files, 1):
+        for i, f in enumerate(send, 1):
             if job_cancelled():
                 raise ApiError("Stopped before it finished. Publish again to complete the upload.")
             parts = f.split("/")[:-1]
@@ -3845,8 +3931,8 @@ def deploy_ftp(site, dep, password, files, staged, dry):
                         pass
             with open(staged / f, "rb") as fh:
                 ftp.storbinary("STOR " + home + "/" + f, fh)
-            if i % 10 == 0 or i == len(files):
-                job_say("Uploaded %d/%d" % (i, len(files)))
+            if i % 10 == 0 or i == len(send):
+                job_say("Uploaded %d/%d" % (i, len(send)))
         for f in stale:
             try:
                 ftp.delete(home + "/" + f)
@@ -3929,15 +4015,16 @@ def folder_dest(site, dep):
     return dest
 
 
-def deploy_folder(site, dep, files, staged, dry):
+def deploy_folder(site, dep, files, staged, dry, send=None):
+    send = files if send is None else send
     dest = folder_dest(site, dep)
     previous = load_published(site, dep) or []
     stale = [f for f in previous if f not in files] if dep.get("mirror") else []
     if dry:
-        job_say("Dry run. %d file(s) would be copied to %s and %d removed." % (len(files), dest, len(stale)))
+        job_say("Dry run. %d file(s) would be copied to %s and %d removed." % (len(send), dest, len(stale)))
         return
     dest.mkdir(parents=True, exist_ok=True)
-    for i, f in enumerate(files, 1):
+    for i, f in enumerate(send, 1):
         if job_cancelled():
             raise ApiError("Stopped before it finished.")
         target = dest / f
@@ -3945,8 +4032,8 @@ def deploy_folder(site, dep, files, staged, dry):
         if target.is_symlink():
             target.unlink()
         shutil.copy2(staged / f, target, follow_symlinks=False)
-        if i % 25 == 0 or i == len(files):
-            job_say("Copied %d/%d" % (i, len(files)))
+        if i % 25 == 0 or i == len(send):
+            job_say("Copied %d/%d" % (i, len(send)))
     for f in stale:
         p = dest / f
         try:
@@ -3967,22 +4054,39 @@ def run_deploy(site, dep, password, dry):
     for s in skipped:
         job_say("Skipped %s (a symlink or special file, which is never published)" % s)
     job_say("%d file(s) to publish from %s" % (len(files), site.root))
-    staged = stage(site, files)
+    staged, files = stage(site, files)
     try:
+        sigs = file_sigs(staged, files)
+        send = files
+        if method in ("sftp", "ftp", "ftps", "folder"):
+            send = changed_files(site, dep, files, sigs)
+            if len(send) < len(files):
+                job_say("%d of them changed since the last publish to this target; only those are sent. "
+                        "Tick \"Upload every file\" to send them all." % len(send))
         if method == "rsync":
             deploy_rsync(dep, password, staged, dry)
         elif method == "sftp":
-            deploy_sftp(site, dep, password, files, staged, dry)
+            deploy_sftp(site, dep, password, files, staged, dry, send)
         elif method in ("ftp", "ftps"):
-            deploy_ftp(site, dep, password, files, staged, dry)
+            deploy_ftp(site, dep, password, files, staged, dry, send)
         elif method == "folder":
-            deploy_folder(site, dep, files, staged, dry)
+            deploy_folder(site, dep, files, staged, dry, send)
         else:
             raise ApiError("Unknown publish method.")
     finally:
         shutil.rmtree(staged, ignore_errors=True)
     if not dry:
-        save_published(site, dep, files)
+        save_published(site, dep, files, sigs)
+
+
+def remote_dir_test(path):
+    """A shell test for a folder on the server. A leading ~/ stays outside the quotes, so the
+    remote shell expands it to the login folder instead of looking for a folder named ~."""
+    if path in ("~", "~/"):
+        return 'test -d "$HOME"'
+    if path.startswith("~/"):
+        return 'test -d "$HOME"/' + shlex.quote(path[2:])
+    return "test -d " + shlex.quote(path)
 
 
 def test_deploy(site, dep, password):
@@ -3993,7 +4097,7 @@ def test_deploy(site, dep, password):
             raise ApiError("The ssh program is not installed, so the connection cannot be tested here.")
         path = server_path(dep)
         cmd = ["ssh"] + ssh_opts(dep, password) + [
-            "--", remote_target(dep), "test -d %s && echo FOUND || echo MISSING" % shlex.quote(path)]
+            "--", remote_target(dep), remote_dir_test(path) + " && echo FOUND || echo MISSING"]
         cmd, env = with_sshpass(cmd, password)
         code = run_stream(cmd, env=env)
         if code != 0:
@@ -4272,6 +4376,7 @@ def api(method, route, query, h):
 
 
 class Handler(BaseHTTPRequestHandler):
+    head_only = False
     server_version = APP
 
     def log_message(self, *args):
@@ -4305,7 +4410,55 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(data)
+        if not self.head_only:
+            self.wfile.write(data)
+
+    def send_file(self, path, ctype, extra=None):
+        """Stream a file in chunks, answering a single byte range when one is asked for, so an
+        audio or video file can be scrubbed in the preview without loading it into memory."""
+        size = path.stat().st_size
+        start, end, status = 0, size - 1, 200
+        m = re.fullmatch(r"bytes=(\d*)-(\d*)", (self.headers.get("Range") or "").strip())
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                start = int(m.group(1))
+                end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+            else:
+                start, end = max(0, size - int(m.group(2))), size - 1
+                if int(m.group(2)) == 0:
+                    start = size
+            if start >= size or start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % size)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            status = 206
+        length = max(0, end - start + 1)
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.send_header("Accept-Ranges", "bytes")
+        if status == 206:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.head_only:
+            return
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                left = length
+                while left > 0:
+                    chunk = fh.read(min(65536, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the browser stopped reading, which it does whenever a player seeks
 
     def send_json(self, obj, status=200):
         self.send_bytes(status, "application/json; charset=utf-8", json.dumps(obj).encode("utf-8"))
@@ -4342,7 +4495,7 @@ class Handler(BaseHTTPRequestHandler):
             ctype += "; charset=utf-8"
         # Built pages share an origin with the editor, so scripts are refused outright. The generated
         # site has none, and this stops an uploaded SVG or pasted HTML from reaching the editor API.
-        self.send_bytes(200, ctype, target.read_bytes(), {
+        self.send_file(target, ctype, {
             "Content-Security-Policy": "script-src 'none'; object-src 'none'; base-uri 'self'",
             "X-Content-Type-Options": "nosniff",
         })
@@ -4379,6 +4532,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "Unexpected error: %s" % e}, 500)
 
     def do_GET(self):
+        self.dispatch("GET")
+
+    def do_HEAD(self):
+        """HEAD answers for the editor page and built files only; the API has nothing to offer it."""
+        path = urlsplit(self.path).path
+        if path != "/" and not path.startswith("/site/"):
+            return self.send_text(405, "Method not allowed")
+        self.head_only = True
         self.dispatch("GET")
 
     def do_POST(self):
@@ -4825,6 +4986,7 @@ const PUB_TPL = `
       <label class="field">Branch <input id="d-branch" placeholder="main"></label>
     </div>
     <label id="d-mirrorrow"><input type="checkbox" id="d-mirror"> Remove files on the server that are no longer part of the site</label>
+    <label id="d-fullrow"><input type="checkbox" id="d-full_upload"> Upload every file, not only the ones that changed since the last publish</label>
     <p class="hint" id="d-mirrorhint"></p>
     <label id="d-srcrow"><input type="checkbox" id="d-include_sources"> Include the hidden source folder</label>
     <label id="d-passiverow"><input type="checkbox" id="d-passive"> Passive mode (leave this on unless the server says otherwise)</label>
@@ -4836,7 +4998,7 @@ const PUB_TPL = `
 </div>`;
 
 let pubTimer = null, pubSeen = 0;
-const DEPLOY_BOOLS = ["mirror", "include_sources", "save_password", "passive", "insecure_tls"];
+const DEPLOY_BOOLS = ["mirror", "include_sources", "save_password", "passive", "insecure_tls", "full_upload"];
 
 function readDeploy() {
   const o = { method: $("#d-method").value };
@@ -4860,6 +5022,7 @@ function pubSync(info) {
   $("#d-tlsrow").hidden = m !== "ftps";
   $("#d-mirrorrow").hidden = m === "git";
   $("#d-mirrorhint").hidden = m === "git";
+  $("#d-fullrow").hidden = !(m === "sftp" || ftp || m === "folder");
   $("#d-mirrorhint").textContent = m === "rsync"
     ? "rsync mirrors the folder: anything there that is not part of the site is deleted, apart from hidden files. The first publish to a new folder asks before doing that."
     : "Only files that an earlier publish sent are removed. Nothing else on the server is touched.";
@@ -4870,6 +5033,7 @@ function pubSync(info) {
   if (m === "git" && !t.git) notes.push("git is not installed on this machine.");
   if (m === "ftp") notes.push("Plain FTP sends your password and files in the clear. Prefer FTPS or SFTP.");
   if (m === "rsync") notes.push("rsync only transfers what changed, so repeat publishes are quick.");
+  if (m === "sftp" || ftp || m === "folder") notes.push("Only files that changed since the last publish to this target are sent; the first publish sends everything.");
   if (m === "git") notes.push("For GitHub or GitLab pages, or a bare repo on your VPS with a post-receive hook that checks the files out into the web root.");
   $("#d-note").textContent = notes.join(" ");
   $("#d-tools").textContent = "On this machine: " + ["rsync", "ssh", "sftp", "sshpass", "git"]
