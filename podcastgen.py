@@ -1,0 +1,12903 @@
+#!/usr/bin/env python3
+"""
+PodcastGen: a local podcast site generator. It makes a show page, a page per episode with a
+player, and the RSS feed that Apple Podcasts, Spotify and every other podcast app read.
+
+Run it:
+    python3 podcastgen.py                       opens the last show you used
+    python3 podcastgen.py ~/my-show             opens (or creates) a show in that folder
+    python3 podcastgen.py ~/my-show --publish   builds and publishes with the saved settings
+    python3 podcastgen.py --help
+
+It needs Python 3.8 or newer and nothing else (standard library only). It starts a small web
+server on 127.0.0.1 and opens the editor in your browser. ffmpeg and ffprobe are optional: with
+them it measures, normalizes and encodes audio, and without them MP3 and M4A files are used as
+they are. rclone is optional too, for a media host on Cloudflare R2, Backblaze B2 or S3.
+
+Folder layout (inside the folder you choose):
+    index.html                      the show page
+    episodes/                       one page per episode
+    feed.xml                        the podcast feed
+    audio/                          episode audio, as uploaded or processed; never deleted by a build
+    transcripts/, chapters/         transcripts and chapter files
+    about.html, ...                 extra pages
+    style.css                       your stylesheet (edited through "Edit CSS", never overwritten)
+    assets/                         show art, episode art and other images
+    .podcastgen/                    your markdown sources and settings
+
+A PodcastGen folder imports into SiteForge with every address unchanged.
+
+This file is generated from siteforge.py by tools/make_podcastgen.py. Change siteforge.py and
+run that script; edits made here are lost the next time it runs.
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime
+import email.utils
+import filecmp
+import ftplib
+import hashlib
+import json
+import mimetypes
+import os
+import re
+import secrets
+import shlex
+import shutil
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+import unicodedata
+import urllib.error
+import urllib.request
+import uuid
+import webbrowser
+import xml.etree.ElementTree as ET
+from html import escape as _escape, unescape as _unescape
+from html.parser import HTMLParser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, quote, unquote, urlsplit
+
+APP = "PodcastGen"
+META_DIR = ".podcastgen"
+# PodcastGen is this file with these set (tools/make_podcastgen.py writes it): one module, served
+# from the site root, and its own port.
+ONLY_MODULE = "podcast"
+DEFAULT_PORT = 8769
+TOKEN = secrets.token_urlsafe(24)
+LOCK = threading.RLock()
+CURRENT = {"site": None}
+SERVER = {"httpd": None, "port": 0}
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "podcastgen"
+IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif"}
+MAX_UPLOAD = 25 * 1024 * 1024
+SEARCH_TEXT_LIMIT = 8000
+MODULES = ("blog", "wiki", "library", "podcast")
+MODULE_NAMES = {"blog": "Blog", "wiki": "Wiki", "library": "Stories", "podcast": "Podcast"}
+MOUNT_DEFAULT = {"blog": "blog", "wiki": "wiki", "library": "stories", "podcast": "podcast"}
+# Modules that can be served from the site root when they are the homepage.
+ROOT_MOUNTABLE = ("wiki", "library", "podcast")
+HOME_MODES = ("page",) + MODULES
+# Folder names a page, wiki section or story can never take, because something else lives there.
+RESERVED = {"index", "style", "assets", "blog", "wiki", "stories", "genre", "tag", "posts", "rss", "sitemap",
+            "robots", "search", "site", "api", "404", "podcast", "episodes", "audio", "transcripts", "chapters",
+            "feed"}
+CALLOUTS = {"NOTE": "Note", "TIP": "Tip", "IMPORTANT": "Important", "WARNING": "Warning", "CAUTION": "Caution"}
+STATUSES = [("draft", "Draft"), ("ongoing", "Ongoing"), ("hiatus", "On hiatus"), ("complete", "Complete")]
+STATUS_LABELS = dict(STATUSES)
+SEARCH_MODES = ("builtin", "web", "off")
+
+
+class ApiError(Exception):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+# ----------------------------------------------------------------------------
+# Small helpers
+# ----------------------------------------------------------------------------
+
+def esc(s):
+    return _escape(s, quote=False)
+
+
+def attr(s):
+    return _escape(s, quote=True)
+
+
+_ENTITY_AMP = re.compile(r"&(?!#?\w+;)")
+
+
+def esc_text(s):
+    """Escape text but leave existing entities such as &copy; alone."""
+    return _ENTITY_AMP.sub("&amp;", s).replace("<", "&lt;").replace(">", "&gt;")
+
+
+def slugify(s):
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+    return s[:80].strip("-")
+
+
+def write_text(path, text):
+    """Write through a hidden temporary file and swap it in, so a reader never sees half a file
+    and a publish walking the folder at the same moment never picks the temporary file up."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(".%s.%s.tmp" % (path.name, secrets.token_hex(4)))
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def md_files(folder):
+    """The .md files directly in a folder, leaving out symlinks. A symlinked folder gives none,
+    the same rule publishing and importing follow."""
+    if folder.is_symlink() or not folder.is_dir():
+        return []
+    return [f for f in folder.glob("*.md") if not f.is_symlink() and f.is_file()]
+
+
+def read_text(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+def clean_date(s):
+    try:
+        return datetime.date.fromisoformat(str(s)[:10]).isoformat()
+    except (TypeError, ValueError):
+        return datetime.date.today().isoformat()
+
+
+def nice_date(s):
+    d = datetime.date.fromisoformat(clean_date(s))
+    return d.strftime("%B ") + str(d.day) + d.strftime(", %Y")
+
+
+_SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
+
+
+def fix_url(url, prefix):
+    """Relative URLs written in markdown are relative to the site root.
+    Prefix them so they work from pages that live in sub folders."""
+    url = str(url).strip()
+    if not url:
+        return "#"
+    low = re.sub(r"[\s\x00-\x1f]+", "", url.lower())
+    if low.startswith(("javascript:", "vbscript:", "data:text")):
+        return "#"
+    if _SCHEME.match(url) or url.startswith(("#", "/", "//", "?")):
+        return url
+    while url.startswith("./"):
+        url = url[2:]
+    return prefix + url
+
+
+def abs_url(site_url, rel):
+    """Join a site's base URL with a site-root-relative path. Empty base -> empty (no absolute URL possible)."""
+    site_url = str(site_url or "").strip()
+    if not site_url:
+        return ""
+    return site_url.rstrip("/") + "/" + str(rel).lstrip("/")
+
+
+def resolve_img(site, rel):
+    """Absolute URL for a social image path. Relative paths need the site URL; only http(s) absolutes are kept."""
+    rel = str(rel or "").strip()
+    if not rel:
+        return ""
+    if _SCHEME.match(rel):
+        return rel if re.match(r"^https?://", rel, re.I) else ""
+    return abs_url(site.get("url", ""), rel)
+
+
+# ----------------------------------------------------------------------------
+# Markdown
+# ----------------------------------------------------------------------------
+
+BLOCK_TAGS = set(
+    "div p figure figcaption details summary section article aside header footer nav table "
+    "thead tbody tr td th ul ol li dl dt dd h1 h2 h3 h4 h5 h6 blockquote hr iframe video audio "
+    "picture source form fieldset legend label input textarea select option button center address".split()
+)
+INLINE_TAGS = set(
+    "a abbr b bdi bdo br cite code data del dfn em i img ins kbd mark q s samp small span strong "
+    "sub sup time u var wbr".split()
+)
+
+LIST_RE = re.compile(r"^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$")
+HR_RE = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$")
+HEAD_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$")
+FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})\s*([\w+#.-]*).*$")
+QUOTE_RE = re.compile(r"^\s{0,3}>\s?(.*)$")
+SEP_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
+RAW_RE = re.compile(r"^\s{0,3}<(!--|/?([a-zA-Z][\w-]*))")
+# Raw HTML inside markdown is passed through an allowlist sanitizer built on html.parser.
+# The parser decodes entities in attribute values the same way a browser does, so tricks such as
+# href="&#106;avascript:..." are caught. Tags outside the allowlist are dropped (script and style
+# lose their contents too), event handler attributes are removed and URLs are checked by scheme.
+_SAFE_TAGS = BLOCK_TAGS | INLINE_TAGS | set(
+    "pre caption colgroup col tfoot track main small".split()
+)
+_DROP_CONTENT = {"script", "style", "template", "noscript"}
+_URL_ATTRS = {"href", "src", "poster", "action", "formaction", "cite", "data", "background", "longdesc"}
+_SAFE_SCHEMES = ("http:", "https:", "mailto:", "tel:")
+_ATTR_NAME = re.compile(r"^[a-zA-Z_:][-a-zA-Z0-9_:.]*$")
+_BAD_CSS = re.compile(r"expression|javascript|vbscript|behavior|-moz-binding|@import", re.I)
+
+
+def safe_url(value, prefix, attr_name="href"):
+    """Return a URL that is safe to emit, or '#'. Relative URLs get the page prefix."""
+    v = str(value or "").strip()
+    compact = re.sub(r"[\s\x00-\x1f\x7f]+", "", v).lower()
+    if not compact:
+        return "#" if attr_name == "href" else ""
+    if _SCHEME.match(compact):
+        if compact.startswith(_SAFE_SCHEMES):
+            return v
+        if attr_name in ("src", "poster") and re.match(r"^data:image/(png|jpe?g|gif|webp|avif);", compact):
+            return v
+        return "#" if attr_name in ("href", "action") else ""
+    return fix_url(v, prefix)
+
+
+def _safe_srcset(value, prefix):
+    out = []
+    for cand in str(value).split(","):
+        bits = cand.strip().split()
+        if not bits:
+            continue
+        url = safe_url(bits[0], prefix, "src")
+        if not url or url == "#":
+            return ""
+        out.append(" ".join([url] + bits[1:]))
+    return ", ".join(out)
+
+
+class _Sanitizer(HTMLParser):
+    def __init__(self, prefix):
+        super().__init__(convert_charrefs=True)
+        self.prefix = prefix
+        self.out = []
+        self.skip = 0
+
+    def _attrs(self, attrs):
+        parts = []
+        for name, value in attrs:
+            name = (name or "").lower()
+            if not _ATTR_NAME.match(name) or name.startswith("on") or name in ("srcdoc", "formaction"):
+                continue
+            if value is None:
+                parts.append(" " + name)
+                continue
+            if name in _URL_ATTRS or name.endswith(":href"):
+                value = safe_url(value, self.prefix, name)
+                if not value:
+                    continue
+            elif name == "srcset":
+                value = _safe_srcset(value, self.prefix)
+                if not value:
+                    continue
+            elif name == "style":
+                if _BAD_CSS.search(re.sub(r"/\*.*?\*/|\\", "", value, flags=re.S)):
+                    continue
+            parts.append(' %s="%s"' % (name, attr(value)))
+        return "".join(parts)
+
+    def handle_starttag(self, tag, attrs):
+        if tag in _DROP_CONTENT:
+            self.skip += 1
+            return
+        if self.skip or tag not in _SAFE_TAGS:
+            return
+        self.out.append("<%s%s>" % (tag, self._attrs(attrs)))
+
+    def handle_startendtag(self, tag, attrs):
+        if self.skip or tag not in _SAFE_TAGS:
+            return
+        self.out.append("<%s%s>" % (tag, self._attrs(attrs)))
+
+    def handle_endtag(self, tag):
+        if tag in _DROP_CONTENT:
+            self.skip = max(0, self.skip - 1)
+            return
+        if self.skip or tag not in _SAFE_TAGS:
+            return
+        self.out.append("</%s>" % tag)
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.out.append(esc(data))
+
+    # comments, doctype, processing instructions and CDATA are dropped
+    def handle_comment(self, data):
+        pass
+
+    def handle_decl(self, decl):
+        pass
+
+    def handle_pi(self, data):
+        pass
+
+    def unknown_decl(self, data):
+        pass
+
+
+def sanitize_html(s, prefix=""):
+    p = _Sanitizer(prefix)
+    try:
+        p.feed(s)
+        p.close()
+    except Exception:  # malformed input: fall back to showing it as text
+        return esc(s)
+    return "".join(p.out)
+
+
+class Markdown:
+    """Markdown subset renderer. resolver(target) maps a [[wiki link]] target to a site-root
+    relative URL, or None when no article matches."""
+
+    def __init__(self, prefix="", resolver=None):
+        self.prefix = prefix
+        self.resolver = resolver
+        self.ids = {}
+        self.headings = []
+        self.missing = []
+
+    # ---- entry points
+    def render(self, text):
+        text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "").expandtabs(4)
+        return self.blocks(text.split("\n"))
+
+    def raw(self, s):
+        return sanitize_html(s, self.prefix)
+
+    # ---- blocks
+    def unique_id(self, text):
+        base = slugify(re.sub(r"<[^>]+>", "", text)) or "section"
+        n = self.ids.get(base, 0)
+        self.ids[base] = n + 1
+        return base if n == 0 else "%s-%d" % (base, n)
+
+    def starts_block(self, line, para=False):
+        if FENCE_RE.match(line) or HEAD_RE.match(line) or HR_RE.match(line) or QUOTE_RE.match(line):
+            return True
+        m = LIST_RE.match(line)
+        if m:
+            if not para:
+                return True
+            marker = m.group(2)
+            return (not marker[0].isdigit()) or marker[:-1] == "1"
+        m = RAW_RE.match(line)
+        if m and (m.group(1) == "!--" or (m.group(2) or "").lower() in BLOCK_TAGS):
+            return True
+        return False
+
+    def blocks(self, lines):
+        out = []
+        i, n = 0, len(lines)
+        while i < n:
+            line = lines[i]
+            if not line.strip():
+                i += 1
+                continue
+
+            m = FENCE_RE.match(line)
+            if m:
+                fence, lang = m.group(1), m.group(2)
+                i += 1
+                buf = []
+                while i < n:
+                    s = lines[i].strip()
+                    if s.startswith(fence) and set(s) <= set(fence[0]):
+                        break
+                    buf.append(lines[i])
+                    i += 1
+                i += 1
+                cls = ' class="language-%s"' % attr(lang) if lang else ""
+                out.append("<pre><code%s>%s</code></pre>" % (cls, esc("\n".join(buf))))
+                continue
+
+            m = HEAD_RE.match(line)
+            if m:
+                level, text = len(m.group(1)), m.group(2)
+                hid, inner = self.unique_id(text), self.inline(text)
+                if level in (2, 3):
+                    self.headings.append((level, hid, re.sub(r"<[^>]+>", "", inner)))
+                anchor = ""
+                if 2 <= level <= 4:
+                    anchor = ' <a class="anchor" href="#%s" aria-label="Link to this section">#</a>' % hid
+                out.append('<h%d id="%s">%s%s</h%d>' % (level, hid, inner, anchor, level))
+                i += 1
+                continue
+
+            if HR_RE.match(line):
+                out.append("<hr>")
+                i += 1
+                continue
+
+            if QUOTE_RE.match(line):
+                buf = []
+                while i < n and QUOTE_RE.match(lines[i]):
+                    buf.append(QUOTE_RE.match(lines[i]).group(1))
+                    i += 1
+                out.append(self.quote(buf))
+                continue
+
+            if LIST_RE.match(line):
+                html_, i = self.list_block(lines, i)
+                out.append(html_)
+                continue
+
+            m = RAW_RE.match(line)
+            if m and (m.group(1) == "!--" or (m.group(2) or "").lower() in BLOCK_TAGS):
+                buf = []
+                while i < n and lines[i].strip():
+                    buf.append(lines[i])
+                    i += 1
+                out.append(self.raw("\n".join(buf)))
+                continue
+
+            if "|" in line and i + 1 < n and SEP_RE.match(lines[i + 1]):
+                html_, i = self.table(lines, i)
+                out.append(html_)
+                continue
+
+            buf = []
+            while i < n and lines[i].strip() and (not buf or not self.starts_block(lines[i], True)):
+                buf.append(lines[i].lstrip())
+                i += 1
+            text = "\n".join(buf).strip()
+            html_ = self.inline(text)
+            html_ = re.sub(r"(?: {2,}|\\)\n", "<br>\n", html_)
+            out.append("<p>%s</p>" % html_)
+        return "\n".join(out)
+
+    def quote(self, buf):
+        """Blockquotes, plus GitHub style callouts: a first line of [!NOTE], [!TIP], [!IMPORTANT],
+        [!WARNING] or [!CAUTION] turns the quote into a styled box."""
+        m = re.match(r"^\s*\[!(\w+)\]\s*(.*)$", buf[0]) if buf else None
+        if m and m.group(1).upper() in CALLOUTS:
+            kind = m.group(1).upper()
+            label = m.group(2).strip() or CALLOUTS[kind]
+            body = self.blocks(buf[1:])
+            return '<div class="callout callout-%s">\n<p class="callout-title">%s</p>\n%s\n</div>' % (
+                kind.lower(), self.inline(label), body)
+        return "<blockquote>\n%s\n</blockquote>" % self.blocks(buf)
+
+    def list_block(self, lines, i):
+        n = len(lines)
+        m = LIST_RE.match(lines[i])
+        base = len(m.group(1))
+        ordered = m.group(2)[0].isdigit()
+        start = int(m.group(2)[:-1]) if ordered else 1
+        items = []
+        loose = False
+
+        def is_sibling(mm):
+            return bool(mm) and len(mm.group(1)) == base and mm.group(2)[0].isdigit() == ordered
+
+        while i < n:
+            line = lines[i]
+            if not line.strip():
+                j = i
+                while j < n and not lines[j].strip():
+                    j += 1
+                if j >= n:
+                    break
+                nxt = lines[j]
+                ind = len(nxt) - len(nxt.lstrip())
+                if is_sibling(LIST_RE.match(nxt)):
+                    loose = True
+                    i = j
+                    continue
+                if ind > base and items:
+                    items[-1]["lines"].extend([""] * (j - i))
+                    i = j
+                    continue
+                break
+            m = LIST_RE.match(line)
+            ind = len(line) - len(line.lstrip())
+            if is_sibling(m):
+                items.append({"first": m.group(3), "width": base + len(m.group(2)) + 1, "lines": []})
+                i += 1
+                continue
+            if ind > base and items:
+                strip = min(ind, items[-1]["width"])
+                items[-1]["lines"].append(line[strip:])
+                i += 1
+                continue
+            if m:
+                break
+            if items and lines[i - 1].strip() and not self.starts_block(line, True):
+                items[-1]["lines"].append(line.lstrip())
+                i += 1
+                continue
+            break
+
+        if any("" in it["lines"] for it in items):
+            loose = True
+        rendered = []
+        for it in items:
+            content = [it["first"]] + it["lines"]
+            task, cls = "", ""
+            tm = re.match(r"^\[( |x|X)\]\s+(.*)$", content[0])
+            if tm:
+                task = '<input type="checkbox" disabled%s> ' % (" checked" if tm.group(1) != " " else "")
+                content[0] = tm.group(2)
+                cls = ' class="task-item"'
+            inner = self.blocks(content)
+            if not loose:
+                inner = re.sub(r"^<p>(.*?)</p>", r"\1", inner, count=1, flags=re.S)
+            rendered.append("<li%s>%s%s</li>" % (cls, task, inner))
+        tag = "ol" if ordered else "ul"
+        start_attr = ' start="%d"' % start if ordered and start != 1 else ""
+        return "<%s%s>\n%s\n</%s>" % (tag, start_attr, "\n".join(rendered), tag), i
+
+    def table(self, lines, i):
+        def cells(row):
+            row = row.strip()
+            if row.startswith("|"):
+                row = row[1:]
+            if row.endswith("|") and not row.endswith("\\|"):
+                row = row[:-1]
+            return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", row)]
+
+        head = cells(lines[i])
+        aligns = []
+        for c in cells(lines[i + 1]):
+            left, right = c.startswith(":"), c.endswith(":")
+            aligns.append("center" if left and right else "right" if right else "left" if left else "")
+        i += 2
+        rows = []
+        while i < len(lines) and lines[i].strip() and "|" in lines[i]:
+            rows.append(cells(lines[i]))
+            i += 1
+
+        def cell(tag, text, k):
+            a = aligns[k] if k < len(aligns) else ""
+            style = ' style="text-align:%s"' % a if a else ""
+            return "<%s%s>%s</%s>" % (tag, style, self.inline(text), tag)
+
+        out = ['<div class="table-wrap">', "<table>", "<thead>"]
+        out.append("<tr>" + "".join(cell("th", c, k) for k, c in enumerate(head)) + "</tr>")
+        out += ["</thead>", "<tbody>"]
+        for r in rows:
+            out.append("<tr>" + "".join(cell("td", c, k) for k, c in enumerate(r)) + "</tr>")
+        out += ["</tbody>", "</table>", "</div>"]
+        return "\n".join(out), i
+
+    # ---- inline
+    def inline(self, text):
+        stash = []
+        out = self._inline(text.replace("\x00", ""), stash)
+        for _ in range(10):
+            if "\x00" not in out:
+                break
+            out = re.sub(r"\x00(\d+)\x00", lambda m: stash[int(m.group(1))], out)
+        return out
+
+    def _inline(self, text, stash):
+        def keep(s):
+            stash.append(s)
+            return "\x00%d\x00" % (len(stash) - 1)
+
+        # code spans
+        text = re.sub(r"(`+)(.+?)\1", lambda m: keep("<code>%s</code>" % esc(m.group(2).strip())), text, flags=re.S)
+        # backslash escapes
+        text = re.sub(r"\\([\\`*_{}\[\]()#+.!|~<>-])", lambda m: keep(esc(m.group(1))), text)
+
+        # wiki links: [[Article]], [[Article|label]], [[Section/Article]], [[Article#heading]]
+        if self.resolver is not None:
+            def wiki(m):
+                target, _, label = m.group(1).partition("|")
+                target = target.strip()
+                page, _, frag = target.partition("#")
+                label = label.strip() or page.strip().split("/")[-1].strip() or target
+                url = self.resolver(page) if page.strip() else ""
+                if url is None:
+                    self.missing.append(page.strip())
+                    return keep('<span class="missing-link" title="No article called %s yet">%s</span>'
+                                % (attr(page.strip()), esc(label)))
+                href = (self.prefix + url if url else "") + ("#" + slugify(frag) if frag.strip() else "")
+                return keep('<a class="wiki-link" href="%s">%s</a>' % (attr(href or "#"), esc(label)))
+
+            text = re.sub(r"\[\[([^\[\]\n]+?)\]\]", wiki, text)
+        # autolinks
+        text = re.sub(
+            r"<((?:https?://|mailto:)[^\s<>]+)>",
+            lambda m: keep('<a href="%s">%s</a>' % (attr(m.group(1)), esc(m.group(1)))),
+            text,
+        )
+
+        # inline html (whitelisted tags only)
+        def tag(m):
+            if m.group(1).lower() in INLINE_TAGS:
+                return keep(self.raw(m.group(0)))
+            return m.group(0)
+
+        text = re.sub(r"</?([a-zA-Z][\w-]*)(?:\s[^<>]*)?/?>", tag, text)
+
+        # images
+        def img(m):
+            alt = re.sub(r"\x00\d+\x00", "", m.group(1))
+            title = ' title="%s"' % attr(m.group(3)) if m.group(3) else ""
+            return keep('<img src="%s" alt="%s"%s loading="lazy">' % (attr(fix_url(m.group(2), self.prefix)), attr(alt), title))
+
+        text = re.sub(r'!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+"([^"]*)")?\s*\)', img, text)
+
+        # links
+        def link(m):
+            title = ' title="%s"' % attr(m.group(3)) if m.group(3) else ""
+            inner = self._inline(m.group(1), stash)
+            return keep('<a href="%s"%s>%s</a>' % (attr(fix_url(m.group(2), self.prefix)), title, inner))
+
+        text = re.sub(r'\[([^\]]+)\]\(\s*<?([^)\s>]+)>?(?:\s+"([^"]*)")?\s*\)', link, text)
+
+        text = esc_text(text)
+        text = re.sub(r"\*\*\*(?=\S)(.+?)(?<=\S)\*\*\*", r"<strong><em>\1</em></strong>", text, flags=re.S)
+        text = re.sub(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", r"<strong>\1</strong>", text, flags=re.S)
+        text = re.sub(r"(?<!\w)__(?=\S)(.+?)(?<=\S)__(?!\w)", r"<strong>\1</strong>", text, flags=re.S)
+        text = re.sub(r"\*(?=[^\s*])(.+?)(?<=[^\s*])\*", r"<em>\1</em>", text, flags=re.S)
+        text = re.sub(r"(?<!\w)_(?=[^\s_])(.+?)(?<=[^\s_])_(?!\w)", r"<em>\1</em>", text, flags=re.S)
+        text = re.sub(r"~~(?=\S)(.+?)(?<=\S)~~", r"<del>\1</del>", text, flags=re.S)
+        return text
+
+
+def auto_summary(html_):
+    m = re.search(r"<p>(.*?)</p>", html_, re.S)
+    if not m:
+        return ""
+    t = re.sub(r"\s+", " ", _unescape(re.sub(r"<[^>]+>", "", m.group(1)))).strip()
+    return t if len(t) <= 200 else t[:197].rsplit(" ", 1)[0] + "..."
+
+
+# ----------------------------------------------------------------------------
+# Themes and CSS
+#
+# Every theme from SiteGen, WikiGen and StoryGen is kept. They used three different sets of
+# CSS variables, so each is converted to one shared set here: the colors and fonts each theme
+# defined are carried over exactly, and variables a theme never had (a sidebar color for a
+# blog theme, say) are derived from its own colors.
+# ----------------------------------------------------------------------------
+
+UNI_ORDER = [
+    "bg", "bg-image", "surface", "surface-opacity", "text", "muted", "accent", "border", "code-bg",
+    "header-bg", "header-text", "sidebar-bg", "sidebar-text", "sidebar-active",
+    "font-body", "font-heading", "font-ui", "font-mono",
+    "base-size", "line-height", "max-width", "measure", "sidebar-width", "radius",
+    "heading-weight", "heading-transform", "letter-spacing", "dropcap-size",
+]
+
+THEMES = {
+    "site-clean": ("Clean light", "Site", {"bg": "#f6f7f9", "bg-image": "none", "surface": "#ffffff", "surface-opacity": "1", "text": "#1f2328", "muted": "#59636e", "accent": "#0b5fd6", "border": "#d5dbe3", "code-bg": "#f6f7f9", "header-bg": "#ffffff", "header-text": "#1f2328", "sidebar-bg": "#f6f7f9", "sidebar-text": "#1f2328", "sidebar-active": "#d5dbe3", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "17px", "line-height": "1.65", "max-width": "46rem", "measure": "46rem", "sidebar-width": "16rem", "radius": "8px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "site-midnight": ("Midnight", "Site", {"bg": "#0e1116", "bg-image": "none", "surface": "#161b22", "surface-opacity": "1", "text": "#e6edf3", "muted": "#9aa4b2", "accent": "#6cb0ff", "border": "#2b3340", "code-bg": "#0e1116", "header-bg": "#161b22", "header-text": "#e6edf3", "sidebar-bg": "#0e1116", "sidebar-text": "#e6edf3", "sidebar-active": "#2b3340", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "17px", "line-height": "1.65", "max-width": "46rem", "measure": "46rem", "sidebar-width": "16rem", "radius": "8px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "site-terminal": ("Terminal", "Site", {"bg": "#020403", "bg-image": "none", "surface": "#06100a", "surface-opacity": "0.88", "text": "#3dff7a", "muted": "#22b555", "accent": "#b6ffcb", "border": "#146b31", "code-bg": "#020403", "header-bg": "#06100a", "header-text": "#3dff7a", "sidebar-bg": "#020403", "sidebar-text": "#3dff7a", "sidebar-active": "#146b31", "font-body": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-heading": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-ui": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "1.7", "max-width": "52rem", "measure": "52rem", "sidebar-width": "16rem", "radius": "0px", "heading-weight": "700", "heading-transform": "uppercase", "letter-spacing": "0.05em", "dropcap-size": "3.1em"}),
+    "site-paper": ("Paper", "Site", {"bg": "#e9e6dc", "bg-image": "none", "surface": "#f7f4ea", "surface-opacity": "1", "text": "#2b2a26", "muted": "#6d6a5e", "accent": "#1d5c63", "border": "#cfcabb", "code-bg": "#e9e6dc", "header-bg": "#f7f4ea", "header-text": "#2b2a26", "sidebar-bg": "#e9e6dc", "sidebar-text": "#2b2a26", "sidebar-active": "#cfcabb", "font-body": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "19px", "line-height": "1.75", "max-width": "42rem", "measure": "42rem", "sidebar-width": "16rem", "radius": "3px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "site-nord": ("Nord", "Site", {"bg": "#2e3440", "bg-image": "none", "surface": "#3b4252", "surface-opacity": "1", "text": "#eceff4", "muted": "#a7b1c4", "accent": "#88c0d0", "border": "#4c566a", "code-bg": "#2e3440", "header-bg": "#3b4252", "header-text": "#eceff4", "sidebar-bg": "#2e3440", "sidebar-text": "#eceff4", "sidebar-active": "#4c566a", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "17px", "line-height": "1.65", "max-width": "46rem", "measure": "46rem", "sidebar-width": "16rem", "radius": "6px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "site-neon": ("Neon night", "Site", {"bg": "#0b0016", "bg-image": "none", "surface": "#150029", "surface-opacity": "0.9", "text": "#f3e8ff", "muted": "#b491ff", "accent": "#19f0ff", "border": "#6a1fd0", "code-bg": "#0b0016", "header-bg": "#150029", "header-text": "#f3e8ff", "sidebar-bg": "#0b0016", "sidebar-text": "#f3e8ff", "sidebar-active": "#6a1fd0", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "17px", "line-height": "1.65", "max-width": "46rem", "measure": "46rem", "sidebar-width": "16rem", "radius": "2px", "heading-weight": "700", "heading-transform": "uppercase", "letter-spacing": "0.06em", "dropcap-size": "3.1em"}),
+    "site-solarized": ("Solarized light", "Site", {"bg": "#fdf6e3", "bg-image": "none", "surface": "#fffbee", "surface-opacity": "1", "text": "#4b5f66", "muted": "#7a8b90", "accent": "#1f78b4", "border": "#e6dcbc", "code-bg": "#fdf6e3", "header-bg": "#fffbee", "header-text": "#4b5f66", "sidebar-bg": "#fdf6e3", "sidebar-text": "#4b5f66", "sidebar-active": "#e6dcbc", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "17px", "line-height": "1.65", "max-width": "46rem", "measure": "46rem", "sidebar-width": "16rem", "radius": "8px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "site-minimal": ("Minimal serif", "Site", {"bg": "#ffffff", "bg-image": "none", "surface": "#ffffff", "surface-opacity": "1", "text": "#151515", "muted": "#666666", "accent": "#151515", "border": "#e2e2e2", "code-bg": "#ffffff", "header-bg": "#ffffff", "header-text": "#151515", "sidebar-bg": "#ffffff", "sidebar-text": "#151515", "sidebar-active": "#e2e2e2", "font-body": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "19px", "line-height": "1.75", "max-width": "38rem", "measure": "38rem", "sidebar-width": "16rem", "radius": "0px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-clean": ("Clean light", "Wiki", {"bg": "#f6f7f9", "bg-image": "none", "surface": "#ffffff", "surface-opacity": "1", "text": "#1f2328", "muted": "#5b6470", "accent": "#0b5fd6", "border": "#d8dde4", "code-bg": "#f2f4f7", "header-bg": "#ffffff", "header-text": "#1f2328", "sidebar-bg": "#f0f2f5", "sidebar-text": "#1f2328", "sidebar-active": "#e1e7f0", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "1.65", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "6px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-classic": ("Classic wiki", "Wiki", {"bg": "#f8f9fa", "bg-image": "none", "surface": "#ffffff", "surface-opacity": "1", "text": "#202122", "muted": "#54595d", "accent": "#3366cc", "border": "#c8ccd1", "code-bg": "#f8f9fa", "header-bg": "#ffffff", "header-text": "#202122", "sidebar-bg": "#f8f9fa", "sidebar-text": "#202122", "sidebar-active": "#eaecf0", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "1.65", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "2px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-slate": ("Slate dark", "Wiki", {"bg": "#0f141b", "bg-image": "none", "surface": "#151b24", "surface-opacity": "1", "text": "#dde3ea", "muted": "#95a1b1", "accent": "#7aa7ff", "border": "#263041", "code-bg": "#0b1017", "header-bg": "#111720", "header-text": "#e8edf3", "sidebar-bg": "#111720", "sidebar-text": "#cfd7e2", "sidebar-active": "#1d2635", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "1.65", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "6px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-nord": ("Nord", "Wiki", {"bg": "#2e3440", "bg-image": "none", "surface": "#3b4252", "surface-opacity": "1", "text": "#eceff4", "muted": "#b0b8c8", "accent": "#88c0d0", "border": "#4c566a", "code-bg": "#2e3440", "header-bg": "#2e3440", "header-text": "#eceff4", "sidebar-bg": "#353c4a", "sidebar-text": "#e5e9f0", "sidebar-active": "#434c5e", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "1.65", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "6px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-gruvbox": ("Gruvbox dark", "Wiki", {"bg": "#1d2021", "bg-image": "none", "surface": "#282828", "surface-opacity": "1", "text": "#ebdbb2", "muted": "#b0a391", "accent": "#fabd2f", "border": "#3c3836", "code-bg": "#1d2021", "header-bg": "#1d2021", "header-text": "#ebdbb2", "sidebar-bg": "#202324", "sidebar-text": "#d5c4a1", "sidebar-active": "#3c3836", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "1.65", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "3px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-dracula": ("Dracula", "Wiki", {"bg": "#21222c", "bg-image": "none", "surface": "#282a36", "surface-opacity": "1", "text": "#f8f8f2", "muted": "#a4abcc", "accent": "#bd93f9", "border": "#3a3d4e", "code-bg": "#1e1f29", "header-bg": "#21222c", "header-text": "#f8f8f2", "sidebar-bg": "#242631", "sidebar-text": "#e6e6f0", "sidebar-active": "#363949", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "1.65", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "6px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-solarized": ("Solarized light", "Wiki", {"bg": "#fdf6e3", "bg-image": "none", "surface": "#fffbef", "surface-opacity": "1", "text": "#3c4d54", "muted": "#687b82", "accent": "#1f6fb2", "border": "#e4dcc2", "code-bg": "#f5eed8", "header-bg": "#fdf6e3", "header-text": "#3c4d54", "sidebar-bg": "#f6efd9", "sidebar-text": "#3c4d54", "sidebar-active": "#ebe2c4", "font-body": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "1.65", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "6px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-paper": ("Paper", "Wiki", {"bg": "#ebe7dc", "bg-image": "none", "surface": "#f8f5ec", "surface-opacity": "1", "text": "#2b2a26", "muted": "#66635a", "accent": "#1d5c63", "border": "#d3cdbd", "code-bg": "#efeadf", "header-bg": "#f8f5ec", "header-text": "#2b2a26", "sidebar-bg": "#efeadf", "sidebar-text": "#2b2a26", "sidebar-active": "#e1dbc9", "font-body": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "17px", "line-height": "1.7", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "6px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "wiki-terminal": ("Terminal", "Wiki", {"bg": "#050805", "bg-image": "none", "surface": "#0a100a", "surface-opacity": "1", "text": "#3dff7a", "muted": "#2fc862", "accent": "#b6ffcb", "border": "#145c2c", "code-bg": "#030503", "header-bg": "#050805", "header-text": "#3dff7a", "sidebar-bg": "#070b07", "sidebar-text": "#3dff7a", "sidebar-active": "#0f2414", "font-body": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-heading": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-ui": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "15px", "line-height": "1.65", "max-width": "48rem", "measure": "36rem", "sidebar-width": "17rem", "radius": "0px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "book-paperback": ("Paperback", "Reading", {"bg": "#f3f1ec", "bg-image": "none", "surface": "#fffdf8", "surface-opacity": "1", "text": "#23201b", "muted": "#6b655c", "accent": "#8a5a2b", "border": "#ddd6c8", "code-bg": "#efeadf", "header-bg": "#fffdf8", "header-text": "#23201b", "sidebar-bg": "#f3f1ec", "sidebar-text": "#3a352d", "sidebar-active": "#e6e0d2", "font-body": "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "4px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "book-night": ("Night reading", "Reading", {"bg": "#14161a", "bg-image": "none", "surface": "#1a1d22", "surface-opacity": "1", "text": "#ddd8cf", "muted": "#9a948a", "accent": "#d3a06a", "border": "#2c3139", "code-bg": "#101317", "header-bg": "#14161a", "header-text": "#ddd8cf", "sidebar-bg": "#171a1f", "sidebar-text": "#c9c3ba", "sidebar-active": "#232830", "font-body": "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "4px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "book-parchment": ("Parchment", "Reading", {"bg": "#e7dec7", "bg-image": "none", "surface": "#f6efdc", "surface-opacity": "1", "text": "#2f2a20", "muted": "#6d6552", "accent": "#7a5230", "border": "#d0c4a4", "code-bg": "#e9e0c6", "header-bg": "#f6efdc", "header-text": "#2f2a20", "sidebar-bg": "#ebe2cc", "sidebar-text": "#3a3427", "sidebar-active": "#ded3b6", "font-body": "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "19px", "line-height": "1.8", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "4px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "book-manuscript": ("Manuscript", "Reading", {"bg": "#ffffff", "bg-image": "none", "surface": "#ffffff", "surface-opacity": "1", "text": "#111111", "muted": "#555555", "accent": "#222222", "border": "#cccccc", "code-bg": "#f4f4f4", "header-bg": "#ffffff", "header-text": "#111111", "sidebar-bg": "#f4f4f4", "sidebar-text": "#222222", "sidebar-active": "#e6e6e6", "font-body": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-heading": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "16px", "line-height": "2", "max-width": "44rem", "measure": "36rem", "sidebar-width": "16rem", "radius": "0px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "1em"}),
+    "book-ink": ("Ink on white", "Reading", {"bg": "#ffffff", "bg-image": "none", "surface": "#ffffff", "surface-opacity": "1", "text": "#16181d", "muted": "#5f646e", "accent": "#1b3f8b", "border": "#e2e4e8", "code-bg": "#f4f5f7", "header-bg": "#ffffff", "header-text": "#16181d", "sidebar-bg": "#f7f8fa", "sidebar-text": "#31353d", "sidebar-active": "#eaecf1", "font-body": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "2px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "book-midnight": ("Midnight blue", "Reading", {"bg": "#0f1420", "bg-image": "none", "surface": "#161d2b", "surface-opacity": "1", "text": "#e3e8f2", "muted": "#98a2b6", "accent": "#8fb3ff", "border": "#27324a", "code-bg": "#0b101a", "header-bg": "#0f1420", "header-text": "#e3e8f2", "sidebar-bg": "#131a28", "sidebar-text": "#ccd4e3", "sidebar-active": "#1f2839", "font-body": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "4px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "book-sepia": ("Sepia", "Reading", {"bg": "#efe3d0", "bg-image": "none", "surface": "#f9f0e1", "surface-opacity": "1", "text": "#3b2f22", "muted": "#7b6a55", "accent": "#9a4f24", "border": "#dac9ae", "code-bg": "#eadcc4", "header-bg": "#f9f0e1", "header-text": "#3b2f22", "sidebar-bg": "#ecdfca", "sidebar-text": "#453726", "sidebar-active": "#e0cfb2", "font-body": "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif", "font-heading": "Georgia, \"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Times New Roman\", serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "4px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "book-noir": ("Noir", "Reading", {"bg": "#0c0c0d", "bg-image": "none", "surface": "#141415", "surface-opacity": "1", "text": "#e8e6e3", "muted": "#8e8b86", "accent": "#c3453b", "border": "#27272a", "code-bg": "#0a0a0b", "header-bg": "#0c0c0d", "header-text": "#e8e6e3", "sidebar-bg": "#0f0f10", "sidebar-text": "#cfcdc9", "sidebar-active": "#1d1d20", "font-body": "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "0px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+    "book-pulp": ("Pulp", "Reading", {"bg": "#1b1712", "bg-image": "none", "surface": "#241e17", "surface-opacity": "1", "text": "#f2e6d2", "muted": "#b3a48c", "accent": "#e0a63c", "border": "#3a3126", "code-bg": "#171310", "header-bg": "#1b1712", "header-text": "#f2e6d2", "sidebar-bg": "#1f1a14", "sidebar-text": "#e2d6c0", "sidebar-active": "#312819", "font-body": "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "4px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.4em"}),
+    "retro-portal": ("Secure portal", "Retro", {"bg": "#141414", "bg-image": "none", "surface": "#050505", "surface-opacity": "1", "text": "#c0c0c0", "muted": "#808080", "accent": "#6699ff", "border": "#555555", "code-bg": "#000000", "header-bg": "#0a0a0a", "header-text": "#e8e8e8", "sidebar-bg": "#0b0b12", "sidebar-text": "#c0c0c0", "sidebar-active": "#1a1a26", "font-body": "\"Times New Roman\", Times, serif", "font-heading": "Arial, Helvetica, sans-serif", "font-ui": "Verdana, Geneva, Arial, sans-serif", "font-mono": "\"Courier New\", Courier, monospace", "base-size": "16px", "line-height": "1.45", "max-width": "46rem", "measure": "38rem", "sidebar-width": "15rem", "radius": "0px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
+}
+DEFAULT_THEME = {"page": "site-clean", "blog": "site-clean", "wiki": "wiki-classic", "library": "book-paperback",
+                 "podcast": "site-clean"}
+
+
+def root_block(theme_id):
+    label, group, values = THEMES[theme_id]
+    lines = [":root {", "  /* Theme: %s (%s). Change any value below. */" % (label, group)]
+    for k in UNI_ORDER:
+        lines.append("  --%s: %s;" % (k, values[k]))
+    lines.append("}")
+    return "\n".join(lines)
+
+
+CSS_HEADER = """/*
+  SiteForge stylesheet
+
+  TOP:     theme variables (colors, fonts, sizes). They apply to every page.
+  MIDDLE:  base styles: header, pages, blog, wiki, library.
+  BOTTOM:  your rules. Every page has body classes, so a rule can target one page, one
+           module or one wiki section. See the list at the start of that part.
+
+  SiteForge never overwrites this file. "Apply theme" only replaces the :root block.
+*/
+
+/* ============ GLOBAL THEME (every page) ============ */
+"""
+
+BASE_CSS = r"""
+/* ============ GLOBAL BASE STYLES (every page) ============ */
+*, *::before, *::after { box-sizing: border-box; }
+html { font-size: var(--base-size); -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; color: var(--text); font-family: var(--font-body); line-height: var(--line-height);
+  background-color: var(--bg); background-image: var(--bg-image); background-size: cover; background-attachment: fixed;
+}
+a { color: var(--accent); text-underline-offset: 0.18em; }
+a:focus-visible, summary:focus-visible, input:focus-visible, label:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-heading); font-weight: var(--heading-weight); line-height: 1.25;
+  text-transform: var(--heading-transform); letter-spacing: var(--letter-spacing);
+}
+.skip { position: absolute; left: -9999px; }
+.skip:focus { left: 1rem; top: 1rem; z-index: 20; padding: 0.5rem 0.75rem; background: var(--surface); color: var(--text); }
+.wrap { max-width: var(--max-width); margin: 0 auto; padding: 0 1.25rem; }
+.page-main { padding-top: 2rem; padding-bottom: 3rem; }
+.empty { color: var(--muted); }
+
+/* header and navigation */
+.nav-toggle, .side-toggle { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }
+.site-header { background: var(--header-bg); color: var(--header-text); border-bottom: 1px solid var(--border); }
+.site-header .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem 1.5rem; padding: 0.85rem 1.25rem; }
+.brand { display: flex; flex-direction: column; }
+.site-title { font-family: var(--font-heading); font-weight: var(--heading-weight); font-size: 1.35rem; color: var(--header-text); text-decoration: none; letter-spacing: var(--letter-spacing); }
+.tagline { color: var(--muted); font-size: 0.85rem; font-family: var(--font-ui); }
+.site-nav { margin-left: auto; font-family: var(--font-ui); font-size: 0.95rem; }
+.site-nav ul { display: flex; flex-wrap: wrap; gap: 0.25rem 1.1rem; list-style: none; margin: 0; padding: 0; }
+.site-nav a { color: var(--header-text); text-decoration: none; border-bottom: 2px solid transparent; padding: 0.15rem 0; }
+.site-nav a:hover { border-bottom-color: var(--border); }
+.site-nav a[aria-current="page"] { color: var(--accent); border-bottom-color: var(--accent); }
+.nav-button, .side-button {
+  display: none; cursor: pointer; user-select: none; font-family: var(--font-ui); font-size: 0.85rem;
+  padding: 0.15rem 0.7rem; border: 1px solid var(--border); border-radius: var(--radius);
+}
+.nav-toggle:focus-visible + .site-header .nav-button { outline: 2px solid var(--accent); }
+.site-footer { border-top: 1px solid var(--border); color: var(--muted); font-family: var(--font-ui); font-size: 0.85rem; }
+.site-footer .bar { padding: 1.25rem; }
+.site-footer p { margin: 0; }
+
+/* content card, used by pages, posts and wiki articles */
+.content {
+  background: var(--surface);
+  background: color-mix(in srgb, var(--surface) calc(var(--surface-opacity) * 100%), transparent);
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 1.75rem clamp(1rem, 3vw, 2.25rem);
+}
+.content > :last-child { margin-bottom: 0; }
+.content h1 { font-size: 2rem; margin: 0 0 1rem; }
+.content h2 { font-size: 1.45rem; margin: 2rem 0 0.75rem; }
+.content h3 { font-size: 1.2rem; margin: 1.5rem 0 0.5rem; }
+.content h4, .content h5, .content h6 { font-size: 1rem; margin: 1.25rem 0 0.5rem; }
+.content p, .content ul, .content ol, .content dl { margin: 0 0 1rem; }
+.content li + li { margin-top: 0.2rem; }
+.content img, .content video, .content iframe { max-width: 100%; height: auto; border-radius: calc(var(--radius) / 2); }
+.content blockquote { margin: 0 0 1rem; padding: 0.1rem 1rem; border-left: 3px solid var(--border); color: var(--muted); }
+.content code, .prose code { font-family: var(--font-mono); font-size: 0.88em; padding: 0.1em 0.35em; background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px; }
+.content pre, .prose pre {
+  overflow-x: auto; margin: 0 0 1rem; padding: 0.9rem 1rem; line-height: 1.5; font-size: 0.9rem;
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.content pre code, .prose pre code { padding: 0; border: 0; background: none; font-size: inherit; }
+.content kbd { font-family: var(--font-mono); font-size: 0.82em; padding: 0.05em 0.4em; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; background: var(--code-bg); }
+.table-wrap { overflow-x: auto; margin: 0 0 1rem; }
+.content table, .prose table { border-collapse: collapse; min-width: 100%; }
+.content th, .content td, .prose th, .prose td { border: 1px solid var(--border); padding: 0.4rem 0.7rem; text-align: left; vertical-align: top; }
+.content th { background: var(--code-bg); }
+.content hr { border: 0; border-top: 1px solid var(--border); margin: 2rem 0; }
+.task-item { list-style: none; margin-left: -1.25rem; }
+.task-item input { margin-right: 0.5rem; }
+.page-title { margin: 0 0 1rem; }
+.anchor { margin-left: 0.35rem; font-weight: 400; color: var(--muted); text-decoration: none; opacity: 0; }
+.content h2:hover .anchor, .content h3:hover .anchor, .content h4:hover .anchor, .anchor:focus { opacity: 1; }
+
+/* callouts: > [!NOTE], [!TIP], [!IMPORTANT], [!WARNING], [!CAUTION] */
+.callout { --c: #2f6fdb; margin: 0 0 1rem; padding: 0.65rem 1rem; border-left: 4px solid var(--c); border-radius: 0 var(--radius) var(--radius) 0; background: var(--code-bg); }
+.callout-tip { --c: #1f8a4c; }
+.callout-important { --c: #8250df; }
+.callout-warning { --c: #c27c0e; }
+.callout-caution { --c: #d13b3b; }
+.content .callout-title, .prose .callout-title { margin: 0 0 0.3rem; font-weight: 700; color: var(--c); text-indent: 0; }
+.callout > :last-child { margin-bottom: 0; }
+
+/* ============ BLOG ============ */
+.post-meta { color: var(--muted); font-size: 0.9rem; font-family: var(--font-ui); margin: -0.5rem 0 1rem; }
+.post-list { list-style: none; margin: 0; padding: 0; }
+.post-item { padding: 1.1rem 0; border-top: 1px solid var(--border); }
+.post-item:first-child { border-top: 0; padding-top: 0.25rem; }
+.content .post-item h2 { font-size: 1.3rem; margin: 0 0 0.35rem; }
+.post-item h2 a { text-decoration: none; }
+.post-item .post-meta { margin: 0 0 0.35rem; }
+.content .post-summary { margin: 0.35rem 0 0; color: var(--muted); }
+.tags { display: flex; flex-wrap: wrap; gap: 0.35rem; list-style: none; margin: 0 0 0.75rem; padding: 0; font-family: var(--font-ui); font-size: 0.78rem; }
+.content .tags li + li { margin-top: 0; }
+.tags a { display: inline-block; padding: 0.05rem 0.55rem; border: 1px solid var(--border); border-radius: 99px; text-decoration: none; color: var(--muted); }
+.tags a:hover { color: var(--accent); border-color: var(--accent); }
+.post-back, .tag-back, .feed-links { font-family: var(--font-ui); font-size: 0.9rem; }
+
+/* ============ WIKI and chapter layouts: sidebar on the left ============ */
+.with-sidebar { display: grid; grid-template-columns: var(--sidebar-width) minmax(0, 1fr); align-items: start; }
+.side {
+  position: sticky; top: 0; max-height: 100vh; overflow-y: auto; padding: 1.25rem 0.85rem 2rem;
+  min-height: calc(100vh - 4rem); background: var(--sidebar-bg); color: var(--sidebar-text);
+  border-right: 1px solid var(--border); font-family: var(--font-ui); font-size: 0.92rem;
+}
+.side ul, .side ol { list-style: none; margin: 0; padding: 0; }
+.side a { display: block; padding: 0.25rem 0.6rem; border-radius: calc(var(--radius) - 1px); color: var(--sidebar-text); text-decoration: none; }
+.side a:hover { background: var(--sidebar-active); }
+.side a[aria-current="page"] { background: var(--sidebar-active); color: var(--accent); font-weight: 600; }
+.with-sidebar > main { min-width: 0; padding: 1.5rem clamp(1rem, 4vw, 3rem) 3rem; }
+.with-sidebar .content { max-width: calc(var(--max-width) + 8rem); }
+.nav-home { margin: 0 0 0.6rem; }
+.nav-empty { color: var(--muted); padding: 0 0.6rem; font-size: 0.85rem; }
+.nav-section { margin: 0.1rem 0; }
+.nav-section > summary {
+  display: flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.6rem; cursor: pointer;
+  list-style: none; font-weight: 600; border-radius: calc(var(--radius) - 1px);
+}
+.nav-section > summary::-webkit-details-marker { display: none; }
+.nav-section > summary::before {
+  content: ""; flex: none; width: 0.42em; height: 0.42em; opacity: 0.7;
+  border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: rotate(-45deg); transition: transform 0.15s;
+}
+.nav-section[open] > summary::before { transform: rotate(45deg); }
+.nav-section > summary:hover { background: var(--sidebar-active); }
+.nav-count { margin-left: auto; font-weight: 400; font-size: 0.78rem; color: var(--muted); }
+.nav-section ul { margin: 0.1rem 0 0.5rem 0.95rem; padding-left: 0.4rem; border-left: 1px solid var(--border); }
+.search { position: relative; margin: 0 0 1rem; }
+.search input {
+  width: 100%; padding: 0.45rem 0.65rem; font: inherit; color: var(--text); background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius);
+}
+.search-results { margin: 0.35rem 0 0; padding: 0.25rem; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: 0 6px 18px rgba(0, 0, 0, 0.14); }
+.side .search-results a { padding: 0.4rem 0.5rem; }
+.search-results a.active { background: var(--sidebar-active); }
+.search-results .r-title { display: block; font-weight: 600; color: var(--text); }
+.search-results .r-sec, .search-results .r-snip { display: block; font-size: 0.78rem; color: var(--muted); }
+.search-results mark { background: rgba(255, 200, 0, 0.35); color: inherit; border-radius: 2px; }
+.search-empty { padding: 0.4rem 0.5rem; color: var(--muted); font-size: 0.85rem; }
+.breadcrumbs ol { display: flex; flex-wrap: wrap; gap: 0.35rem; list-style: none; margin: 0 0 1rem; padding: 0; font-family: var(--font-ui); font-size: 0.85rem; color: var(--muted); }
+.breadcrumbs li + li::before { content: "/"; margin-right: 0.35rem; opacity: 0.6; }
+.content .breadcrumbs li + li { margin-top: 0; }
+.lead { color: var(--muted); font-size: 1.05rem; margin-top: -0.25rem; }
+.wiki-toc { margin: 0 0 1.5rem; padding: 0.6rem 1rem; background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--radius); font-family: var(--font-ui); font-size: 0.92rem; }
+.wiki-toc summary { cursor: pointer; font-weight: 600; }
+.wiki-toc ol { margin: 0.4rem 0 0.2rem; padding-left: 1.3rem; }
+.wiki-toc ol ol { margin: 0.1rem 0; }
+.missing-link { color: #d33a3a; border-bottom: 1px dashed currentColor; cursor: help; }
+.article-meta { margin: 2rem 0 0; padding-top: 0.75rem; border-top: 1px solid var(--border); color: var(--muted); font-family: var(--font-ui); font-size: 0.85rem; }
+.pager { display: flex; gap: 1rem; margin-top: 1.5rem; font-family: var(--font-ui); font-size: 0.9rem; }
+.pager a { flex: 1 1 0; padding: 0.65rem 0.85rem; border: 1px solid var(--border); border-radius: var(--radius); text-decoration: none; color: var(--text); }
+.pager a:hover { border-color: var(--accent); }
+.pager .next { text-align: right; margin-left: auto; }
+.pager small { display: block; color: var(--muted); font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; }
+.wiki-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); gap: 1rem; margin: 0 0 1.5rem; }
+.wiki-card { padding: 1rem 1.1rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
+.content .wiki-card h3 { margin: 0 0 0.35rem; font-size: 1.1rem; }
+.wiki-card h3 a { text-decoration: none; }
+.content .wiki-card p { margin: 0 0 0.5rem; color: var(--muted); font-size: 0.9rem; }
+.content .wiki-card ul { margin: 0; padding-left: 1.1rem; font-size: 0.92rem; }
+.wiki-card .more { display: inline-block; margin-top: 0.4rem; font-size: 0.85rem; }
+.content .article-list { list-style: none; margin: 0.5rem 0 1rem; padding: 0; }
+.article-list li { padding: 0.65rem 0; border-top: 1px solid var(--border); }
+.content .article-list li + li { margin-top: 0; }
+.article-list li:first-child { border-top: 0; }
+.article-list a { font-weight: 600; }
+.content .article-list p { margin: 0.15rem 0 0; color: var(--muted); font-size: 0.92rem; }
+.article-list .when { display: block; color: var(--muted); font-size: 0.8rem; font-family: var(--font-ui); }
+
+/* ============ LIBRARY: stories and chapters ============ */
+.wide { max-width: calc(var(--max-width) + 16rem); margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+.sheet { max-width: var(--measure); margin: 0 auto; }
+.chapters-nav .in-story { display: block; font-family: var(--font-heading); font-size: 1.05rem; font-weight: 700; padding: 0 0.6rem; margin-bottom: 0.15rem; }
+.chapters-nav .by { display: block; color: var(--muted); font-size: 0.8rem; margin: 0 0.6rem 0.9rem; }
+.chapters-nav ol { counter-reset: ch; }
+.chapters-nav li { counter-increment: ch; }
+.chapters-nav li a { display: flex; gap: 0.5rem; }
+.chapters-nav li a::before { content: counter(ch); color: var(--muted); font-variant-numeric: tabular-nums; min-width: 1.3em; text-align: right; }
+.chapters-nav .all-stories { margin-top: 1rem; padding-top: 0.75rem; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.82rem; }
+.prose { font-size: 1rem; }
+.prose p { margin: 0 0 1.15rem; }
+body.prose-indented .prose p + p { margin-top: -1.15rem; text-indent: 1.6em; }
+body.prose-indented .prose blockquote p + p, body.prose-indented .prose li p + p { margin-top: 0; text-indent: 0; }
+.prose h2, .prose h3 { margin: 2.2rem 0 0.9rem; }
+.prose h2 { font-size: 1.35rem; }
+.prose h3 { font-size: 1.1rem; }
+.prose blockquote { margin: 1.5rem; padding: 0; color: var(--muted); font-style: italic; }
+.prose hr { border: 0; margin: 2rem 0; text-align: center; }
+.prose hr::after { content: "* * *"; letter-spacing: 0.6em; color: var(--muted); font-size: 0.9rem; }
+.prose img { max-width: 100%; height: auto; border-radius: var(--radius); }
+.prose ul, .prose ol { margin: 0 0 1.15rem; padding-left: 1.4rem; }
+body.dropcap .prose.opening > p:first-of-type::first-letter {
+  float: left; font-family: var(--font-heading); font-size: var(--dropcap-size); line-height: 0.82;
+  padding: 0.08em 0.08em 0 0; color: var(--accent);
+}
+body.dropcap .prose.opening > p:first-of-type { text-indent: 0; }
+.chapter-head { margin-bottom: 2.5rem; text-align: center; }
+.chapter-head .in { display: block; font-family: var(--font-ui); font-size: 0.78rem; letter-spacing: 0.16em; text-transform: uppercase; color: var(--muted); }
+.chapter-head .in a { color: inherit; text-decoration: none; }
+.chapter-head h1 { font-size: 1.8rem; margin: 0.6rem 0 0.4rem; }
+.chapter-head .meta { font-family: var(--font-ui); font-size: 0.8rem; color: var(--muted); margin: 0; }
+.note { margin: 2.5rem 0 0; padding: 1rem 1.15rem; background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--radius); font-size: 0.92rem; }
+.note h2 { font-family: var(--font-ui); font-size: 0.8rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin: 0 0 0.5rem; }
+.note p { margin: 0 0 0.6rem; text-indent: 0 !important; }
+.note > :last-child { margin-bottom: 0; }
+.the-end { margin: 3rem 0 0; text-align: center; font-family: var(--font-ui); font-size: 0.78rem; letter-spacing: 0.25em; text-transform: uppercase; color: var(--muted); }
+.story-head { display: flex; flex-wrap: wrap; gap: 1.5rem; margin-bottom: 2rem; }
+.story-head .cover { flex: 0 0 auto; width: 11rem; max-width: 40%; border: 1px solid var(--border); border-radius: var(--radius); }
+.story-head .about { flex: 1 1 18rem; min-width: 0; }
+.story-head h1 { font-size: 2rem; margin: 0 0 0.2rem; line-height: 1.15; }
+.subtitle { font-family: var(--font-heading); font-style: italic; color: var(--muted); margin: 0 0 0.5rem; }
+.byline { font-family: var(--font-ui); font-size: 0.9rem; color: var(--muted); margin: 0 0 0.75rem; }
+.facts { display: flex; flex-wrap: wrap; gap: 0.4rem 0.75rem; list-style: none; margin: 0 0 1rem; padding: 0; font-family: var(--font-ui); font-size: 0.8rem; color: var(--muted); }
+.facts .tag { display: inline-block; padding: 0.05rem 0.6rem; border: 1px solid var(--border); border-radius: 99px; text-decoration: none; color: var(--muted); }
+.facts .tag:hover { color: var(--accent); border-color: var(--accent); }
+.facts .status { border-color: var(--accent); color: var(--accent); }
+.blurb { margin: 0 0 1rem; }
+.warnings { font-family: var(--font-ui); font-size: 0.85rem; color: var(--muted); margin: 0 0 1rem; }
+.read-button { display: inline-block; padding: 0.55rem 1.4rem; background: var(--accent); color: var(--surface); border-radius: var(--radius); font-family: var(--font-ui); font-size: 0.92rem; text-decoration: none; }
+.chapter-list { margin: 2.5rem 0 0; }
+.chapter-list h2 { font-family: var(--font-ui); font-size: 0.8rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); margin: 0 0 0.75rem; }
+.chapter-list ol { list-style: none; margin: 0; padding: 0; counter-reset: ch; }
+.chapter-list li { counter-increment: ch; border-top: 1px solid var(--border); }
+.chapter-list li:last-child { border-bottom: 1px solid var(--border); }
+.chapter-list a { display: flex; align-items: baseline; gap: 0.75rem; padding: 0.65rem 0.25rem; text-decoration: none; color: var(--text); }
+.chapter-list a:hover { background: var(--sidebar-active); }
+.chapter-list a::before { content: counter(ch); color: var(--muted); font-variant-numeric: tabular-nums; min-width: 1.6em; text-align: right; font-family: var(--font-ui); font-size: 0.85rem; }
+.chapter-list .ch-title { flex: 1; }
+.chapter-list .ch-meta { font-family: var(--font-ui); font-size: 0.78rem; color: var(--muted); white-space: nowrap; }
+.shelf { display: grid; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); gap: 1.75rem; margin: 1.25rem 0 0; }
+.book { display: flex; gap: 1rem; }
+.book > a { flex: 0 0 auto; text-decoration: none; }
+.book .cover { width: 7.5rem; border: 1px solid var(--border); border-radius: var(--radius); }
+.book .cover.none { display: flex; align-items: center; justify-content: center; aspect-ratio: 2 / 3; background: var(--code-bg); color: var(--muted); font-family: var(--font-ui); font-size: 0.72rem; text-align: center; padding: 0.5rem; }
+.book h2 { font-size: 1.15rem; margin: 0 0 0.15rem; }
+.book h2 a { color: var(--text); text-decoration: none; }
+.book h2 a:hover { color: var(--accent); }
+.book p { margin: 0 0 0.5rem; font-size: 0.92rem; }
+.section-title { font-family: var(--font-ui); font-size: 0.8rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); margin: 2.5rem 0 0; }
+.updates { list-style: none; margin: 1rem 0 0; padding: 0; }
+.updates li { padding: 0.55rem 0; border-top: 1px solid var(--border); font-size: 0.95rem; }
+.updates .when { display: block; font-family: var(--font-ui); font-size: 0.78rem; color: var(--muted); }
+
+/* narrow screens: menus fold behind buttons (pure CSS, no script) */
+@media (max-width: 820px) {
+  .nav-button { display: inline-block; margin-left: auto; }
+  .site-nav { margin-left: 0; width: 100%; display: none; }
+  .nav-toggle:checked ~ .site-header .site-nav { display: block; }
+  .with-sidebar { display: block; }
+  .side-button { display: inline-block; margin: 0.75rem 1rem 0; }
+  .side { display: none; position: static; max-height: none; min-height: 0; border-right: 0; border-bottom: 1px solid var(--border); }
+  .side-toggle:checked ~ .with-sidebar .side { display: block; }
+  .with-sidebar > main { padding: 1rem 0.75rem 2rem; }
+  .story-head .cover { width: 8rem; }
+}
+@media print {
+  .site-header, .site-footer, .side, .pager, .nav-button, .side-button, .anchor { display: none !important; }
+  .with-sidebar { display: block; }
+  .content { border: 0; padding: 0; background: none; }
+}
+"""
+
+PAGE_MARK = "/* ============ PAGE SPECIFIC RULES ============ */"
+PAGE_HELP = """/*
+  Body classes you can target:
+    A page:                  body.page-SLUG            (home page: body.page-index)
+    The blog:                body.mod-blog             feed: body.blog-feed, post: body.blog-post, tags: body.blog-tag
+    The wiki:                body.mod-wiki             one section: body.sec-SLUG, one article: body.art-SECTION-SLUG
+    The library:             body.mod-library          story page: body.lib-story, chapter: body.lib-chapter
+    One story and chapters:  body.story-SLUG
+    Whatever the homepage is: body.is-home
+  Example: body.mod-wiki .content h2 { color: var(--accent); }
+*/
+"""
+
+
+def css_stub(label, cls):
+    return "\n/* --- %s (body.%s) --- */\nbody.%s {\n}\n" % (label.replace("*/", ""), cls, cls)
+
+
+def default_css(theme="site-clean"):
+    return CSS_HEADER + root_block(theme) + "\n" + BASE_CSS + "\n" + PAGE_MARK + "\n" + PAGE_HELP
+
+
+# ----------------------------------------------------------------------------
+# Side menu collapse and dropdown menus
+#
+# Layouts with a menu down one side get a "Hide menu" button. It is a hidden checkbox and a
+# label, so it works with JavaScript off: the CSS keys off html:has(#menu-collapse:checked).
+# NAV_JS is a small inline script. It remembers the choice between pages (localStorage), and it
+# closes dropdown menus (any <details data-drop>) when another one opens, when you click
+# outside them, or when you press Escape. Without it the dropdowns still open and close, they
+# just stay open until clicked again, and the menu shows again on every new page.
+# ----------------------------------------------------------------------------
+
+COLLAPSE_INPUT = '<input type="checkbox" id="menu-collapse" class="menu-collapse" aria-label="Hide the menu">'
+
+
+def collapse_button(where="", hide="Hide menu", show="Show menu"):
+    return ('<label for="menu-collapse" class="collapse-button%s"><span class="cb-hide">%s</span>'
+            '<span class="cb-show">%s</span></label>' % (" " + where if where else "", hide, show))
+
+
+NAV_JS = """<script>
+(function () {
+  var d = document, t = d.getElementById("menu-collapse"), key = "menu-collapsed";
+  if (t) {
+    try { if (localStorage.getItem(key) === "1") { t.checked = true; } } catch (e) {}
+    t.addEventListener("change", function () {
+      try { localStorage.setItem(key, t.checked ? "1" : "0"); } catch (e) {}
+    });
+  }
+  function openDrops() { return d.querySelectorAll("details[data-drop][open]"); }
+  d.addEventListener("toggle", function (e) {
+    var el = e.target;
+    if (!el.open || !el.hasAttribute || !el.hasAttribute("data-drop")) { return; }
+    openDrops().forEach(function (o) { if (o !== el) { o.open = false; } });
+  }, true);
+  d.addEventListener("click", function (e) {
+    openDrops().forEach(function (o) { if (!o.contains(e.target)) { o.open = false; } });
+  });
+  d.addEventListener("keydown", function (e) {
+    if (e.key !== "Escape") { return; }
+    openDrops().forEach(function (o) {
+      var had = o.contains(d.activeElement), s = o.querySelector("summary");
+      o.open = false;
+      if (had && s) { s.focus(); }
+    });
+  });
+})();
+</script>"""
+
+_COLLAPSED = "html:has(#menu-collapse:checked)"
+
+COLLAPSE_BASE_CSS = """
+/* Hide menu button: a checkbox and a label, no script needed */
+.menu-collapse { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }
+.collapse-button {
+  display: none; align-items: center; gap: 0.5rem; width: max-content; cursor: pointer; user-select: none;
+  padding: 0.25rem 0.7rem; font: 600 0.8rem/1.3 var(--font-ui, inherit); color: var(--muted);
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.collapse-button:hover { color: var(--accent); border-color: var(--accent); }
+.collapse-button::before {
+  content: ""; flex: none; width: 0.4em; height: 0.4em; margin-left: 0.15em;
+  border-left: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: rotate(45deg);
+}
+.collapse-button .cb-show { display: none; }
+.in-main.collapse-button { margin: 0 0 1rem; }
+html:has(#menu-collapse:focus-visible) .collapse-button { outline: 2px solid var(--accent); outline-offset: 2px; }
+COLLAPSED .collapse-button::before { margin-left: 0; margin-right: 0.15em; transform: rotate(-135deg); }
+COLLAPSED .collapse-button .cb-hide { display: none; }
+COLLAPSED .collapse-button .cb-show { display: inline; }
+/* Secure portal and Framed: the menu column hides at any width */
+.collapse-button.always { display: inline-flex; }
+COLLAPSED .pt-body { grid-template-columns: minmax(0, 1fr); }
+COLLAPSED .pt-nav { display: none; }
+@media print { .collapse-button { display: none !important; } }
+""".replace("COLLAPSED", _COLLAPSED)
+
+_MENU_OPEN = "html:where(:not(:has(#menu-collapse:checked)))"
+
+
+def page_scripts(side, html=""):
+    """The very top of <body>: the Hide menu checkbox when the page has a side menu, then NAV_JS
+    when there is a side menu or a dropdown (Handbook sections, the Book Contents) to look after."""
+    out = COLLAPSE_INPUT + "\n" if side else ""
+    if side or "data-drop" in html:
+        out += NAV_JS + "\n"
+    return out
+
+
+_MAIN_OPEN = re.compile(r"<main\b[^>]*>")
+
+
+def with_button(html, button):
+    """html with button placed just inside its first <main>."""
+    return _MAIN_OPEN.sub(lambda m: m.group(0) + "\n" + button, html, count=1)
+
+
+SF_COLLAPSE_CSS = COLLAPSE_BASE_CSS + """
+/* SiteForge: the wiki sections and a story's chapter list (.with-sidebar.collapsible) hide on wide
+   screens. The Sidebar site layout falls back to the Classic header on top while collapsed. */
+@media (min-width: 821px) {
+  .with-sidebar.collapsible .collapse-button { display: inline-flex; }
+  COLLAPSED .with-sidebar.collapsible { grid-template-columns: minmax(0, 1fr); }
+  COLLAPSED .with-sidebar.collapsible > .side { display: none; }
+  COLLAPSED .with-sidebar.collapsible > main > .content { margin-left: auto; margin-right: auto; }
+}
+@media (min-width: 900px) {
+  body.layout-sidebar .collapse-button { display: inline-flex; }
+}
+COLLAPSED .pt-main .with-sidebar.collapsible > .side { display: block; }
+""".replace("COLLAPSED", _COLLAPSED)
+
+
+# ----------------------------------------------------------------------------
+# Layouts
+#
+# A layout changes how the site is put together, not its colors. There are four choices, one
+# for the site as a whole and one for each module:
+#   Site layout     where the title and menu sit and how pages are framed
+#   Blog layout     the feed as a list, cards, a magazine front page or a dated archive
+#   Wiki layout     the sidebar on the left or right, a docs rail for the contents, or a menu bar
+#   Stories layout  a shelf, a book, a cover wall, a web serial or one story in the spotlight
+# The theme in style.css still sets colors and fonts, so every theme works with every layout.
+#
+# The chosen rules go to layout.css, which SiteForge rewrites on every build. Pages load it
+# before style.css. Layout rules start with a body class (body.layout-NAME, body.blog-layout-NAME
+# and so on), which outranks the base styles in style.css, while a rule you write in style.css
+# with the same weight still wins because it loads later.
+# ----------------------------------------------------------------------------
+
+LAYOUT_SHARED_CSS = """
+/* every layout: panel padding as variables, so full-width images can line up with it */
+.content { --pad-y: 1.75rem; --pad-x: clamp(1rem, 3vw, 2.25rem); }
+""" + SF_COLLAPSE_CSS
+
+SITE_SIDEBAR_CSS = """
+/* Site layout, Sidebar: title, tagline and menu in a column on the left. Every rule waits on the menu
+   not being collapsed (html:where(...) adds no weight), so collapsing falls back to the Classic header. */
+@media (min-width: 900px) {
+  MENU_OPEN body.layout-sidebar { display: grid; grid-template-columns: minmax(14rem, 17rem) minmax(0, 1fr); grid-template-rows: auto 1fr auto; min-height: 100vh; }
+  MENU_OPEN body.layout-sidebar > .site-header {
+    grid-column: 1; grid-row: 1 / -1; position: sticky; top: 0; height: 100vh; overflow-y: auto;
+    background: var(--sidebar-bg); color: var(--sidebar-text); border-bottom: 0; border-right: 1px solid var(--border);
+  }
+  MENU_OPEN body.layout-sidebar .site-header .bar { flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: 2.25rem; padding: 2.75rem 1.4rem 2rem; }
+  MENU_OPEN body.layout-sidebar .site-title { font-size: 1.6rem; line-height: 1.15; color: var(--sidebar-text); }
+  MENU_OPEN body.layout-sidebar .tagline { margin-top: 0.55rem; line-height: 1.45; }
+  MENU_OPEN body.layout-sidebar .site-nav { margin-left: 0; }
+  MENU_OPEN body.layout-sidebar .site-nav ul { flex-direction: column; flex-wrap: nowrap; gap: 0.15rem; }
+  MENU_OPEN body.layout-sidebar .site-nav a {
+    display: block; padding: 0.4rem 0.75rem; color: var(--sidebar-text);
+    border-bottom: 0; border-left: 3px solid transparent; border-radius: 0 var(--radius) var(--radius) 0;
+  }
+  MENU_OPEN body.layout-sidebar .site-nav a:hover { background: var(--sidebar-active); }
+  MENU_OPEN body.layout-sidebar .site-nav a[aria-current="page"] { color: var(--accent); border-left-color: var(--accent); background: var(--sidebar-active); }
+  MENU_OPEN body.layout-sidebar > .story-backdrop { grid-column: 2; grid-row: 1; }
+  MENU_OPEN body.layout-sidebar > main, MENU_OPEN body.layout-sidebar > .with-sidebar { grid-column: 2; grid-row: 2; min-width: 0; width: 100%; }
+  MENU_OPEN body.layout-sidebar > main.page-main { max-width: calc(var(--max-width) + 4rem); padding-top: 3rem; }
+  MENU_OPEN body.layout-sidebar > .site-footer { grid-column: 2; grid-row: 3; }
+}
+""".replace("MENU_OPEN", _MENU_OPEN)
+
+SITE_MAGAZINE_CSS = """
+/* Site layout, Magazine: big centered masthead over a ruled menu bar, a wider page */
+body.layout-magazine .site-header .bar {
+  max-width: calc(var(--max-width) + 22rem); margin: 0 auto; flex-direction: column; align-items: center; text-align: center;
+  gap: 0; padding: 2.5rem 1.25rem 0;
+}
+body.layout-magazine .brand { align-items: center; margin-bottom: 1.4rem; }
+body.layout-magazine .site-title { font-size: clamp(2.1rem, 6vw, 3.6rem); line-height: 1.05; }
+body.layout-magazine .tagline { margin-top: 0.55rem; font-size: 1rem; font-style: italic; }
+body.layout-magazine .nav-button { margin: 0 0 1rem; }
+@media (min-width: 821px) {
+  body.layout-magazine .site-nav { width: 100%; margin-left: 0; border-top: 3px double var(--border); border-bottom: 1px solid var(--border); }
+  body.layout-magazine .site-nav ul { justify-content: center; gap: 0.25rem 2.25rem; padding: 0.7rem 0; font-size: 0.78rem; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; }
+}
+body.layout-magazine main.page-main { max-width: calc(var(--max-width) + 22rem); padding-top: 2.5rem; }
+body.layout-magazine main.page-main > .content { max-width: calc(var(--max-width) + 4rem); margin: 0 auto; --pad-y: 2.25rem; --pad-x: clamp(1.1rem, 4vw, 3rem); padding: var(--pad-y) var(--pad-x); }
+body.layout-magazine .page-title { text-align: center; font-size: clamp(2rem, 5vw, 2.8rem); }
+body.layout-magazine .site-footer { text-align: center; border-top: 3px double var(--border); }
+"""
+
+SITE_JOURNAL_CSS = """
+/* Site layout, Journal: no panels, a narrow column and a small header */
+body.layout-journal .site-header { background: none; border-bottom: 0; }
+body.layout-journal .site-header .bar {
+  max-width: min(var(--max-width), 40rem); margin: 0 auto; align-items: baseline; padding: 3.25rem 1.25rem 0.8rem;
+  background: linear-gradient(var(--text), var(--text)) center bottom / calc(100% - 2.5rem) 1px no-repeat;
+}
+body.layout-journal .site-title { font-size: 1rem; letter-spacing: 0.2em; text-transform: uppercase; }
+body.layout-journal .site-nav a { color: var(--muted); border-bottom: 0; }
+body.layout-journal .site-nav a:hover, body.layout-journal .site-nav a[aria-current="page"] { color: var(--text); }
+body.layout-journal main.page-main { max-width: min(var(--max-width), 40rem); padding-top: 3rem; padding-bottom: 4rem; }
+body.layout-journal main.page-main > .content { --pad-y: 0; --pad-x: 0; padding: 0; background: none; border: 0; border-radius: 0; }
+body.layout-journal main.page-main .page-title { font-size: clamp(1.9rem, 5vw, 2.6rem); line-height: 1.1; margin-bottom: 1.5rem; }
+body.layout-journal main.page-main blockquote { border-left: 0; padding: 0 0 0 1.5rem; font-style: italic; }
+body.layout-journal .site-footer { border-top: 0; text-align: center; }
+body.layout-journal .site-footer .bar { padding-bottom: 3rem; }
+"""
+
+SITE_LANDING_CSS = """
+/* Site layout, Landing: a tinted hero with a large title, the menu on top, raised panels */
+body.layout-landing .site-header { background: linear-gradient(165deg, color-mix(in srgb, var(--accent) 24%, var(--bg)) 0%, var(--bg) 100%); border-bottom: 0; }
+body.layout-landing .site-header .bar {
+  max-width: calc(var(--max-width) + 16rem); margin: 0 auto; flex-direction: column; align-items: center; text-align: center;
+  gap: 0; padding: 1rem 1.25rem 2.5rem;
+}
+body.layout-landing:has(> main.page-main) .site-header .bar { padding-bottom: 4.5rem; }
+body.layout-landing.is-home:has(> main.page-main) .site-header .bar { padding-bottom: 7rem; }
+body.layout-landing .brand { align-items: center; }
+body.layout-landing.is-home .brand { padding-top: 2rem; }
+body.layout-landing .site-title { font-size: clamp(2.2rem, 7vw, 4rem); line-height: 1.05; }
+body.layout-landing .tagline { max-width: 34rem; margin: 0.9rem auto 0; font-size: 1.15rem; }
+body.layout-landing .nav-button { margin: 0 0 1.5rem auto; }
+@media (min-width: 821px) {
+  body.layout-landing .site-nav { order: -1; width: 100%; margin: 0 0 2.75rem; }
+  body.layout-landing .site-nav ul { justify-content: flex-end; gap: 0.35rem; }
+  body.layout-landing .site-nav a { display: block; padding: 0.35rem 0.95rem; border: 1px solid transparent; border-radius: 99px; color: var(--text); }
+  body.layout-landing .site-nav a:hover { border-color: var(--border); }
+  body.layout-landing .site-nav a[aria-current="page"] { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+}
+body.layout-landing main.page-main { max-width: calc(var(--max-width) + 8rem); margin-top: -3rem; padding-top: 0; }
+body.layout-landing.is-home main.page-main { margin-top: -5rem; }
+body.layout-landing main.page-main > .content {
+  --pad-y: 2.5rem; --pad-x: clamp(1.25rem, 5vw, 3.5rem); padding: var(--pad-y) var(--pad-x);
+  border-radius: calc(var(--radius) * 2); box-shadow: 0 24px 60px -28px rgba(0, 0, 0, 0.45);
+}
+body.layout-landing .site-footer { border-top: 0; text-align: center; }
+body.layout-landing .site-footer .bar { padding-top: 2.5rem; padding-bottom: 3rem; }
+"""
+
+
+def _blog_cards_css(L):
+    return """
+/* blog feed as cards */
+{L}.blog-feed main > .content, {L}.blog-tag main > .content {{ max-width: none; padding: 0; background: none; border: 0; box-shadow: none; }}
+{L}.layout-landing.blog-feed main.page-main, {L}.layout-landing.blog-tag main.page-main {{ margin-top: 0; padding-top: 0.5rem; }}
+{L} .post-list.cards {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); gap: 1.5rem; margin: 1.25rem 0 0; }}
+{L} .post-list.cards .post-item {{
+  display: flex; flex-direction: column; margin: 0; padding: 0; overflow: hidden;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface);
+  background: color-mix(in srgb, var(--surface) calc(var(--surface-opacity) * 100%), transparent);
+}}
+{L} .post-list.cards .post-item:not(.has-thumb) {{ border-top: 4px solid var(--accent); }}
+{L} .post-thumb {{ display: block; overflow: hidden; background: var(--code-bg); }}
+{L} .post-thumb img {{ display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; transition: transform 0.3s; }}
+{L} .post-item:hover .post-thumb img {{ transform: scale(1.03); }}
+{L} .post-body {{ display: flex; flex-direction: column; flex: 1; padding: 1.1rem 1.25rem 1.3rem; }}
+{L} .content .post-list.cards .post-item h2 {{ font-size: 1.2rem; margin: 0 0 0.35rem; }}
+{L} .post-list.cards .tags {{ margin: 0 0 0.5rem; }}
+{L} .post-feature {{ grid-column: 1 / -1; }}
+@media (min-width: 760px) {{
+  {L} .post-list.cards .post-feature.has-thumb {{ flex-direction: row; }}
+  {L} .post-feature.has-thumb .post-thumb {{ position: relative; flex: 1.35 1 0; min-height: 17rem; }}
+  {L} .post-feature.has-thumb .post-thumb img {{ position: absolute; inset: 0; height: 100%; aspect-ratio: auto; }}
+  {L} .post-feature .post-body {{ flex: 1 1 0; justify-content: center; padding: 2rem 2.25rem; }}
+  {L} .content .post-list.cards .post-feature h2 {{ font-size: 2rem; }}
+  {L} .post-feature .post-summary {{ font-size: 1.05rem; }}
+}}
+""".format(L=L)
+
+
+BLOG_CARDS_CSS = _blog_cards_css("body.blog-layout-cards")
+
+BLOG_MAGAZINE_CSS = _blog_cards_css("body.blog-layout-magazine") + """
+/* post page: the post's image across the top of the panel, a centered head */
+body.blog-layout-magazine.blog-post .content { overflow: hidden; }
+body.blog-layout-magazine .post-hero { margin: calc(-1 * var(--pad-y)) calc(-1 * var(--pad-x)) 2rem; }
+body.blog-layout-magazine .post-hero img { display: block; width: 100%; max-height: 28rem; object-fit: cover; }
+body.blog-layout-magazine.blog-post .content > .page-title { text-align: center; font-size: clamp(2rem, 5vw, 3rem); line-height: 1.1; }
+body.blog-layout-magazine.blog-post .content > .post-meta { text-align: center; }
+body.blog-layout-magazine.blog-post .content > .tags { justify-content: center; }
+"""
+
+BLOG_ARCHIVE_CSS = """
+/* blog as a dated archive grouped by year */
+body.blog-layout-archive .post-year { margin: 2.25rem 0 0; }
+body.blog-layout-archive .post-year:first-of-type { margin-top: 0.75rem; }
+body.blog-layout-archive .content .post-year > h2 {
+  margin: 0 0 0.4rem; padding-bottom: 0.3rem; border-bottom: 1px solid var(--border);
+  font-family: var(--font-ui); font-size: 0.8rem; letter-spacing: 0.2em; color: var(--muted);
+}
+body.blog-layout-archive .post-list.archive .post-item {
+  display: grid; grid-template-columns: 4.5rem minmax(0, 1fr); column-gap: 1rem; align-items: baseline; padding: 0.4rem 0; border-top: 0;
+}
+body.blog-layout-archive .post-list.archive .post-meta { grid-column: 1; grid-row: 1; margin: 0; font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+body.blog-layout-archive .content .post-list.archive .post-item h2 { grid-column: 2; grid-row: 1; margin: 0; font-size: 1.05rem; font-weight: 600; }
+body.blog-layout-archive .post-list.archive .tags { grid-column: 2; margin: 0.2rem 0 0; }
+body.blog-layout-archive .post-list.archive .post-summary { display: none; }
+"""
+
+WIKI_DOCS_CSS = """
+/* Wiki layout, Docs: a quiet sidebar, open articles and the contents in a rail on the right */
+body.wiki-layout-docs .wiki-side { background: var(--bg); padding-top: 1.5rem; }
+body.wiki-layout-docs .nav-section > summary { font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+body.wiki-layout-docs .nav-section ul { border-left: 0; margin-left: 0.3rem; }
+body.wiki-layout-docs.mod-wiki .with-sidebar > main { padding: 2.25rem clamp(1rem, 4vw, 3.5rem) 4rem; }
+body.wiki-layout-docs.mod-wiki .content { max-width: calc(var(--max-width) + 8rem); padding: 0; background: none; border: 0; border-radius: 0; }
+body.wiki-layout-docs.mod-wiki .content h1 { font-size: 2.3rem; }
+body.wiki-layout-docs .toc-rail .wiki-toc { margin: 0 0 2rem; }
+@media (min-width: 1180px) {
+  body.wiki-layout-docs .wiki-body.has-rail { display: grid; grid-template-columns: minmax(0, calc(var(--max-width) + 8rem)) 14rem; gap: 3rem; align-items: start; }
+  body.wiki-layout-docs .wiki-body.has-rail > .content { grid-column: 1; grid-row: 1; }
+  body.wiki-layout-docs .toc-rail { grid-column: 2; grid-row: 1; position: sticky; top: 1.5rem; max-height: calc(100vh - 3rem); overflow-y: auto; }
+  body.wiki-layout-docs .toc-rail .wiki-toc { margin: 0; padding: 0 0 0 1rem; background: none; border: 0; border-left: 1px solid var(--border); border-radius: 0; font-size: 0.85rem; }
+  body.wiki-layout-docs .toc-rail .wiki-toc summary { list-style: none; margin-bottom: 0.4rem; font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+  body.wiki-layout-docs .toc-rail .wiki-toc summary::-webkit-details-marker { display: none; }
+  body.wiki-layout-docs .toc-rail .wiki-toc ol { list-style: none; margin: 0; padding: 0; }
+  body.wiki-layout-docs .toc-rail .wiki-toc ol ol { padding-left: 0.85rem; }
+  body.wiki-layout-docs .toc-rail .wiki-toc a { display: block; padding: 0.18rem 0; color: var(--muted); text-decoration: none; }
+  body.wiki-layout-docs .toc-rail .wiki-toc a:hover { color: var(--accent); }
+}
+"""
+
+WIKI_HANDBOOK_CSS = """
+/* Wiki layout, Handbook: search and sections as a menu bar of dropdowns, one centered column */
+@media (min-width: 821px) {
+  body.wiki-layout-handbook.mod-wiki .with-sidebar { display: block; }
+  body.wiki-layout-handbook .wiki-side {
+    position: sticky; top: 0; z-index: 15; display: flex; flex-wrap: wrap; justify-content: center; align-items: center;
+    gap: 0.15rem 0.35rem; min-height: 0; max-height: none; overflow: visible; padding: 0.4rem 1rem;
+    border-right: 0; border-bottom: 1px solid var(--border);
+  }
+  body.wiki-layout-handbook .wiki-side .search { flex: 0 1 15rem; margin: 0 0.75rem 0 0; }
+  body.wiki-layout-handbook .wiki-side .search input { padding: 0.3rem 0.65rem; }
+  body.wiki-layout-handbook .wiki-side .search-results { position: absolute; left: 0; width: 22rem; max-width: 90vw; z-index: 30; max-height: 70vh; overflow-y: auto; }
+  body.wiki-layout-handbook .nav-home { margin: 0; }
+  body.wiki-layout-handbook .nav-section { position: relative; margin: 0; }
+  body.wiki-layout-handbook .nav-count { display: none; }
+  body.wiki-layout-handbook .nav-section.is-current > summary { color: var(--accent); box-shadow: inset 0 -2px 0 var(--accent); border-radius: 0; }
+  body.wiki-layout-handbook .nav-section > ul {
+    position: absolute; top: calc(100% + 0.45rem); left: 0; z-index: 20; min-width: 15rem; max-height: 60vh; overflow-y: auto;
+    margin: 0; padding: 0.4rem; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
+  }
+  body.wiki-layout-handbook.mod-wiki .with-sidebar > main { padding: 2.75rem 1.25rem 4rem; }
+  body.wiki-layout-handbook.mod-wiki .content { max-width: calc(var(--max-width) + 6rem); margin: 0 auto; padding: 0; background: none; border: 0; border-radius: 0; }
+  body.wiki-layout-handbook.mod-wiki .breadcrumbs ol { justify-content: center; }
+  body.wiki-layout-handbook.mod-wiki .content > h1 { text-align: center; font-size: 2.4rem; }
+}
+"""
+
+WIKI_RIGHT_CSS = """
+/* Wiki layout, Right sidebar: articles first, sections on the right, a raised panel */
+@media (min-width: 821px) {
+  body.wiki-layout-right .with-sidebar { grid-template-columns: minmax(0, 1fr) var(--sidebar-width); }
+  body.wiki-layout-right .wiki-side { grid-column: 2; grid-row: 1; border-right: 0; border-left: 1px solid var(--border); }
+  body.wiki-layout-right.mod-wiki .with-sidebar > main { grid-column: 1; grid-row: 1; padding-top: 2.25rem; }
+  body.wiki-layout-right.mod-wiki .content { margin: 0 auto; box-shadow: 0 18px 44px -26px rgba(0, 0, 0, 0.4); }
+}
+body.wiki-layout-right .wiki-card { background: var(--surface); border-top: 3px solid var(--accent); }
+"""
+
+LIB_SOLO_CSS = """
+/* chapters without the sidebar */
+.solo { max-width: calc(var(--measure) + 6rem); margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+"""
+
+LIB_BOOK_CSS = LIB_SOLO_CSS + """
+/* Stories layout, Book: each chapter is a paper page with a Contents dropdown */
+body.lib-layout-book .solo .sheet {
+  max-width: none; padding: clamp(1.5rem, 6vw, 4.5rem) clamp(1.25rem, 7vw, 5rem);
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 18px 40px -24px rgba(0, 0, 0, 0.35);
+}
+body.lib-layout-book .contents-drop { margin: -0.5rem 0 2.5rem; text-align: center; font-family: var(--font-ui); font-size: 0.85rem; }
+body.lib-layout-book .contents-drop > summary { display: inline-block; cursor: pointer; padding: 0.3rem 1rem; border: 1px solid var(--border); border-radius: 99px; color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; font-size: 0.72rem; list-style: none; }
+body.lib-layout-book .contents-drop > summary::-webkit-details-marker { display: none; }
+body.lib-layout-book .contents-drop[open] > summary { color: var(--accent); border-color: var(--accent); }
+body.lib-layout-book .contents-drop .side {
+  display: block; position: static; min-height: 0; max-height: 55vh; margin: 0.75rem auto 0; max-width: 24rem; text-align: left;
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+}
+body.lib-layout-book .chapter-head { margin-bottom: 3rem; }
+body.lib-layout-book .chapter-head h1 { font-size: 2.2rem; }
+body.lib-layout-book .chapter-head h1::after { content: ""; display: block; width: 3rem; height: 1px; margin: 1.25rem auto 0; background: var(--accent); }
+body.lib-layout-book .shelf { grid-template-columns: 1fr; gap: 0; max-width: 48rem; }
+body.lib-layout-book .book { padding: 1.25rem 0; border-top: 1px solid var(--border); }
+body.lib-layout-book .book:first-child { border-top: 0; }
+body.lib-layout-book .book .cover { width: 5.5rem; }
+"""
+
+LIB_SHELF_CSS = """
+/* Stories layout, Bookshelf: a wall of covers, story pages open with a large cover */
+body.lib-layout-shelf .shelf { grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr)); gap: 2rem 1.5rem; }
+body.lib-layout-shelf .book { flex-direction: column; gap: 0.7rem; }
+body.lib-layout-shelf .book > a { display: block; }
+body.lib-layout-shelf .book .cover { display: block; width: 100%; aspect-ratio: 2 / 3; object-fit: cover; box-shadow: 0 14px 28px -14px rgba(0, 0, 0, 0.55); transition: transform 0.2s, box-shadow 0.2s; }
+body.lib-layout-shelf .book .cover.none { display: flex; font-family: var(--font-heading); font-size: 1rem; padding: 1rem; background: linear-gradient(160deg, color-mix(in srgb, var(--accent) 35%, var(--surface)), var(--code-bg)); color: var(--text); }
+body.lib-layout-shelf .book > a:hover .cover { transform: translateY(-4px); box-shadow: 0 20px 34px -14px rgba(0, 0, 0, 0.6); }
+body.lib-layout-shelf .book h2 { font-size: 1.02rem; }
+body.lib-layout-shelf .book .subtitle, body.lib-layout-shelf .book p:not(.subtitle) { display: none; }
+body.lib-layout-shelf .book .facts { font-size: 0.72rem; margin: 0.3rem 0 0; }
+body.lib-layout-shelf .story-head { align-items: flex-end; gap: 2.25rem; }
+body.lib-layout-shelf .story-head .cover { width: 15rem; box-shadow: 0 20px 40px -18px rgba(0, 0, 0, 0.6); }
+body.lib-layout-shelf .story-head h1 { font-size: 2.5rem; }
+body.lib-layout-shelf.lib-story .sheet { max-width: calc(var(--measure) + 10rem); }
+body.lib-layout-shelf .chapter-list ol { display: grid; grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr)); gap: 0.6rem; }
+body.lib-layout-shelf .chapter-list li, body.lib-layout-shelf .chapter-list li:last-child { border: 1px solid var(--border); border-radius: var(--radius); }
+body.lib-layout-shelf .chapter-list a { flex-wrap: wrap; height: 100%; padding: 0.7rem 0.85rem; }
+body.lib-layout-shelf .chapter-list .ch-meta { flex-basis: 100%; padding-left: 2.35em; }
+"""
+
+LIB_SERIAL_CSS = LIB_SOLO_CSS + """
+/* Stories layout, Serial: latest chapters lead, navigation above and below every chapter */
+body.lib-layout-serial .updates { margin: 0.75rem 0 0; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+body.lib-layout-serial .updates li { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0.25rem 1rem; padding: 0.7rem 1rem; }
+body.lib-layout-serial .updates li:first-child { border-top: 0; }
+body.lib-layout-serial .updates a { font-weight: 600; text-decoration: none; }
+body.lib-layout-serial .shelf { grid-template-columns: 1fr; gap: 0; margin-top: 0.75rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+body.lib-layout-serial .book { align-items: center; padding: 0.85rem 1rem; border-top: 1px solid var(--border); }
+body.lib-layout-serial .book:first-child { border-top: 0; }
+body.lib-layout-serial .book .cover { width: 3.4rem; }
+body.lib-layout-serial .book .cover.none { font-size: 0.55rem; padding: 0.25rem; }
+body.lib-layout-serial .book .facts { margin: 0; }
+body.lib-layout-serial .book p:not(.subtitle) { margin-bottom: 0.3rem; }
+body.lib-layout-serial .solo { max-width: calc(var(--measure) + 4rem); }
+body.lib-layout-serial .pager.top { margin: 0 0 2.5rem; }
+body.lib-layout-serial .pager a { text-align: center; }
+body.lib-layout-serial .pager .index { flex: 0 0 auto; }
+body.lib-layout-serial .pager .prev { text-align: left; }
+body.lib-layout-serial .pager .next { text-align: right; }
+body.lib-layout-serial .chapter-head { text-align: left; padding-bottom: 1.25rem; border-bottom: 1px solid var(--border); }
+@media (max-width: 600px) {
+  body.lib-layout-serial .pager a { padding: 0.6rem 0.5rem; font-size: 0; }
+  body.lib-layout-serial .pager small { margin: 0; font-size: 0.75rem; }
+}
+"""
+
+LIB_SPOTLIGHT_CSS = """
+/* Stories layout, Spotlight: the first story fills the top, story pages open on a cover backdrop */
+body.lib-layout-spotlight .shelf { grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr)); }
+body.lib-layout-spotlight .book { padding: 1rem; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+body.lib-layout-spotlight .book.featured {
+  grid-column: 1 / -1; gap: clamp(1rem, 4vw, 2.5rem); padding: clamp(1.25rem, 4vw, 2.5rem); align-items: center;
+  background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 20%, var(--surface)) 0%, var(--surface) 70%);
+}
+body.lib-layout-spotlight .book.featured .cover { width: clamp(8rem, 22vw, 14rem); box-shadow: 0 20px 40px -18px rgba(0, 0, 0, 0.6); }
+body.lib-layout-spotlight .book.featured h2 { font-size: clamp(1.6rem, 4vw, 2.4rem); }
+body.lib-layout-spotlight .book.featured p { font-size: 1.02rem; }
+body.lib-layout-spotlight .story-backdrop {
+  position: relative; height: 15rem; overflow: hidden; border-bottom: 1px solid var(--border);
+  background: linear-gradient(160deg, color-mix(in srgb, var(--accent) 40%, var(--bg)), var(--bg));
+}
+body.lib-layout-spotlight .story-backdrop img { position: absolute; inset: -40px; width: calc(100% + 80px); height: calc(100% + 80px); object-fit: cover; filter: blur(24px) saturate(1.2); opacity: 0.6; }
+body.lib-layout-spotlight.lib-story .with-sidebar > main, body.lib-layout-spotlight.lib-story main.page-main { padding-top: 0; }
+body.lib-layout-spotlight.lib-story .story-head { position: relative; margin-top: -6rem; }
+body.lib-layout-spotlight.lib-story .story-head .cover { width: 12rem; box-shadow: 0 22px 44px -18px rgba(0, 0, 0, 0.65); }
+@media (min-width: 700px) {
+  body.lib-layout-spotlight.lib-story .story-head .about { padding-top: 6.5rem; }
+}
+body.lib-layout-spotlight.lib-story .story-head.no-cover { margin-top: -4rem; }
+body.lib-layout-spotlight.lib-story .story-head.no-cover .about { padding-top: 0; }
+body.lib-layout-spotlight.lib-story .story-head.no-cover h1 { font-size: 2.6rem; }
+"""
+
+# ----------------------------------------------------------------------------
+# Secure portal layout
+#
+# A late-90s "secure system" site: classification banners above and below, a stack of warning
+# lines, a framed page with a chrome title, a flag and a seal, the menu in a column on the left,
+# and a webring, hit counter and 88x31 badges at the bottom. What it shows is set in Settings
+# under "Secure portal layout": the text, the line breaks in the warning box, which pieces appear and
+# the layout's own colors. The theme still sets the page, panel, text, link and font colors.
+# "Secure portal" in the Retro group is the palette it was made with, but any theme works.
+# ----------------------------------------------------------------------------
+
+PORTAL_COLORS = (
+    ("banner_bg", "#7a0e0e", "Banner background"),
+    ("banner_line", "#ff2a2a", "Banner edges"),
+    ("banner_text", "#ffffff", "Banner text"),
+    ("warn_text", "#ff2a2a", "Warning text"),
+    ("heading", "#ff2a2a", "Headings and bullets"),
+    ("highlight", "#ffcc00", "Highlights"),
+    ("visited", "#9966cc", "Visited links"),
+    ("term", "#b8d8c0", "Code text"),
+    ("frame", "#555555", "Frame lines"),
+)
+PORTAL_TEXT = (("banner", 200), ("warning", 2000), ("seal_text", 120), ("seal_caption", 60), ("nav_title", 60),
+               ("nav_note", 300), ("construction", 200), ("webring", 120), ("counter_label", 80), ("counter", 12),
+               ("counter_note", 120), ("badges", 600))
+PORTAL_BOOLS = ("banner_bottom", "warning_big", "blink", "chrome", "flag", "seal")
+PORTAL_DEFAULTS = {
+    "banner": "TOP SECRET // SCI // NOFORN // ORCON",
+    "banner_bottom": True,
+    "warning": ("*** WARNING ***\n"
+                "*** UNAUTHORIZED ACCESS TO THIS SYSTEM IS A FEDERAL OFFENSE ***\n"
+                "*** THIS SESSION IS BEING MONITORED, RECORDED, AND NARRATED ***\n"
+                "*** A SATELLITE HAS BEEN REPOSITIONED OVER YOUR GENERAL AREA ***\n"
+                "*** DO NOT UNPLUG YOUR MODEM ***"),
+    "warning_big": True,
+    "blink": True,
+    "chrome": True,
+    "flag": True,
+    "seal": True,
+    "seal_text": "",
+    "seal_caption": "NOT A REAL SEAL",
+    "nav_title": "NAVIGATION",
+    "nav_note": "This site is best viewed with Netscape Navigator 4.0 at 800x600 in 256 colors.",
+    "construction": "THIS SECTION UNDER CONSTRUCTION SINCE 1998",
+    "webring": "The Secret Government Webring",
+    "counter_label": "You are visitor number",
+    "counter": "0000007",
+    "counter_note": "since 04/12/98",
+    "badges": "Y2K COMPLIANT\nBEST VIEWED AT 800x600\nMADE WITH NOTEPAD.EXE\nSIGN OUR GUESTBOOK",
+    "width": 860,
+}
+PORTAL_DEFAULTS.update({k: v for k, v, _ in PORTAL_COLORS})
+_PORTAL_HEX = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+_PORTAL_SMALL = {"a", "an", "and", "at", "by", "for", "in", "of", "on", "or", "the", "to"}
+
+
+def clean_portal(d, current=None):
+    """Secure portal settings with every value checked: text trimmed to length, colors as #hex only."""
+    out = dict(PORTAL_DEFAULTS)
+    if isinstance(current, dict):
+        out.update({k: v for k, v in current.items() if k in PORTAL_DEFAULTS})
+    if isinstance(d, dict):
+        out.update({k: v for k, v in d.items() if k in PORTAL_DEFAULTS})
+    for k, limit in PORTAL_TEXT:
+        out[k] = str(out[k] if out[k] is not None else "").replace("\r\n", "\n").replace("\r", "\n")[:limit]
+    for k in PORTAL_BOOLS:
+        out[k] = bool(out[k])
+    for k, default, _ in PORTAL_COLORS:
+        v = str(out[k] or "").strip()
+        out[k] = v.lower() if _PORTAL_HEX.match(v) else default
+    try:
+        out["width"] = max(640, min(1600, int(out["width"])))
+    except (TypeError, ValueError):
+        out["width"] = PORTAL_DEFAULTS["width"]
+    return out
+
+
+def portal_vars_css(p):
+    lines = ["body.layout-secure {", "  --pt-width: %dpx;" % p["width"]]
+    lines += ["  --pt-%s: %s;" % (k.replace("_", "-"), p[k]) for k, _, _ in PORTAL_COLORS]
+    return "\n/* Portal width and colors, from Settings > Secure portal layout */\n" + "\n".join(lines) + "\n}\n"
+
+
+def _portal_lines(text):
+    return [ln.strip() for ln in str(text or "").split("\n") if ln.strip()]
+
+
+def portal_seal(p, title):
+    lines = _portal_lines(p["seal_text"])[:3]
+    if not lines:
+        words = [w for w in re.findall(r"[A-Za-z0-9]+", title or "") if w.lower() not in _PORTAL_SMALL]
+        initials = ".".join(w[0] for w in words[:5]).upper()
+        lines = ["SEAL OF", "★", (initials + ".") if initials else "THIS SITE"]
+    parts = []
+    for ln in lines:
+        parts.append(("<b>%s</b>" if len(ln) <= 2 else "<span>%s</span>") % esc(ln))
+    cap = '<div class="pt-seal-cap">%s</div>' % esc(p["seal_caption"]) if p["seal_caption"].strip() else ""
+    return ('<div class="pt-seal-box"><div class="pt-seal" aria-hidden="true"><div>%s</div></div>%s</div>'
+            % ("".join(parts), cap))
+
+
+def portal_body(p, *, title, brand, nav, main, footer):
+    """The body of a Secure portal page. brand: the title link and tagline. nav: the menu (or a wiki
+    sidebar), shown in the left column. main and footer: what the page would show anyway."""
+    out = []
+    banner = p["banner"].strip()
+    if banner:
+        out.append('<div class="pt-banner">%s</div>' % esc(banner))
+    lines = _portal_lines(p["warning"])
+    if lines:
+        cls = "pt-warn" + (" big" if p["warning_big"] else "") + (" blink" if p["blink"] else "")
+        out.append('<div class="%s" role="note">\n%s\n</div>' % (cls, "\n".join("<p>%s</p>" % esc(ln) for ln in lines)))
+    head = []
+    if p["flag"]:
+        head.append('<div class="pt-flagpole" aria-hidden="true"><div class="pt-flag"></div></div>')
+    head.append('<div class="pt-brand%s">%s</div>' % (" chrome" if p["chrome"] else "", brand))
+    if p["seal"]:
+        head.append(portal_seal(p, title))
+    out.append('<div class="pt-frame">\n<header class="pt-head%s">\n%s\n</header>'
+               % ("" if p["flag"] or p["seal"] else " solo", "\n".join(head)))
+    side = ""
+    if nav.strip():
+        t = '<div class="pt-nav-title">%s</div>\n' % esc(p["nav_title"]) if p["nav_title"].strip() else ""
+        note = '\n<p class="pt-note">%s</p>' % esc(p["nav_note"]) if p["nav_note"].strip() else ""
+        side = '<aside class="pt-nav">\n%s%s%s\n</aside>\n' % (t, nav, note)
+    cons = ('\n<div class="pt-construction"><p>%s</p></div>' % esc(p["construction"])
+            if p["construction"].strip() else "")
+    out.append('<div class="pt-body%s">\n%s<div class="pt-main">\n%s%s\n</div>\n</div>'
+               % ("" if side else " no-nav", side, main, cons))
+    foot = []
+    if p["webring"].strip():
+        foot.append('<div class="pt-ring"><strong>%s</strong><a href="#">&lt;&lt; Prev</a> | <a href="#">Random</a> | '
+                    '<a href="#">List Sites</a> | <a href="#">Next &gt;&gt;</a></div>' % esc(p["webring"]))
+    digits = re.sub(r"\s+", "", p["counter"])
+    if digits:
+        foot.append('<p class="pt-counter">%s <span class="pt-digits">%s</span> %s</p>'
+                    % (esc(p["counter_label"]), "".join("<span>%s</span>" % esc(ch) for ch in digits),
+                       esc(p["counter_note"])))
+    badges = _portal_lines(p["badges"])[:12]
+    if badges:
+        foot.append('<div class="pt-badges">%s</div>'
+                    % "".join('<span class="pt-badge b%d">%s</span>' % (i % 5 + 1, esc(b)) for i, b in enumerate(badges)))
+    if foot or footer.strip():
+        out.append('<div class="pt-foot">\n%s%s\n</div>' % ("\n".join(foot), footer))
+    out.append("</div>")
+    if banner and p["banner_bottom"]:
+        out.append('<div class="pt-banner bottom">%s</div>' % esc(banner))
+    return "\n".join(out)
+
+
+PORTAL_CSS = """
+/* Site layout, Secure portal: a late-90s secure system page. Colors under --pt-* come from Settings. */
+body.layout-secure { padding-bottom: 1.25rem; }
+body.layout-secure a:visited { color: var(--pt-visited); }
+body.layout-secure .pt-banner {
+  background: var(--pt-banner-bg); color: var(--pt-banner-text); text-align: center;
+  font: 700 0.8125rem/1.4 var(--font-heading); letter-spacing: 0.2em; padding: 0.3rem 0.6rem;
+  border-top: 1px solid var(--pt-banner-line); border-bottom: 1px solid var(--pt-banner-line);
+}
+body.layout-secure .pt-banner.bottom { margin-top: 1.25rem; }
+body.layout-secure .pt-warn, body.layout-secure .pt-frame { width: min(var(--pt-width), calc(100% - 2rem)); margin: 1.25rem auto 0; }
+body.layout-secure .pt-warn {
+  padding: 0.65rem 0.9rem; background: var(--code-bg); color: var(--pt-warn-text); text-align: center;
+  font: 700 0.875rem/1.6 var(--font-mono); border: 2px ridge var(--pt-frame); border-bottom: 0;
+}
+body.layout-secure .pt-warn p { margin: 0; }
+body.layout-secure .pt-warn.big p:first-child { font-size: 1.15em; margin-bottom: 0.25rem; }
+body.layout-secure .pt-warn.big.blink p:first-child { animation: pt-blink 1.2s steps(1) infinite; }
+body.layout-secure .pt-warn + .pt-frame { margin-top: 0; }
+body.layout-secure .pt-frame { border: 2px ridge var(--pt-frame); background: var(--surface); color: var(--text); }
+body.layout-secure .pt-head {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 1rem;
+  padding: 0.9rem 1rem; background: var(--header-bg); color: var(--header-text); border-bottom: 2px ridge var(--pt-frame);
+}
+body.layout-secure .pt-head.solo { grid-template-columns: minmax(0, 1fr); }
+body.layout-secure .pt-brand { grid-column: 2; text-align: center; min-width: 0; }
+body.layout-secure .pt-head.solo .pt-brand { grid-column: 1; }
+body.layout-secure .pt-brand .site-title {
+  display: inline-block; font: 900 clamp(1.4rem, 3.6vw, 2rem)/1.08 "Arial Black", Impact, var(--font-heading);
+  letter-spacing: 0.02em; color: var(--header-text); text-decoration: none; overflow-wrap: anywhere;
+}
+body.layout-secure .pt-brand.chrome .site-title {
+  background: linear-gradient(#ffffff 0%, #bdbdbd 44%, #3a3a3a 50%, #9a9a9a 62%, #ffffff 100%);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+  filter: drop-shadow(2px 2px 0 var(--pt-banner-bg));
+}
+body.layout-secure .pt-brand .tagline { display: block; margin: 0.45rem 0 0; font-style: italic; color: var(--muted); }
+body.layout-secure .pt-flagpole { grid-column: 1; display: flex; align-items: flex-start; }
+body.layout-secure .pt-flagpole::before { content: ""; width: 4px; height: 92px; margin-right: 2px; background: linear-gradient(90deg, #444, #bbb, #444); }
+body.layout-secure .pt-flag {
+  position: relative; width: 104px; height: 56px; border: 1px solid #222;
+  background: repeating-linear-gradient(to bottom, #a01a1a 0 7.6923%, #d8d8d8 7.6923% 15.3846%);
+  transform-origin: left center; animation: pt-wave 1.6s ease-in-out infinite alternate;
+}
+body.layout-secure .pt-flag::before {
+  content: ""; position: absolute; left: 0; top: 0; width: 40%; height: 53.85%; background-color: #2a2a5e;
+  background-image: radial-gradient(#ddd 0.9px, transparent 1.3px); background-size: 6.9px 6px; background-position: 1px 1px;
+}
+body.layout-secure .pt-seal-box { grid-column: 3; }
+body.layout-secure .pt-seal {
+  position: relative; width: max(92px, 11.5em); height: max(92px, 11.5em); margin: 0 auto; border-radius: 50%; border: 2px solid #8a7420;
+  background: radial-gradient(circle, #141a33 0 44%, #8a7420 45% 48%, #141a33 49% 68%, #8a7420 69% 72%, #0a0a0a 73%);
+  display: flex; align-items: center; justify-content: center; text-align: center;
+  color: #c9a227; font: 700 8px/1.15 Arial, Helvetica, sans-serif; letter-spacing: 0.06em;
+}
+body.layout-secure .pt-seal::before { content: ""; position: absolute; inset: 7px; border-radius: 50%; border: 1px dashed #8a7420; animation: pt-spin 14s linear infinite; }
+body.layout-secure .pt-seal span, body.layout-secure .pt-seal b { display: block; max-width: 6.75em; overflow-wrap: anywhere; }
+body.layout-secure .pt-seal b { font-size: 18px; line-height: 1; margin: 1px auto; }
+body.layout-secure .pt-seal-cap { margin-top: 0.3rem; font: 700 9px Arial, Helvetica, sans-serif; color: var(--muted); text-align: center; }
+body.layout-secure .pt-body { display: grid; grid-template-columns: 11rem minmax(0, 1fr); align-items: stretch; }
+body.layout-secure .pt-body.no-nav { grid-template-columns: minmax(0, 1fr); }
+body.layout-secure .pt-nav {
+  min-width: 0; padding: 0.9rem 0.75rem; background: var(--sidebar-bg); color: var(--sidebar-text);
+  border-right: 2px ridge var(--pt-frame); font: 0.8125rem/1.45 var(--font-ui);
+}
+body.layout-secure .pt-nav-title {
+  margin: 0 0 0.55rem; padding-bottom: 0.2rem; border-bottom: 1px solid var(--pt-frame);
+  color: var(--pt-highlight); font: 700 0.75rem/1.3 var(--font-ui); letter-spacing: 0.04em;
+}
+body.layout-secure .pt-nav .site-nav { display: block; width: auto; margin: 0; font: inherit; }
+body.layout-secure .pt-nav .site-nav ul { display: block; margin: 0; padding: 0; list-style: none; }
+body.layout-secure .pt-nav .site-nav li { position: relative; margin: 0 0 0.35rem; padding-left: 0.8rem; }
+body.layout-secure .pt-nav .site-nav li::before { content: ""; position: absolute; left: 0; top: 0.45em; width: 0.4rem; height: 0.4rem; background: var(--pt-heading); }
+body.layout-secure .pt-nav .site-nav a { display: inline; padding: 0; border: 0; border-radius: 0; background: none; color: var(--accent); text-decoration: underline; }
+body.layout-secure .pt-nav .site-nav a:visited { color: var(--pt-visited); }
+body.layout-secure .pt-nav .site-nav a:hover { color: var(--pt-highlight); background: none; }
+body.layout-secure .pt-nav .site-nav a[aria-current="page"], body.layout-secure .pt-nav .site-nav a.active { color: var(--pt-highlight); font-weight: 700; }
+body.layout-secure .pt-note { margin: 1.1rem 0 0; font-size: 0.6875rem; color: var(--muted); }
+body.layout-secure .pt-main { min-width: 0; padding: 1.1rem 1.35rem 1.35rem; }
+body.layout-secure .pt-main h1, body.layout-secure .pt-main h2, body.layout-secure .pt-main h3 { color: var(--pt-heading); font-family: var(--font-heading); }
+body.layout-secure .pt-main h1 a, body.layout-secure .pt-main h2 a, body.layout-secure .pt-main h3 a { color: inherit; }
+body.layout-secure .pt-main hr { height: 0; border: 0; border-top: 1px solid var(--pt-frame); border-bottom: 1px solid var(--code-bg); background: none; margin: 1.25rem 0; }
+body.layout-secure .pt-main pre { background: var(--code-bg); color: var(--pt-term); border: 1px solid var(--pt-frame); border-radius: 0; }
+body.layout-secure .pt-main code { color: var(--pt-term); }
+body.layout-secure .pt-main blockquote {
+  margin: 1rem 0; padding: 0.5rem 0.8rem; border: 1px dashed var(--pt-highlight); border-radius: 0;
+  background: none; color: var(--text); font-style: normal;
+}
+body.layout-secure .pt-main blockquote strong { color: var(--pt-highlight); }
+body.layout-secure .pt-main table { border-collapse: collapse; border: 1px solid var(--pt-frame); }
+body.layout-secure .pt-main th, body.layout-secure .pt-main td { border: 1px solid var(--pt-frame); }
+body.layout-secure .pt-main th { background: var(--header-bg); color: var(--header-text); }
+body.layout-secure .pt-construction { margin-top: 1.5rem; padding: 5px; background: repeating-linear-gradient(45deg, #000 0 14px, var(--pt-highlight) 14px 28px); }
+body.layout-secure .pt-construction p { margin: 0; padding: 0.4rem; background: #000; color: var(--pt-highlight); text-align: center; font: 700 0.875rem/1.4 var(--font-heading); }
+body.layout-secure .pt-foot {
+  padding: 1rem; border-top: 2px ridge var(--pt-frame); background: var(--header-bg); color: var(--muted);
+  text-align: center; font: 0.75rem/1.5 var(--font-ui);
+}
+body.layout-secure .pt-ring { display: inline-block; padding: 0.4rem 0.75rem; border: 2px outset var(--pt-frame); background: var(--code-bg); }
+body.layout-secure .pt-ring strong { display: block; margin-bottom: 0.15rem; color: var(--pt-highlight); }
+body.layout-secure .pt-counter { margin: 0.85rem 0 0; }
+body.layout-secure .pt-digits span {
+  display: inline-block; margin: 0 1px; padding: 0 3px; background: #000; color: var(--pt-heading);
+  border: 1px solid var(--pt-frame); font: 700 1rem/1.3 var(--font-mono);
+}
+body.layout-secure .pt-badges { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin-top: 0.85rem; }
+body.layout-secure .pt-badge {
+  display: flex; align-items: center; justify-content: center; width: max(88px, 9.8em); min-height: 31px; padding: 2px;
+  border: 1px solid var(--pt-frame); text-align: center; font: 700 9px/1.1 Arial, Helvetica, sans-serif; overflow: hidden;
+}
+body.layout-secure .pt-badge.b1 { background: linear-gradient(#001, #004); color: var(--pt-highlight); }
+body.layout-secure .pt-badge.b2 { background: #000; color: var(--pt-term); font-family: "Courier New", Courier, monospace; }
+body.layout-secure .pt-badge.b3 { background: linear-gradient(#333, #111); color: #ddd; }
+body.layout-secure .pt-badge.b4 { background: linear-gradient(#300, #800); color: #fff; }
+body.layout-secure .pt-badge.b5 { background: var(--pt-highlight); color: #000; }
+body.layout-secure .pt-foot .site-footer { margin: 0.85rem 0 0; padding: 0; border: 0; background: none; color: var(--muted); }
+body.layout-secure .pt-foot .site-footer > * { max-width: none; margin: 0; padding: 0; }
+body.layout-secure .pt-foot .site-footer p { margin: 0; }
+@keyframes pt-blink { 50% { visibility: hidden; } }
+@keyframes pt-wave { from { transform: skewY(-3deg) scaleX(0.97); } to { transform: skewY(3deg) scaleX(1); } }
+@keyframes pt-spin { to { transform: rotate(360deg); } }
+@media (max-width: 720px) {
+  body.layout-secure .pt-head { grid-template-columns: minmax(0, 1fr); }
+  body.layout-secure .pt-brand { grid-column: 1; }
+  body.layout-secure .pt-flagpole, body.layout-secure .pt-seal-box { display: none; }
+  body.layout-secure .pt-body { display: block; }
+  body.layout-secure .pt-nav { border-right: 0; border-bottom: 2px ridge var(--pt-frame); }
+  body.layout-secure .pt-main { padding: 0.9rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  body.layout-secure .pt-warn p, body.layout-secure .pt-flag, body.layout-secure .pt-seal::before { animation: none !important; }
+}
+@media print {
+  body.layout-secure .pt-banner, body.layout-secure .pt-warn, body.layout-secure .pt-nav, body.layout-secure .pt-foot { display: none; }
+  body.layout-secure .pt-frame { border: 0; width: auto; }
+}
+"""
+
+PORTAL_DESC = ("A 1998 secure-system site: classification banners, a box of warning lines, a framed page with a chrome "
+               "title, flag and seal, the menu in a column on the left and a webring, hit counter and badges at the "
+               "bottom. Set its text, line breaks and colors in Settings under Secure portal layout. Pairs with the "
+               "Secure portal theme.")
+
+# ----------------------------------------------------------------------------
+# Framed layout
+#
+# The Secure portal's page structure with none of its costume: an optional bar across the top,
+# an optional notice box, then one framed page with the title row on top (an image either side
+# if you want), the menu in a column on the left, the content on the right and the footer
+# along the bottom. Colors and fonts all come from the theme, so it reads as an ordinary site.
+# Its text and images are set in Settings under "Framed layout".
+# ----------------------------------------------------------------------------
+
+FRAME_TEXT = (("top_bar", 200), ("notice", 2000), ("left_image", 400), ("right_image", 400), ("nav_title", 60),
+              ("nav_note", 300))
+FRAME_DEFAULTS = {
+    "top_bar": "",
+    "bottom_bar": False,
+    "notice": "",
+    "left_image": "",
+    "right_image": "",
+    "nav_title": "Menu",
+    "nav_note": "",
+    "width": 960,
+}
+
+
+def clean_frame(d, current=None):
+    """Framed layout settings with every value checked."""
+    out = dict(FRAME_DEFAULTS)
+    if isinstance(current, dict):
+        out.update({k: v for k, v in current.items() if k in FRAME_DEFAULTS})
+    if isinstance(d, dict):
+        out.update({k: v for k, v in d.items() if k in FRAME_DEFAULTS})
+    for k, limit in FRAME_TEXT:
+        out[k] = str(out[k] if out[k] is not None else "").replace("\r\n", "\n").replace("\r", "\n")[:limit]
+    for k in ("left_image", "right_image"):
+        out[k] = out[k].strip()
+    out["bottom_bar"] = bool(out["bottom_bar"])
+    try:
+        out["width"] = max(640, min(1600, int(out["width"])))
+    except (TypeError, ValueError):
+        out["width"] = FRAME_DEFAULTS["width"]
+    return out
+
+
+def frame_vars_css(f):
+    return "\n/* Framed width, from Settings > Framed layout */\nbody.layout-frame { --pt-width: %dpx; }\n" % f["width"]
+
+
+def _frame_src(url, prefix):
+    """An image path from the settings as a src: a full web address as is, a site path made
+    relative to the page, anything else (other schemes) dropped."""
+    url = str(url or "").strip()
+    if not url:
+        return ""
+    if re.match(r"^https?://", url, re.I):
+        return url
+    if url.startswith("//") or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", url):
+        return ""
+    return prefix + url.lstrip("/")
+
+
+def frame_body(f, *, prefix, title, brand, nav, main, footer):
+    """The body of a Framed page. Same arguments as portal_body, plus prefix for image paths."""
+    out = []
+    bar = f["top_bar"].strip()
+    if bar:
+        out.append('<div class="pt-banner">%s</div>' % esc(bar))
+    lines = _portal_lines(f["notice"])
+    if lines:
+        out.append('<div class="pt-warn" role="note">\n%s\n</div>' % "\n".join("<p>%s</p>" % esc(ln) for ln in lines))
+    head = []
+    left, right = _frame_src(f["left_image"], prefix), _frame_src(f["right_image"], prefix)
+    if left:
+        head.append('<div class="pt-img left"><img src="%s" alt=""></div>' % attr(left))
+    head.append('<div class="pt-brand">%s</div>' % brand)
+    if right:
+        head.append('<div class="pt-img right"><img src="%s" alt=""></div>' % attr(right))
+    out.append('<div class="pt-frame">\n<header class="pt-head%s">\n%s\n</header>'
+               % ("" if left or right else " solo", "\n".join(head)))
+    side = ""
+    if nav.strip():
+        t = '<div class="pt-nav-title">%s</div>\n' % esc(f["nav_title"]) if f["nav_title"].strip() else ""
+        note = '\n<p class="pt-note">%s</p>' % esc(f["nav_note"]) if f["nav_note"].strip() else ""
+        side = '<aside class="pt-nav">\n%s%s%s\n</aside>\n' % (t, nav, note)
+    out.append('<div class="pt-body%s">\n%s<div class="pt-main">\n%s\n</div>\n</div>'
+               % ("" if side else " no-nav", side, main))
+    if footer.strip():
+        out.append('<div class="pt-foot">\n%s\n</div>' % footer)
+    out.append("</div>")
+    if bar and f["bottom_bar"]:
+        out.append('<div class="pt-banner bottom">%s</div>' % esc(bar))
+    return "\n".join(out)
+
+
+# ----------------------------------------------------------------------------
+# Logo and fonts (Settings > Logo and fonts)
+#
+# The logo is any image in assets/ or a full URL. It can sit left or right of the site title,
+# above it, in place of it, or as a banner across the top of the header, and it can repeat in the
+# footer and serve as the browser tab icon.
+#
+# Uploaded fonts go to assets/fonts/ and get @font-face rules in layout.css. Each one can be
+# picked for body text, headings, menus and small text, or code. The picks override the theme's
+# --font-* variables with an html:root rule, which outranks the :root block in style.css, so
+# changing the theme keeps your fonts. A font-family rule you write yourself in style.css still
+# wins, since it targets elements directly.
+# ----------------------------------------------------------------------------
+
+FONT_EXT = {".woff2": "woff2", ".woff": "woff", ".ttf": "truetype", ".otf": "opentype"}
+FONT_MAGIC = {".woff2": (b"wOF2",), ".woff": (b"wOFF",), ".ttf": (b"\x00\x01\x00\x00", b"true", b"ttcf"),
+              ".otf": (b"OTTO", b"\x00\x01\x00\x00")}
+MAX_FONT = 10 * 1024 * 1024
+FONT_PATH = re.compile(r"^assets/fonts/[A-Za-z0-9_.-]+\.(?:woff2|woff|ttf|otf)$")
+FONT_WEIGHTS = ("100", "200", "300", "400", "500", "600", "700", "800", "900", "100 900")
+LOGO_PLACES = ("left", "right", "above", "replace", "banner", "none")
+FONT_ROLES = (("font_body", "font-body", "system-ui, sans-serif"),
+              ("font_heading", "font-heading", "system-ui, sans-serif"),
+              ("font_ui", "font-ui", "system-ui, sans-serif"),
+              ("font_mono", "font-mono", "ui-monospace, monospace"))
+BRAND_DEFAULTS = {"logo": "", "logo_alt": "", "logo_place": "left", "logo_height": 48, "logo_footer": False,
+                  "footer_height": 32, "favicon": False, "fonts": [], "font_body": "", "font_heading": "",
+                  "font_ui": "", "font_mono": ""}
+_WEIGHT_WORDS = (("extralight", "200"), ("ultralight", "200"), ("semibold", "600"), ("demibold", "600"),
+                 ("extrabold", "800"), ("ultrabold", "800"), ("hairline", "100"), ("thin", "100"),
+                 ("light", "300"), ("regular", "400"), ("book", "400"), ("normal", "400"), ("medium", "500"),
+                 ("bold", "700"), ("heavy", "900"), ("black", "900"))
+LOGO_CSS = """
+.site-title.has-logo { display: inline-flex; align-items: center; gap: 0.6rem; }
+.site-logo { display: block; height: var(--logo-height); width: auto; max-width: 100%; }
+.site-title.logo-replace .site-logo { max-width: min(100%, 80vw); object-fit: contain; }
+.site-title.logo-above { display: inline-block; }
+.site-title.logo-above .site-logo { display: inline-block; vertical-align: top; }
+.site-title.logo-above .site-title-text { display: block; margin-top: 0.35rem; }
+html body a.site-title.has-logo.has-logo.has-logo { display: inline-flex; }
+html body a.site-title.logo-above.logo-above.logo-above { display: inline-block; }
+.site-banner { line-height: 0; text-align: center; padding: 0.5rem 0 0; }
+.site-banner a { display: inline-block; max-width: 100%; }
+.site-banner img { display: inline-block; max-width: 100%; height: auto; max-height: var(--logo-height); }
+.footer-logo-link { display: inline-block; line-height: 0; margin: 0 0 0.5rem; }
+.footer-logo { display: inline-block; height: var(--logo-footer-height); width: auto; max-width: 100%; }
+@media (max-width: 640px) { .site-logo { max-height: min(var(--logo-height), 56px); } }
+"""
+
+
+def _clamp_int(v, lo, hi, default):
+    try:
+        return max(lo, min(hi, int(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+def clean_family(s):
+    """A font family name that is safe inside CSS quotes: letters, digits, space, dot, dash, underscore."""
+    s = re.sub(r"[^A-Za-z0-9 _.-]+", "", str(s or ""))
+    return re.sub(r"\s+", " ", s).strip()[:60]
+
+
+def guess_font(filename):
+    """Family, weight and style guessed from a font file name such as OpenSans-SemiBoldItalic.woff2."""
+    stem = os.path.splitext(os.path.basename(str(filename)))[0]
+    squashed = re.sub(r"[-_ ]+", "", stem.lower())
+    style = "italic" if ("italic" in squashed or "oblique" in squashed) else "normal"
+    if "variable" in squashed or "wght" in squashed:
+        weight = "100 900"
+    else:
+        weight = next((w for word, w in _WEIGHT_WORDS if word in squashed), "400")
+    keep = []
+    for part in re.split(r"[-_ \[\]()]+", stem):
+        low = part.lower()
+        if not low:
+            continue
+        if (any(low.startswith(word) for word, _ in _WEIGHT_WORDS) or low.startswith(("italic", "oblique", "variable", "webfont"))
+                or re.fullmatch(r"v?\d+|wght|ital|vf|latin|subset|opsz", low)):
+            break
+        keep.append(part)
+    fam = re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", " ".join(keep) or stem)
+    return clean_family(fam) or "Custom font", weight, style
+
+
+def clean_brand(d, current=None):
+    out = copy.deepcopy(BRAND_DEFAULTS)
+    for src in (current, d):
+        if isinstance(src, dict):
+            out.update({k: copy.deepcopy(v) for k, v in src.items() if k in BRAND_DEFAULTS})
+    out["logo"] = str(out["logo"] or "").strip()[:400]
+    out["logo_alt"] = str(out["logo_alt"] or "").strip()[:120]
+    if out["logo_place"] not in LOGO_PLACES:
+        out["logo_place"] = "left"
+    out["logo_height"] = _clamp_int(out["logo_height"], 16, 400, 48)
+    out["footer_height"] = _clamp_int(out["footer_height"], 12, 200, 32)
+    out["logo_footer"] = bool(out["logo_footer"])
+    out["favicon"] = bool(out["favicon"])
+    fonts, seen = [], set()
+    for f in out["fonts"] if isinstance(out["fonts"], list) else []:
+        if not isinstance(f, dict):
+            continue
+        path = str(f.get("file") or "").strip()
+        if not FONT_PATH.match(path) or path in seen:
+            continue
+        g_fam, g_weight, g_style = guess_font(path)
+        weight = str(f.get("weight") or g_weight)
+        fonts.append({"file": path, "family": clean_family(f.get("family")) or g_fam,
+                      "weight": weight if weight in FONT_WEIGHTS else "400",
+                      "style": "italic" if f.get("style") == "italic" else "normal"})
+        seen.add(path)
+        if len(fonts) >= 32:
+            break
+    out["fonts"] = fonts
+    families = {f["family"] for f in fonts}
+    for key, _, _ in FONT_ROLES:
+        fam = clean_family(out[key])
+        out[key] = fam if fam in families else ""
+    return out
+
+
+def brand_css(b, root=""):
+    """@font-face rules, font picks and logo sizing for layout.css. root leads from the page to
+    the site root; it is empty in layout.css itself, which sits at the root."""
+    b = clean_brand(b)
+    out = []
+    for f in b["fonts"]:
+        fmt = FONT_EXT[os.path.splitext(f["file"])[1].lower()]
+        out.append('@font-face { font-family: "%s"; src: url("%s%s") format("%s"); font-weight: %s; '
+                   "font-style: %s; font-display: swap; }" % (f["family"], root, f["file"], fmt, f["weight"], f["style"]))
+    roles = ['  --%s: "%s", %s;' % (var, b[key], fallback) for key, var, fallback in FONT_ROLES if b[key]]
+    if roles:
+        out.append("html:root {\n%s\n}" % "\n".join(roles))
+    if b["logo"]:
+        out.append("html:root { --logo-height: %dpx; --logo-footer-height: %dpx; }%s"
+                   % (b["logo_height"], b["footer_height"], LOGO_CSS))
+    if not out:
+        return ""
+    return "\n/* Logo and fonts, from Settings > Logo and fonts */\n%s\n" % "\n".join(out)
+
+
+def _logo_src(b, prefix):
+    return safe_url(b["logo"], prefix, "src") if b["logo"] else ""
+
+
+def brand_title(site, prefix, cls="site-title"):
+    """The site title link, with the logo where Settings put it."""
+    b = clean_brand(site.get("brand"))
+    title = site.get("title") or ""
+    href = prefix + "index.html"
+    src = _logo_src(b, prefix)
+    place = b["logo_place"] if src else "none"
+    if place in ("none", "banner"):
+        return '<a class="%s" href="%s">%s</a>' % (cls, attr(href), esc(title))
+    if place == "replace":
+        return ('<a class="%s has-logo logo-replace" href="%s"><img class="site-logo" src="%s" alt="%s"></a>'
+                % (cls, attr(href), attr(src), attr(b["logo_alt"] or title)))
+    img = '<img class="site-logo" src="%s" alt="">' % attr(src)
+    text = '<span class="site-title-text">%s</span>' % esc(title)
+    return ('<a class="%s has-logo logo-%s" href="%s">%s</a>'
+            % (cls, place, attr(href), text + img if place == "right" else img + text))
+
+
+def brand_banner(site, prefix):
+    b = clean_brand(site.get("brand"))
+    src = _logo_src(b, prefix)
+    if not src or b["logo_place"] != "banner":
+        return ""
+    return ('<div class="site-banner"><a href="%sindex.html"><img src="%s" alt="%s"></a></div>\n'
+            % (attr(prefix), attr(src), attr(b["logo_alt"] or site.get("title") or "")))
+
+
+def brand_footer(site, prefix):
+    b = clean_brand(site.get("brand"))
+    src = _logo_src(b, prefix)
+    if not src or not b["logo_footer"]:
+        return ""
+    return ('<a class="footer-logo-link" href="%sindex.html"><img class="footer-logo" src="%s" alt="%s"></a>'
+            % (attr(prefix), attr(src), attr(b["logo_alt"] or site.get("title") or "")))
+
+
+def brand_favicon(site, prefix):
+    b = clean_brand(site.get("brand"))
+    src = _logo_src(b, prefix)
+    if not src or not b["favicon"]:
+        return ""
+    kind = mimetypes.guess_type(b["logo"].split("?")[0])[0]
+    return '<link rel="icon" href="%s"%s>' % (attr(src), ' type="%s"' % attr(kind) if kind else "")
+
+
+def save_font_file(root, name, data):
+    """Store an uploaded font in assets/fonts/ and guess its family, weight and style."""
+    stem, ext = os.path.splitext(os.path.basename(str(name)))
+    ext = ext.lower()
+    if ext not in FONT_EXT:
+        raise ApiError("Only font files can be added here (woff2, woff, ttf, otf).")
+    if not data:
+        raise ApiError("That file is empty.")
+    if len(data) > MAX_FONT:
+        raise ApiError("That font is over 10 MB. Use a woff2 version or a subset.")
+    if not data.startswith(FONT_MAGIC[ext]):
+        raise ApiError("That file does not look like a %s font." % ext[1:])
+    family, weight, style = guess_font(stem + ext)
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", stem).strip("-.") or "font"
+    folder = root / "assets" / "fonts"
+    folder.mkdir(parents=True, exist_ok=True)
+    fn, n = stem + ext, 2
+    while (folder / fn).exists():
+        fn = "%s-%d%s" % (stem, n, ext)
+        n += 1
+    (folder / fn).write_bytes(data)
+    return {"file": "assets/fonts/" + fn, "family": family, "weight": weight, "style": style}
+
+
+for _ext, _type in ((".woff2", "font/woff2"), (".woff", "font/woff"), (".ttf", "font/ttf"), (".otf", "font/otf"),
+                    (".avif", "image/avif"), (".webp", "image/webp"), (".svg", "image/svg+xml")):
+    mimetypes.add_type(_type, _ext)
+
+
+def special_body(lid, site, prefix, **kw):
+    """The body for the Secure portal and Framed layouts, which build their own page frame."""
+    if lid == "frame":
+        return frame_body(clean_frame(site.get("frame")), prefix=prefix, **kw)
+    return portal_body(clean_portal(site.get("secure")), **kw)
+
+
+SPECIAL_LAYOUTS = ("secure", "frame")
+
+FRAME_CSS = """
+/* Site layout, Framed: one framed page with the menu in a column on the left. Theme colors only. */
+body.layout-frame { --pt-frame: var(--border); --pt-visited: var(--accent); --pt-highlight: var(--accent); padding-bottom: 1.5rem; }
+body.layout-frame .pt-banner {
+  background: var(--accent); color: var(--surface); text-align: center;
+  font: 600 0.8125rem/1.4 var(--font-ui); letter-spacing: 0.04em; padding: 0.4rem 0.75rem;
+}
+body.layout-frame .pt-banner.bottom { margin-top: 1.5rem; }
+body.layout-frame .pt-warn, body.layout-frame .pt-frame { width: min(var(--pt-width), calc(100% - 2rem)); margin: 1.5rem auto 0; }
+body.layout-frame .pt-warn {
+  padding: 0.75rem 1rem; background: var(--surface); color: var(--text); text-align: center;
+  font: 0.9375rem/1.55 var(--font-ui); border: 1px solid var(--border); border-bottom: 0;
+}
+body.layout-frame .pt-warn p { margin: 0; }
+body.layout-frame .pt-warn p:first-child { font-weight: 600; }
+body.layout-frame .pt-warn + .pt-frame { margin-top: 0; }
+body.layout-frame .pt-frame {
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  box-shadow: 0 18px 40px -30px rgba(0, 0, 0, 0.45);
+}
+body.layout-frame .pt-head {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 1rem;
+  padding: 1.25rem 1.25rem; background: var(--header-bg); color: var(--header-text); border-bottom: 1px solid var(--border);
+}
+body.layout-frame .pt-head.solo { grid-template-columns: minmax(0, 1fr); }
+body.layout-frame .pt-brand { grid-column: 2; text-align: center; min-width: 0; }
+body.layout-frame .pt-head.solo .pt-brand { grid-column: 1; }
+body.layout-frame .pt-brand .site-title {
+  display: inline-block; font-family: var(--font-heading); font-weight: var(--heading-weight, 700);
+  font-size: clamp(1.45rem, 3.4vw, 2.1rem); line-height: 1.15; color: var(--header-text); text-decoration: none;
+  text-transform: var(--heading-transform, none); letter-spacing: var(--letter-spacing, 0); overflow-wrap: anywhere;
+}
+body.layout-frame .pt-brand .tagline { display: block; margin: 0.4rem 0 0; color: var(--muted); }
+body.layout-frame .pt-img { min-width: 0; }
+body.layout-frame .pt-img.left { grid-column: 1; justify-self: start; }
+body.layout-frame .pt-img.right { grid-column: 3; justify-self: end; }
+body.layout-frame .pt-img img { display: block; max-width: 160px; max-height: 96px; width: auto; height: auto; }
+body.layout-frame .pt-body { display: grid; grid-template-columns: 12rem minmax(0, 1fr); align-items: stretch; }
+body.layout-frame .pt-body.no-nav { grid-template-columns: minmax(0, 1fr); }
+body.layout-frame .pt-nav {
+  min-width: 0; padding: 1.1rem 0.85rem; background: var(--sidebar-bg); color: var(--sidebar-text);
+  border-right: 1px solid var(--border); font: 0.9rem/1.45 var(--font-ui);
+}
+body.layout-frame .pt-nav-title {
+  margin: 0 0 0.6rem; padding: 0 0.6rem 0.35rem; border-bottom: 1px solid var(--border);
+  color: var(--muted); font: 600 0.75rem/1.3 var(--font-ui); letter-spacing: 0.08em; text-transform: uppercase;
+}
+body.layout-frame .pt-nav .site-nav { display: block; width: auto; margin: 0; font: inherit; }
+body.layout-frame .pt-nav .site-nav ul { display: block; margin: 0; padding: 0; list-style: none; }
+body.layout-frame .pt-nav .site-nav li { margin: 0 0 0.1rem; }
+body.layout-frame .pt-nav .site-nav a {
+  display: block; padding: 0.35rem 0.6rem; border: 0; border-left: 3px solid transparent;
+  border-radius: 0 var(--radius) var(--radius) 0; color: var(--sidebar-text); text-decoration: none; background: none;
+}
+body.layout-frame .pt-nav .site-nav a:hover { background: var(--sidebar-active); }
+body.layout-frame .pt-nav .site-nav a[aria-current="page"], body.layout-frame .pt-nav .site-nav a.active {
+  color: var(--accent); border-left-color: var(--accent); background: var(--sidebar-active); font-weight: 600;
+}
+body.layout-frame .pt-body .pt-nav .sidebar a, body.layout-frame .pt-body .pt-nav .sidebar a:visited { color: var(--sidebar-text); }
+body.layout-frame .pt-body .pt-nav .sidebar a[aria-current="page"] { color: var(--accent); background: var(--sidebar-active); }
+body.layout-frame .pt-note { margin: 1.1rem 0 0; padding: 0 0.6rem; font-size: 0.75rem; color: var(--muted); }
+body.layout-frame .pt-main { min-width: 0; padding: 1.5rem 1.75rem 1.75rem; }
+body.layout-frame .pt-foot {
+  padding: 1rem 1.25rem; border-top: 1px solid var(--border); background: var(--header-bg); color: var(--muted);
+  text-align: center; font: 0.85rem/1.5 var(--font-ui);
+}
+body.layout-frame .pt-foot .site-footer { margin: 0; padding: 0; border: 0; background: none; color: var(--muted); }
+body.layout-frame .pt-foot .site-footer > * { max-width: none; margin: 0; padding: 0; }
+body.layout-frame .pt-foot .site-footer p { margin: 0; }
+@media (max-width: 720px) {
+  body.layout-frame .pt-head { grid-template-columns: minmax(0, 1fr); }
+  body.layout-frame .pt-brand { grid-column: 1; }
+  body.layout-frame .pt-img { display: none; }
+  body.layout-frame .pt-body { display: block; }
+  body.layout-frame .pt-nav { border-right: 0; border-bottom: 1px solid var(--border); }
+  body.layout-frame .pt-main { padding: 1rem; }
+}
+@media print {
+  body.layout-frame .pt-banner, body.layout-frame .pt-warn, body.layout-frame .pt-nav { display: none; }
+  body.layout-frame .pt-frame { border: 0; width: auto; box-shadow: none; }
+}
+"""
+
+FRAME_DESC = ("The Secure portal's page structure with an ordinary look: an optional bar across the top and notice "
+              "box, then one framed page with the title row on top, the menu in a column on the left and the footer "
+              "along the bottom. Colors and fonts come from the theme. Set its text and images in Settings under "
+              "Framed layout.")
+
+# ----------------------------------------------------------------------------
+# Text size
+#
+# Two site-wide settings that work with every theme and layout:
+#   scale  makes all text bigger or smaller, as a percentage
+#   min    the smallest text the site may show, in pixels (0 means no floor)
+# Themes and layouts size text in rem, em and the odd px, in style.css and layout.css. Most of
+# it follows the root size, so the scale sets that. For the rest, and for the floor, every rule
+# in those two files that sets a font size is repeated in text.css with its size wrapped in
+# max(floor, size), px sizes also multiplied by the scale. text.css loads after style.css, so
+# with the same selector it wins. It is written on every build, and only when a setting is on.
+# ----------------------------------------------------------------------------
+
+TEXT_DEFAULTS = {"scale": 100, "min": 0}
+TEXT_FILE = "text.css"
+TEXT_MARK = "/* text.css: written by"
+_FONT_KEYWORDS = {"inherit", "initial", "unset", "revert", "revert-layer", "smaller", "larger", "xx-small", "x-small",
+                  "small", "medium", "large", "x-large", "xx-large", "xxx-large", "math"}
+_SIZE_TOKEN = re.compile(r"^(?:\d*\.)?\d+(?:px|rem|em|%|pt|pc|vw|vh|vmin|vmax|ch|ex|lh|rlh)$", re.I)
+_SIZE_FUNC = re.compile(r"^(?:calc|clamp|min|max)\(.*\)$", re.I | re.S)
+
+
+def clean_text(d, current=None):
+    out = dict(TEXT_DEFAULTS)
+    for src in (current, d):
+        if isinstance(src, dict):
+            out.update({k: v for k, v in src.items() if k in TEXT_DEFAULTS})
+    try:
+        out["scale"] = max(70, min(200, int(out["scale"])))
+    except (TypeError, ValueError):
+        out["scale"] = 100
+    try:
+        n = int(out["min"])
+        out["min"] = 0 if n <= 0 else max(9, min(28, n))
+    except (TypeError, ValueError):
+        out["min"] = 0
+    return out
+
+
+def text_active(t):
+    t = clean_text(t)
+    return t["scale"] != 100 or t["min"] > 0
+
+
+def _css_split(s, seps):
+    """Split s on any char in seps that sits outside brackets and quotes."""
+    out, buf, depth, quote = [], [], 0, ""
+    for ch in s:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in "\"'":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif ch in seps and depth == 0:
+            out.append("".join(buf))
+            buf = []
+            if not ch.isspace():
+                out.append(ch)
+            continue
+        buf.append(ch)
+    out.append("".join(buf))
+    return [x for x in (y.strip() for y in out) if x]
+
+
+def _font_size_value(prop, value):
+    """The font size a font or font-size declaration sets, or "" when it sets none we can use."""
+    value = value.strip()
+    if not value or "!important" in value.lower():
+        return ""
+    if prop == "font-size":
+        if value.lower() in _FONT_KEYWORDS:
+            return ""
+        return value if (_SIZE_TOKEN.match(value) or _SIZE_FUNC.match(value) or value.lower().startswith("var(")) else ""
+    toks = _css_split(value, " \t\n/")
+    for i, tok in enumerate(toks):
+        if tok == "/":
+            continue
+        if _SIZE_TOKEN.match(tok) or _SIZE_FUNC.match(tok):
+            return tok
+        if tok.lower().startswith("var(") and i + 1 < len(toks) and toks[i + 1] == "/":
+            return tok
+    return ""
+
+
+def _css_rules(css):
+    """(at-rule preludes, selector, body) for every plain style rule, inside @media and @supports
+    blocks too. Keyframes, font faces and other at-rules are skipped."""
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    rules, stack, buf, quote = [], [], [], ""
+    for ch in css:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in "\"'":
+            quote = ch
+            buf.append(ch)
+        elif ch == "{":
+            pre = "".join(buf).strip()
+            buf = []
+            if pre.lower().startswith(("@media", "@supports", "@container", "@layer")):
+                stack.append(("at", pre))
+            elif pre.startswith("@") or any(k == "skip" for k, _ in stack) or any(k == "rule" for k, _ in stack):
+                stack.append(("skip", pre))
+            else:
+                stack.append(("rule", pre))
+        elif ch == "}":
+            if stack:
+                kind, pre = stack.pop()
+                if kind == "rule" and pre:
+                    rules.append((tuple(p for k, p in stack if k == "at"), pre, "".join(buf)))
+            buf = []
+        elif ch == ";" and not stack:
+            buf = []
+        else:
+            buf.append(ch)
+    return rules
+
+
+def _scaled(size, factor):
+    """px and pt sizes do not follow the root size, so they get the scale too."""
+    if factor == 1 or not re.search(r"\d(?:px|pt)\b", size):
+        return size
+    return "calc(%s * var(--text-scale))" % size
+
+
+def text_css(css, t):
+    """text.css for the given stylesheet text (layout.css plus style.css), or "" when off."""
+    t = clean_text(t)
+    if not text_active(t):
+        return ""
+    factor = t["scale"] / 100.0
+    floor = "%dpx" % t["min"] if t["min"] else "0px"
+    out = ["%s %s on every build from Settings > Text size, so edits here are lost. */" % (TEXT_MARK, APP),
+           ":root { --text-scale: %s; --text-min: %s; }" % (("%.2f" % factor).rstrip("0").rstrip("."), floor),
+           "html { font-size: max(var(--text-min), calc(var(--base-size, 16px) * var(--text-scale))); }"]
+    for ats, sel, body in _css_rules(css):
+        if sel.strip().lower() in ("html", ":root"):
+            continue
+        size = ""
+        for decl in _css_split(body, ";"):
+            if decl == ";" or ":" not in decl:
+                continue
+            prop, _, val = decl.partition(":")
+            prop = prop.strip().lower()
+            if prop in ("font", "font-size"):
+                v = _font_size_value(prop, val)
+                if v or prop == "font-size":
+                    size = v
+        if not size:
+            continue
+        rule = "%s { font-size: max(var(--text-min), %s); }" % (sel, _scaled(size, factor))
+        for at in reversed(ats):
+            rule = "%s { %s }" % (at, rule)
+        out.append(rule)
+    return "\n".join(out) + "\n"
+
+
+
+
+SF_SECURE_CSS = """
+/* SiteForge pages inside the Secure portal frame */
+body.layout-secure .pt-main main, body.layout-secure .pt-main > .page-main { max-width: none; margin: 0; padding: 0; }
+body.layout-secure .pt-main .content {
+  --pad-y: 0px; --pad-x: 0px; max-width: none; margin: 0; padding: 0; background: none; border: 0; border-radius: 0; box-shadow: none;
+}
+body.layout-secure .pt-main .with-sidebar { display: block; }
+body.layout-secure .pt-main .side {
+  display: block; position: static; height: auto; max-height: none; min-height: 0; margin: 0 0 1.25rem;
+  border: 1px solid var(--pt-frame); border-radius: 0;
+}
+body.layout-secure .pt-main .side-button { display: none; }
+"""
+
+PODCAST_BASE_CSS = """
+/* podcast: the show page and episode pages. Theme variables only, so every theme styles it. */
+.pod-show, .pod-ep-head { display: flex; flex-wrap: wrap; gap: 1.25rem; align-items: flex-start; margin: 0 0 1rem; }
+.pod-show .pod-art, .pod-ep-head .pod-art {
+  width: 11rem; max-width: 38%; aspect-ratio: 1 / 1; object-fit: cover; border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+.pod-head { flex: 1 1 15rem; min-width: 0; }
+.content .pod-head .page-title { margin: 0 0 0.3rem; }
+.pod-author { margin: 0; color: var(--muted); font-family: var(--font-ui); }
+.pod-badge {
+  display: inline-block; vertical-align: middle; margin-left: 0.4rem; padding: 0.05rem 0.5rem; border: 1px solid var(--border);
+  border-radius: 99px; color: var(--muted); font: 600 0.7rem/1.5 var(--font-ui); letter-spacing: 0.05em; text-transform: uppercase;
+}
+.pod-subscribe {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem 1rem; margin: 0.5rem 0 1.25rem; padding: 0;
+  list-style: none; font-family: var(--font-ui); font-size: 0.92rem;
+}
+.pod-subscribe code { font-size: 0.8rem; word-break: break-all; user-select: all; }
+.pod-subscribe.compact { margin-top: 2rem; padding-top: 0.75rem; border-top: 1px solid var(--border); }
+.content .pod-episodes-title { margin: 1.75rem 0 0.25rem; }
+.pod-episodes { margin: 0; padding: 0; list-style: none; }
+.pod-ep { padding: 0.9rem 0; border-top: 1px solid var(--border); }
+.pod-ep:first-child { border-top: 0; }
+.content .pod-ep h3 { margin: 0 0 0.2rem; font-size: 1.15rem; }
+.pod-ep h3 a { text-decoration: none; }
+.pod-num { color: var(--muted); font: 600 0.82rem/1 var(--font-ui); letter-spacing: 0.03em; }
+.pod-meta { margin: 0 0 0.35rem; color: var(--muted); font: 0.85rem/1.5 var(--font-ui); }
+.pod-summary { margin: 0; }
+.pod-player { margin: 1rem 0 1.5rem; }
+.pod-player audio { display: block; width: 100%; }
+.pod-download { margin: 0.4rem 0 0; font: 0.85rem/1.5 var(--font-ui); }
+.pod-chapters ol { margin: 0; padding: 0; list-style: none; }
+.pod-chapters li { padding: 0.15rem 0; }
+.pod-time { display: inline-block; min-width: 4.2rem; color: var(--muted); font: 0.9rem var(--font-ui); font-variant-numeric: tabular-nums; }
+.pod-transcript { margin: 1.5rem 0; padding: 0.6rem 0.9rem; border: 1px solid var(--border); border-radius: var(--radius); }
+.pod-transcript summary { cursor: pointer; font-weight: 600; font-family: var(--font-ui); }
+.pod-back { margin: 0 0 1rem; font: 0.9rem var(--font-ui); }
+.pod-season { margin-top: 1.25rem; }
+.content .pod-group {
+  margin: 0 0 0.3rem; padding-bottom: 0.3rem; border-bottom: 1px solid var(--border); color: var(--muted);
+  font: 600 0.8rem/1.4 var(--font-ui); letter-spacing: 0.12em; text-transform: uppercase;
+}
+.pod-kicker { margin: 0 0 0.25rem; color: var(--accent); font: 600 0.75rem/1.4 var(--font-ui); letter-spacing: 0.1em; text-transform: uppercase; }
+@media (max-width: 560px) {
+  .pod-show .pod-art, .pod-ep-head .pod-art { width: 8rem; }
+}
+"""
+
+PODCAST_CARDS_CSS = """
+/* podcast as a grid of cards */
+body.podcast-layout-cards .pod-episodes.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: 1rem; }
+body.podcast-layout-cards .pod-episodes.cards .pod-ep {
+  display: flex; flex-direction: column; padding: 0; border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden; background: var(--surface);
+}
+body.podcast-layout-cards .pod-thumb { position: relative; display: block; aspect-ratio: 1 / 1; }
+body.podcast-layout-cards .pod-thumb img { display: block; width: 100%; height: 100%; object-fit: cover; }
+body.podcast-layout-cards .pod-thumb-num {
+  position: absolute; inset: auto 0 0 0; padding: 0.4rem 0.7rem; color: #fff; background: rgba(0, 0, 0, 0.55);
+  font: 700 1.4rem/1.2 var(--font-ui);
+}
+body.podcast-layout-cards .pod-episodes.cards .pod-body { padding: 0.75rem 0.9rem 0.9rem; }
+body.podcast-layout-cards .pod-episodes.cards .pod-summary { font-size: 0.92rem; }
+@media (min-width: 720px) {
+  body.podcast-layout-cards.podcast-episode .pod-ep-head { flex-wrap: nowrap; }
+  body.podcast-layout-cards.podcast-episode .pod-ep-head .pod-art { width: 14rem; }
+}
+"""
+
+PODCAST_SPOTLIGHT_CSS = """
+/* podcast spotlight: the newest episode in a raised panel with a player */
+body.podcast-layout-spotlight .pod-spotlight {
+  display: flex; flex-wrap: wrap; gap: 1.25rem; margin: 1.5rem 0 0.5rem; padding: 1.1rem; background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius); box-shadow: 0 6px 24px rgba(0, 0, 0, 0.08);
+}
+body.podcast-layout-spotlight .pod-spotlight .pod-art {
+  width: 15rem; max-width: 100%; aspect-ratio: 1 / 1; object-fit: cover; border-radius: var(--radius);
+}
+body.podcast-layout-spotlight .pod-spotlight .pod-body { flex: 1 1 16rem; min-width: 0; }
+body.podcast-layout-spotlight .pod-spotlight h3 { margin: 0 0 0.3rem; font-size: 1.5rem; }
+body.podcast-layout-spotlight .pod-spotlight .pod-player { margin: 0.75rem 0 0; }
+body.podcast-layout-spotlight.podcast-episode .pod-ep-head { display: block; }
+body.podcast-layout-spotlight.podcast-episode .pod-ep-head .pod-art { display: block; width: 100%; max-width: 26rem; margin: 0 0 1rem; }
+"""
+
+PODCAST_ARCHIVE_CSS = """
+/* podcast as an archive: one line per episode, grouped by season or year */
+body.podcast-layout-archive .pod-episodes.archive .pod-ep {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 1rem; align-items: baseline; padding: 0.35rem 0; border-top: 0;
+}
+body.podcast-layout-archive .content .pod-episodes.archive h3 { grid-column: 1; margin: 0; font-size: 1.02rem; font-weight: 600; }
+body.podcast-layout-archive .pod-episodes.archive .pod-meta { grid-column: 2; grid-row: 1; margin: 0; white-space: nowrap; }
+body.podcast-layout-archive .pod-episodes.archive .pod-summary { display: none; }
+"""
+
+
+# Each axis: id -> label, description, CSS and the structural switches the renderers read.
+LAYOUTS = {
+    "site": {
+        "classic": {"label": "Classic", "css": "",
+                    "desc": "A header bar with the menu on the right and pages in a panel. This is how SiteForge has always looked."},
+        "sidebar": {"label": "Sidebar", "css": SITE_SIDEBAR_CSS,
+                    "desc": "The title, tagline and menu sit in a column on the left that stays put while you scroll."},
+        "magazine": {"label": "Magazine", "css": SITE_MAGAZINE_CSS,
+                     "desc": "A big centered masthead over a ruled menu bar, and a wider page."},
+        "journal": {"label": "Journal", "css": SITE_JOURNAL_CSS,
+                    "desc": "No boxes, a narrow column and a small header with a thin rule."},
+        "landing": {"label": "Landing", "css": SITE_LANDING_CSS,
+                    "desc": "A tinted hero with a large title and the menu on top. Pages sit in raised panels."},
+        "secure": {"label": "Secure portal", "css": PORTAL_CSS + SF_SECURE_CSS, "desc": PORTAL_DESC},
+        "frame": {"label": "Framed", "css": FRAME_CSS + SF_SECURE_CSS.replace("layout-secure", "layout-frame"),
+                  "desc": FRAME_DESC},
+    },
+    "blog": {
+        "list": {"label": "List", "feed": "list", "css": "",
+                 "desc": "Posts in a list with the date, tags and summary. The original look."},
+        "cards": {"label": "Cards", "feed": "cards", "css": BLOG_CARDS_CSS,
+                  "desc": "A grid of cards, each with the post's image when it has one."},
+        "magazine": {"label": "Magazine", "feed": "cards", "feature": True, "hero": True, "css": BLOG_MAGAZINE_CSS,
+                     "desc": "Cards with the newest post featured across the top. Post pages open with their image."},
+        "archive": {"label": "Archive", "feed": "archive", "css": BLOG_ARCHIVE_CSS,
+                    "desc": "One line per post, grouped by year. No summaries."},
+    },
+    "wiki": {
+        "classic": {"label": "Classic", "css": "",
+                    "desc": "Search and sections in a sidebar on the left, articles in a panel. The original look."},
+        "docs": {"label": "Docs", "toc": "rail", "css": WIKI_DOCS_CSS,
+                 "desc": "A quiet sidebar, articles without a panel and the table of contents in a column on the right."},
+        "handbook": {"label": "Handbook", "bar": True, "css": WIKI_HANDBOOK_CSS,
+                     "desc": "Search and the sections become a menu bar of dropdowns over one centered column."},
+        "right": {"label": "Right sidebar", "css": WIKI_RIGHT_CSS,
+                  "desc": "Articles come first in a raised panel and the sections sit on the right."},
+    },
+    "library": {
+        "classic": {"label": "Classic", "chapters": "side", "css": "",
+                    "desc": "A shelf of stories and the chapter list in a sidebar. The original look."},
+        "book": {"label": "Book", "chapters": "solo", "drop": True, "css": LIB_BOOK_CSS,
+                 "desc": "Each chapter sits on a paper page with no sidebar and a Contents dropdown. The library reads like a catalog."},
+        "shelf": {"label": "Bookshelf", "chapters": "side", "css": LIB_SHELF_CSS,
+                  "desc": "The library is a wall of covers. Story pages open with a large cover and the chapters as tiles."},
+        "serial": {"label": "Serial", "chapters": "solo", "pager_top": True, "updates_first": True, "css": LIB_SERIAL_CSS,
+                   "desc": "Made for web serials: the latest chapters first, and previous, contents and next links above and below every chapter."},
+        "spotlight": {"label": "Spotlight", "chapters": "side", "featured": True, "backdrop": True, "css": LIB_SPOTLIGHT_CSS,
+                      "desc": "The first story fills the top of the library with a read button. Story pages open on a blurred copy of the cover."},
+    },
+    "podcast": {
+        "list": {"label": "List", "list": "list", "css": PODCAST_BASE_CSS,
+                 "desc": "Episodes in rows with the number, date, length and summary."},
+        "cards": {"label": "Cards", "list": "cards", "css": PODCAST_BASE_CSS + PODCAST_CARDS_CSS,
+                  "desc": "A grid of cards with each episode's art, or the show art with the episode number over it."},
+        "spotlight": {"label": "Spotlight", "list": "spotlight", "css": PODCAST_BASE_CSS + PODCAST_SPOTLIGHT_CSS,
+                      "desc": "The newest episode in a raised panel with large art and a player; the rest as a list."},
+        "archive": {"label": "Archive", "list": "archive", "css": PODCAST_BASE_CSS + PODCAST_ARCHIVE_CSS,
+                    "desc": "One line per episode, grouped by season, or by year when there are no seasons."},
+    },
+}
+LAYOUT_KEYS = {"site": "layout", "blog": "blog_layout", "wiki": "wiki_layout", "library": "lib_layout",
+               "podcast": "podcast_layout"}
+LAYOUT_CLASS = {"site": "layout-", "blog": "blog-layout-", "wiki": "wiki-layout-", "library": "lib-layout-",
+                "podcast": "podcast-layout-"}
+LAYOUT_DEFAULTS = {"site": "classic", "blog": "list", "wiki": "classic", "library": "classic", "podcast": "list"}
+
+
+def layout_id(c, axis):
+    lid = c["site"].get(LAYOUT_KEYS[axis])
+    return lid if lid in LAYOUTS[axis] else LAYOUT_DEFAULTS[axis]
+
+
+def layout_opt(c, axis):
+    return LAYOUTS[axis][layout_id(c, axis)]
+
+
+def layout_classes(c):
+    return " ".join(LAYOUT_CLASS[a] + layout_id(c, a) for a in LAYOUTS)
+
+
+def layout_css(c, modules=None, root=""):
+    """The layout.css text for a config. modules: the module ids switched on (their CSS is left
+    out otherwise)."""
+    names = ", ".join("%s: %s" % (a.title() if a != "library" else "Stories", LAYOUTS[a][layout_id(c, a)]["label"])
+                      for a in LAYOUTS if a == "site" or modules is None or a in modules)
+    parts = ["/*\n  layout.css: written by %s on every build, so edits here are lost.\n"
+             "  Layouts: %s. Pick others under \"Layout and CSS\" in the editor.\n"
+             "  Your own rules go in style.css, which loads after this file and wins any tie.\n*/\n" % (APP, names),
+             LAYOUT_SHARED_CSS]
+    for a in LAYOUTS:
+        if a == "site" or modules is None or a in modules:
+            parts.append(layout_opt(c, a)["css"])
+    if layout_id(c, "site") == "secure":
+        parts.append(portal_vars_css(clean_portal(c["site"].get("secure"))))
+    elif layout_id(c, "site") == "frame":
+        parts.append(frame_vars_css(clean_frame(c["site"].get("frame"))))
+    parts.append(brand_css(c["site"].get("brand"), root))
+    return "".join(parts)
+
+
+def layout_list():
+    return {a: [{"id": k, "label": v["label"], "desc": v["desc"]} for k, v in opts.items()] for a, opts in LAYOUTS.items()}
+
+
+def card_image(url, prefix):
+    """A post image as a usable src, or "" when it is missing or not a web or site path."""
+    url = str(url or "").strip()
+    if not url:
+        return ""
+    if _SCHEME.match(url):
+        return url if re.match(r"^https?://", url, re.I) else ""
+    out = fix_url(url, prefix)
+    return "" if out == "#" else out
+
+
+# ----------------------------------------------------------------------------
+# Small utilities
+# ----------------------------------------------------------------------------
+
+def today():
+    return datetime.date.today().isoformat()
+
+
+def up(rel):
+    """Relative path from a generated file back to the site root."""
+    return "../" * rel.count("/")
+
+
+def page_rel(slug):
+    return "index.html" if slug == "index" else slug + ".html"
+
+
+def title_from_name(name):
+    t = re.sub(r"\s+", " ", re.sub(r"[-_]+", " ", str(name))).strip()
+    return (t[:1].upper() + t[1:]) if t else "Untitled"
+
+
+def first_h1(text):
+    for line in text.splitlines()[:30]:
+        if not line.strip():
+            continue
+        m = re.match(r"^\s{0,3}#\s+(.+?)\s*#*\s*$", line)
+        return m.group(1).strip() if m else ""
+    return ""
+
+
+def strip_title_h1(text, title):
+    """Drop a leading '# Title' line that repeats the title, since the page prints its own."""
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        m = re.match(r"^\s{0,3}#\s+(.+?)\s*#*\s*$", line)
+        if m and m.group(1).strip().lower() == title.strip().lower():
+            return "\n".join(lines[i + 1:])
+        return text
+    return text
+
+
+def file_date(path):
+    try:
+        return datetime.date.fromtimestamp(path.stat().st_mtime).isoformat()
+    except OSError:
+        return today()
+
+
+def rename_path(src, dst):
+    """Rename that also works for case-only changes on case-insensitive file systems."""
+    if src == dst:
+        return
+    tmp = src.with_name(src.name + ".sf-rename")
+    os.replace(src, tmp)
+    os.replace(tmp, dst)
+
+
+def plain_text(html_):
+    t = re.sub(r'<a class="anchor"[^>]*>#</a>', "", html_)
+    t = re.sub(r"<(script|style)\b.*?</\1>", " ", t, flags=re.S | re.I)
+    t = re.sub(r"<[^>]+>", " ", t)
+    return re.sub(r"\s+", " ", _unescape(t)).strip()
+
+
+def write_if_changed(path, text):
+    if path.is_file() and read_text(path) == text:
+        return
+    write_text(path, text)
+
+
+def clean_tags(raw, known=None, limit=12):
+    """Comma separated tags, de-duplicated without regard to case. An existing spelling wins."""
+    items = raw if isinstance(raw, list) else str(raw or "").split(",")
+    known_by = {slugify(k): k for k in (known or [])}
+    out, seen = [], set()
+    for t in items:
+        t = re.sub(r"\s+", " ", str(t)).strip(" ,")[:40]
+        key = slugify(t)
+        if not t or not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(known_by.get(key, t))
+    return out[:limit]
+
+
+def seo_fields(d, target):
+    """Copy the optional per-item SEO fields from a request onto a page, post or story."""
+    if "seo_title" in d:
+        target["seo_title"] = str(d.get("seo_title") or "").strip()[:120]
+    if "description" in d:
+        target["description"] = str(d.get("description") or "").strip()[:320]
+    if "image" in d:
+        target["image"] = str(d.get("image") or "").strip()[:400]
+    if "canonical" in d:
+        c = str(d.get("canonical") or "").strip()[:400]
+        if c and not re.match(r"^https?://", c, re.I):
+            raise ApiError("A canonical URL must start with http:// or https://, or be left blank.")
+        target["canonical"] = c
+    if "noindex" in d:
+        target["noindex"] = bool(d.get("noindex"))
+    return target
+
+
+def reading_time(words, wpm):
+    mins = max(1, int(round(words / float(max(60, wpm)))))
+    if mins < 60:
+        return "%d min read" % mins
+    h, m = divmod(mins, 60)
+    return "%dh %02dm read" % (h, m)
+
+
+def nice_words(n):
+    if n >= 1000:
+        return "{:,} words".format(int(round(n / 100.0) * 100))
+    return "1 word" if n == 1 else "%d words" % n
+
+
+HOME_MD = """# Welcome
+
+This is the home page. Edit it with **Home page** in the editor.
+"""
+
+ABOUT_MD = """A few lines about you, or about this site.
+"""
+
+PRIVACY_MD = """This site is a set of static pages. It does not use cookies, analytics, or tracking scripts,
+and it does not ask for or store personal information.
+
+The server that hosts it keeps standard access logs (IP address, time, page requested and browser
+type), as nearly every web server does. Those logs are used only to keep the site running and
+are not shared.
+
+If you email me, I use your address only to reply.
+
+*Last updated {date}.*
+"""
+
+BLOG_INTRO_MD = ""
+WIKI_HOME_MD = """# Wiki
+
+Pick a section from the sidebar, or search for a topic.
+"""
+LIB_HOME_MD = ""
+
+
+# ----------------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------------
+
+SITE_DEFAULTS = {
+    "title": "My site", "tagline": "", "author": "", "footer": "&copy; {year} {title}", "lang": "en", "url": "",
+    "description": "", "image": "", "twitter": "", "noindex": False, "sitemap": False, "feeds": False,
+    # wiki
+    "search": "builtin", "toc": True, "updated": True, "expand": False, "wiki_cards": True, "wiki_recent": True,
+    # library
+    "prose": "indented", "dropcap": True, "wordcount": True, "reading_time": True, "wpm": 240, "lib_updates": True,
+    # blog
+    "post_nav": True,
+    # layouts
+    "layout": "classic", "blog_layout": "list", "wiki_layout": "classic", "lib_layout": "classic",
+    "podcast_layout": "list",
+}
+SITE_BOOLS = ("noindex", "sitemap", "feeds", "toc", "updated", "expand", "wiki_cards", "wiki_recent", "dropcap",
+              "wordcount", "reading_time", "lib_updates", "post_nav")
+
+
+def default_cfg(title):
+    site = dict(SITE_DEFAULTS)
+    site["title"] = title or "My site"
+    return {
+        "version": 1,
+        "site": site,
+        "home": "page",
+        "modules": {m: {"enabled": False, "label": MODULE_NAMES[m], "mount": MOUNT_DEFAULT[m]} for m in MODULES},
+        "pages": [{"slug": "index", "title": "Home", "show_title": False}],
+        "nav": [{"type": "page", "slug": "index", "label": "", "visible": True}],
+        "posts": [],
+        "wiki": {"sections": []},
+        "library": {"stories": []},
+        "podcast": {"show": {}, "episodes": []},
+        "deploy": {},
+        "generated": [],
+    }
+
+
+# ----------------------------------------------------------------------------
+# The site: shared parts. The blog, wiki and library are mixed in below.
+# ----------------------------------------------------------------------------
+
+class SiteBase:
+    def __init__(self, root):
+        self.root = root
+        self.meta = root / META_DIR
+        self.cfg = None
+        self._mds = []
+        self._res = (None, None)
+        self._pod_check = []
+        self._art_cache = {}
+
+    # ---- paths
+    def page_md(self, slug):
+        return self.meta / "pages" / (slug + ".md")
+
+    def css_path(self):
+        return self.root / "style.css"
+
+    # ---- load and save
+    def load(self):
+        f = self.meta / "config.json"
+        try:
+            self.cfg = json.loads(f.read_text(encoding="utf-8"))
+        except ValueError as e:
+            raise ApiError("The settings file %s is not valid JSON (%s). Fix or remove it." % (f, e))
+        (self.root / "assets").mkdir(parents=True, exist_ok=True)
+        if not self.css_path().exists():
+            write_text(self.css_path(), default_css())
+        self.normalize()
+        self.clear_incoming()
+        self.rescan()
+        self.save_cfg()
+        self.build()
+
+    def create(self, setup):
+        """First run: make a new site with the homepage and modules chosen in the setup screen."""
+        if ONLY_MODULE:
+            setup = dict(setup, home=ONLY_MODULE, modules=[ONLY_MODULE], root_mount=True)
+        home = setup.get("home") if setup.get("home") in HOME_MODES else "page"
+        self.cfg = default_cfg(str(setup.get("title") or "").strip()[:120] or title_from_name(self.root.name))
+        theme = setup.get("theme") if setup.get("theme") in THEMES else None
+        write_text(self.page_md("index"), HOME_MD)
+        (self.root / "assets").mkdir(parents=True, exist_ok=True)
+        if not self.css_path().exists():
+            write_text(self.css_path(), default_css(theme or DEFAULT_THEME.get(home, "site-clean")))
+        wanted = set(m for m in (setup.get("modules") or []) if m in MODULES)
+        if home in MODULES:
+            wanted.add(home)
+        for m in MODULES:
+            if m in wanted:
+                self.enable_module(m)
+        self.cfg["home"] = home
+        if home in ROOT_MOUNTABLE and setup.get("root_mount"):
+            self.cfg["modules"][home]["mount"] = ""
+        self.normalize()
+        self.save_cfg()
+        self.build()
+
+    def save_cfg(self):
+        write_text(self.meta / "config.json", json.dumps(self.cfg, indent=2, ensure_ascii=False) + "\n")
+
+    def normalize(self):
+        c = self.cfg if isinstance(self.cfg, dict) else {}
+        self.cfg = c
+        d = default_cfg("")
+        if not isinstance(c.get("site"), dict):
+            c["site"] = {}
+        for k, v in SITE_DEFAULTS.items():
+            c["site"].setdefault(k, v)
+        if not c["site"].get("title"):
+            c["site"]["title"] = title_from_name(self.root.name)
+        s = c["site"]
+        s["secure"] = clean_portal(s.get("secure"))
+        s["frame"] = clean_frame(s.get("frame"))
+        s["text"] = clean_text(s.get("text"))
+        if s.get("prose") not in ("indented", "spaced"):
+            s["prose"] = "indented"
+        if s.get("search") not in SEARCH_MODES:
+            s["search"] = "builtin"
+        try:
+            s["wpm"] = max(60, min(1000, int(s.get("wpm") or 240)))
+        except (TypeError, ValueError):
+            s["wpm"] = 240
+        mods = c.get("modules") if isinstance(c.get("modules"), dict) else {}
+        for m in MODULES:
+            cur = mods.get(m) if isinstance(mods.get(m), dict) else {}
+            mods[m] = {
+                "enabled": bool(cur.get("enabled")),
+                "label": str(cur.get("label") or MODULE_NAMES[m])[:40],
+                "mount": cur.get("mount") if cur.get("mount") in ("", MOUNT_DEFAULT[m]) else MOUNT_DEFAULT[m],
+            }
+        c["modules"] = mods
+        if ONLY_MODULE:
+            for m in MODULES:
+                mods[m]["enabled"] = m == ONLY_MODULE
+            c["home"] = ONLY_MODULE
+            mods[ONLY_MODULE]["mount"] = ""
+        if c.get("home") not in HOME_MODES or (c["home"] in MODULES and not mods[c["home"]]["enabled"]):
+            c["home"] = "page"
+        for m in MODULES:
+            if m == "blog" or c["home"] != m:
+                mods[m]["mount"] = MOUNT_DEFAULT[m]
+        pages, seen = [], set()
+        for p in c.get("pages") if isinstance(c.get("pages"), list) else []:
+            if not isinstance(p, dict) or not slugify(p.get("slug", "")) or p["slug"] in seen:
+                continue
+            p["slug"] = "index" if p["slug"] == "index" else slugify(p["slug"])
+            seen.add(p["slug"])
+            p["title"] = str(p.get("title") or title_from_name(p["slug"]))
+            p["show_title"] = bool(p.get("show_title", p["slug"] != "index"))
+            pages.append(p)
+        if "index" not in seen:
+            pages.insert(0, dict(d["pages"][0]))
+        c["pages"] = pages
+        for k in ("posts", "generated"):
+            if not isinstance(c.get(k), list):
+                c[k] = []
+        for k, sub in (("wiki", "sections"), ("library", "stories")):
+            if not isinstance(c.get(k), dict) or not isinstance(c[k].get(sub), list):
+                c[k] = {sub: []}
+        if not isinstance(c.get("deploy"), dict):
+            c["deploy"] = {}
+        self.normalize_blog()
+        self.normalize_wiki()
+        self.normalize_library()
+        self.normalize_podcast()
+        self.normalize_nav()
+
+    def normalize_nav(self):
+        c = self.cfg
+        nav, seen = [], set()
+        slugs = {p["slug"] for p in c["pages"]}
+        for n in c.get("nav") if isinstance(c.get("nav"), list) else []:
+            if not isinstance(n, dict):
+                continue
+            t = n.get("type")
+            vis = bool(n.get("visible", True))
+            label = str(n.get("label") or "")[:60]
+            if t == "page" and n.get("slug") in slugs and ("p", n["slug"]) not in seen:
+                seen.add(("p", n["slug"]))
+                nav.append({"type": "page", "slug": n["slug"], "label": label, "visible": vis})
+            elif t == "module" and n.get("id") in MODULES and ("m", n["id"]) not in seen:
+                seen.add(("m", n["id"]))
+                nav.append({"type": "module", "id": n["id"], "label": label, "visible": vis})
+            elif t == "link" and str(n.get("url") or "").strip():
+                nav.append({"type": "link", "label": label or "Link", "url": str(n["url"]).strip()[:400], "visible": vis})
+        for p in c["pages"]:
+            if ("p", p["slug"]) not in seen:
+                nav.append({"type": "page", "slug": p["slug"], "label": "", "visible": True})
+        for m in MODULES:
+            if ("m", m) not in seen and c["modules"][m]["enabled"]:
+                nav.append({"type": "module", "id": m, "label": "", "visible": True})
+        c["nav"] = nav
+
+    def rescan(self):
+        r = {}
+        if self.enabled("wiki"):
+            r.update(self.wiki_rescan())
+        if self.enabled("library"):
+            r.update(self.lib_rescan())
+        if self.enabled("podcast"):
+            r.update(self.pod_rescan())
+        return r
+
+    def api_rescan(self):
+        r = self.rescan()
+        self.save_cfg()
+        self.build()
+        return r
+
+    def state(self):
+        c = self.cfg
+        return {
+            "folder": str(self.root),
+            "site": c["site"],
+            "home": c["home"],
+            "modules": c["modules"],
+            "pages": c["pages"],
+            "nav": c["nav"],
+            "posts": c["posts"],
+            "tags": sorted({t for p in c["posts"] for t in p.get("tags", [])}, key=str.lower),
+            "wiki": c["wiki"],
+            "library": c["library"],
+            "genres": sorted({g for s in c["library"]["stories"] for g in s.get("genres", [])}, key=str.lower),
+            "statuses": [{"id": k, "label": v} for k, v in STATUSES],
+            "themes": [{"id": k, "label": v[0], "group": v[1], "block": root_block(k)} for k, v in THEMES.items()],
+            "layouts": layout_list(),
+            "secure_defaults": PORTAL_DEFAULTS,
+            "frame_defaults": FRAME_DEFAULTS,
+            "names": MODULE_NAMES,
+            "podcast": self.pod_state(),
+            "app": APP,
+            "only": ONLY_MODULE,
+        }
+
+    # ---- modules
+    def enabled(self, mid, cfg=None):
+        return bool((cfg or self.cfg)["modules"][mid]["enabled"])
+
+    def mbase(self, mid, cfg=None):
+        m = (cfg or self.cfg)["modules"][mid]["mount"]
+        return (m + "/") if m else ""
+
+    def landing_rel(self, mid, cfg=None):
+        c = cfg or self.cfg
+        return "index.html" if c["home"] == mid else self.mbase(mid, c) + "index.html"
+
+    def module_label(self, mid, cfg=None):
+        return (cfg or self.cfg)["modules"][mid]["label"] or MODULE_NAMES[mid]
+
+    def enable_module(self, mid):
+        c = self.cfg
+        c["modules"][mid]["enabled"] = True
+        if mid == "blog" and not self.blog_intro_md().exists():
+            write_text(self.blog_intro_md(), BLOG_INTRO_MD)
+        if mid == "wiki":
+            (self.meta / "wiki" / "sections").mkdir(parents=True, exist_ok=True)
+            if not self.wiki_home_md().exists():
+                write_text(self.wiki_home_md(), WIKI_HOME_MD)
+        if mid == "library":
+            (self.meta / "library" / "stories").mkdir(parents=True, exist_ok=True)
+            if not self.lib_home_md().exists():
+                write_text(self.lib_home_md(), LIB_HOME_MD)
+        if mid == "podcast":
+            (self.meta / "podcast" / "episodes").mkdir(parents=True, exist_ok=True)
+            if not self.pod_intro_md().exists():
+                write_text(self.pod_intro_md(), PODCAST_ABOUT_MD)
+        if not any(n.get("type") == "module" and n.get("id") == mid for n in c.get("nav", [])):
+            c.setdefault("nav", []).append({"type": "module", "id": mid, "label": "", "visible": True})
+
+    def save_structure(self, d):
+        """Homepage choice, which modules are on, their labels and whether the homepage module sits at the root.
+        A change that would move a locked podcast feed returns needs_confirm and changes nothing."""
+        if ONLY_MODULE:
+            raise ApiError("%s has one fixed structure." % APP)
+        backup = copy.deepcopy(self.cfg)
+        c = self.cfg
+        mods = d.get("modules") if isinstance(d.get("modules"), dict) else {}
+        for m in MODULES:
+            want = mods.get(m) if isinstance(mods.get(m), dict) else {}
+            if "label" in want:
+                c["modules"][m]["label"] = str(want.get("label") or "").strip()[:40] or MODULE_NAMES[m]
+            if want.get("enabled") is True and not c["modules"][m]["enabled"]:
+                self.enable_module(m)
+            elif want.get("enabled") is False and c["modules"][m]["enabled"]:
+                if (d.get("home") or c["home"]) == m:
+                    raise ApiError("%s is the homepage. Choose another homepage before switching it off."
+                                   % self.module_label(m))
+                c["modules"][m]["enabled"] = False
+        home = d.get("home", c["home"])
+        if home not in HOME_MODES:
+            raise ApiError("Unknown homepage type.")
+        if home in MODULES and not c["modules"][home]["enabled"]:
+            self.enable_module(home)
+        c["home"] = home
+        for m in ROOT_MOUNTABLE:
+            c["modules"][m]["mount"] = "" if (home == m and d.get("root_mount")) else MOUNT_DEFAULT[m]
+        self.normalize()
+        moved = self.pod_feed_moved(backup)
+        if moved and not d.get("confirm_feed_move"):
+            self.cfg = backup
+            return {"needs_confirm": True, "message": moved}
+        if moved:
+            self.pod_accept_move()
+        self.pod_move_files(backup)
+        self.save_cfg()
+        self.build()
+        return {"ok": True}
+
+    def remove_module_content(self, mid):
+        """Move a switched-off module's sources to the trash and forget them."""
+        c = self.cfg
+        if mid not in MODULES:
+            raise ApiError("Unknown module.")
+        if c["modules"][mid]["enabled"]:
+            raise ApiError("Switch the module off first.")
+        folder = self.meta / mid
+        if folder.exists():
+            self.to_trash(folder)
+        note = ""
+        if mid == "blog":
+            c["posts"] = []
+        elif mid == "wiki":
+            c["wiki"] = {"sections": []}
+        elif mid == "library":
+            c["library"] = {"stories": []}
+        else:
+            if self.audio_dir().is_dir():
+                note = "Audio files are never deleted this way; they are still in %s." % self.audio_dir()
+            c["podcast"] = {"show": {}, "episodes": []}
+            self.normalize_podcast()
+        self.save_cfg()
+        self.build()
+        return {"ok": True, "note": note}
+
+    # ---- lookups
+    def find_page(self, slug, cfg=None):
+        return next((p for p in (cfg or self.cfg)["pages"] if p["slug"] == slug), None)
+
+    def get_page_rec(self, slug):
+        p = self.find_page(slug)
+        if not p:
+            raise ApiError("That page does not exist.", 404)
+        return p
+
+    def taken_root_names(self, exclude=None):
+        """Names that a page, or a section or story mounted at the root, cannot use."""
+        c = self.cfg
+        names = set(RESERVED) | {p["slug"] for p in c["pages"]}
+        if c["modules"]["wiki"]["mount"] == "":
+            names |= {s["slug"] for s in c["wiki"]["sections"]}
+        if c["modules"]["library"]["mount"] == "":
+            names |= {s["slug"] for s in c["library"]["stories"]}
+        names.discard(exclude)
+        return names
+
+    def to_trash(self, path):
+        if not path.exists():
+            return
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        dest = self.meta / "trash" / ("%s-%s" % (stamp, path.name))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        n = 2
+        while dest.exists():
+            dest = dest.with_name("%s-%s-%d" % (stamp, path.name, n))
+            n += 1
+        shutil.move(str(path), str(dest))
+
+    # ---- rendering helpers
+    def wiki_resolver(self, c):
+        if not self.enabled("wiki", c):
+            return None
+        if self._res[0] is c:
+            return self._res[1]
+        fn = self.make_resolver(c)
+        self._res = (c, fn)
+        return fn
+
+    def md(self, c, prefix):
+        m = Markdown(prefix, self.wiki_resolver(c))
+        self._mds.append(m)
+        return m
+
+    def nav_html(self, c, prefix, current_rel, current_mod):
+        items = []
+        for n in c["nav"]:
+            if not n.get("visible", True):
+                continue
+            if n["type"] == "page":
+                p = self.find_page(n["slug"], c)
+                if not p:
+                    continue
+                rel = page_rel(p["slug"])
+                label = n.get("label") or p["title"]
+                cur = rel == current_rel and not current_mod
+                href = prefix + rel
+            elif n["type"] == "module":
+                mid = n["id"]
+                if not self.enabled(mid, c):
+                    continue
+                label = n.get("label") or self.module_label(mid, c)
+                cur = current_mod == mid
+                href = prefix + self.landing_rel(mid, c)
+            else:
+                label, cur, href = n.get("label") or "Link", False, fix_url(n["url"], prefix)
+            items.append('<li><a href="%s"%s>%s</a></li>' % (attr(href), ' aria-current="page"' if cur else "", esc(label)))
+        if not items:
+            return ""
+        return '<nav class="site-nav" aria-label="Main"><ul>%s</ul></nav>' % "".join(items)
+
+    def head_seo(self, c, seo):
+        site = c["site"]
+        h = ["<title>%s</title>" % esc(seo["full_title"])]
+        if seo["description"]:
+            h.append('<meta name="description" content="%s">' % attr(seo["description"]))
+        if site.get("author"):
+            h.append('<meta name="author" content="%s">' % attr(site["author"]))
+        if seo["canonical"]:
+            h.append('<link rel="canonical" href="%s">' % attr(seo["canonical"]))
+        if seo["noindex"]:
+            h.append('<meta name="robots" content="noindex, follow">')
+        h.append('<meta property="og:type" content="%s">' % attr(seo["og_type"]))
+        h.append('<meta property="og:title" content="%s">' % attr(seo["social_title"]))
+        if seo["description"]:
+            h.append('<meta property="og:description" content="%s">' % attr(seo["description"]))
+        h.append('<meta property="og:site_name" content="%s">' % attr(site["title"]))
+        if seo["canonical"]:
+            h.append('<meta property="og:url" content="%s">' % attr(seo["canonical"]))
+        if site.get("lang"):
+            h.append('<meta property="og:locale" content="%s">' % attr(site["lang"].replace("-", "_")))
+        if seo["image"]:
+            h.append('<meta property="og:image" content="%s">' % attr(seo["image"]))
+        if seo["og_type"] == "article":
+            if seo["published"]:
+                h.append('<meta property="article:published_time" content="%s">' % attr(seo["published"]))
+            for t in seo["tags"]:
+                h.append('<meta property="article:tag" content="%s">' % attr(t))
+        h.append('<meta name="twitter:card" content="%s">' % ("summary_large_image" if seo["image"] else "summary"))
+        h.append('<meta name="twitter:title" content="%s">' % attr(seo["social_title"]))
+        if seo["description"]:
+            h.append('<meta name="twitter:description" content="%s">' % attr(seo["description"]))
+        if seo["image"]:
+            h.append('<meta name="twitter:image" content="%s">' % attr(seo["image"]))
+        tw = str(site.get("twitter") or "").strip()
+        if tw:
+            h.append('<meta name="twitter:site" content="%s">' % attr(tw if tw.startswith("@") else "@" + tw))
+        return h
+
+    def feed_links(self, c, prefix):
+        site = c["site"]
+        if not (site.get("feeds") and site.get("url")):
+            return []
+        out = []
+        if self.enabled("blog", c) or self.enabled("library", c):
+            out.append('<link rel="alternate" type="application/rss+xml" title="%s" href="%srss.xml">'
+                       % (attr(site["title"]), prefix))
+        if self.enabled("blog", c):
+            out.append('<link rel="alternate" type="application/rss+xml" title="%s" href="%s%srss.xml">'
+                       % (attr("%s: %s" % (site["title"], self.module_label("blog", c))), prefix, self.mbase("blog", c)))
+        if self.enabled("library", c) and self.mbase("library", c):
+            out.append('<link rel="alternate" type="application/rss+xml" title="%s" href="%s%srss.xml">'
+                       % (attr("%s: %s" % (site["title"], self.module_label("library", c))), prefix,
+                          self.mbase("library", c)))
+        return out
+
+    def doc(self, c, *, rel, body_class, main, title="", desc="", og_type="website", published="", tags=None,
+            image="", seo_title="", canonical="", noindex=False, current_mod=None, css=None, base=None,
+            head_extra=None, full=False, canonical_rel=None):
+        """Wrap a page body in the shared shell: head with SEO tags, site header, footer."""
+        site = c["site"]
+        prefix = up(rel)
+        st = site["title"]
+        is_home = rel == "index.html"
+        full_title = seo_title or (st if (is_home or not title or title == st) else "%s | %s" % (title, st))
+        override = (canonical or "").strip()
+        canon = override if re.match(r"^https?://", override, re.I) else abs_url(site.get("url"), canonical_rel or rel)
+        seo = {
+            "full_title": full_title, "social_title": st if is_home else (title or st),
+            "description": re.sub(r"\s+", " ", desc or "").strip()[:320], "canonical": canon,
+            "image": resolve_img(site, image or site.get("image")), "og_type": og_type,
+            "noindex": bool(site.get("noindex") or noindex), "published": published or "",
+            "tags": [t for t in (tags or []) if slugify(t)],
+        }
+        head = ['<meta charset="utf-8">']
+        if base:
+            head.append('<base href="%s">' % attr(base))
+        head.append('<meta name="viewport" content="width=device-width, initial-scale=1">')
+        head.extend(self.head_seo(c, seo))
+        head.extend(self.feed_links(c, prefix))
+        fav = brand_favicon(site, prefix)
+        if fav:
+            head.append(fav)
+        if css is None:
+            head.append('<link rel="stylesheet" href="%slayout.css">' % prefix)
+            head.append('<link rel="stylesheet" href="%sstyle.css">' % prefix)
+            if text_active(site.get("text")):
+                head.append('<link rel="stylesheet" href="%s%s">' % (prefix, TEXT_FILE))
+            head.extend(head_extra or [])
+        else:
+            css = layout_css(c, [m for m in MODULES if self.enabled(m, c)], prefix) + "\n" + css
+            css += "\n" + text_css(css, site.get("text"))
+            head.append("<style>\n%s\n</style>" % css.replace("</", "<\\/"))
+        classes = layout_classes(c) + " " + body_class + (" is-home" if is_home else "")
+        tagline = '<span class="tagline">%s</span>' % esc(site["tagline"]) if site.get("tagline") else ""
+        nav = self.nav_html(c, prefix, rel, current_mod)
+        foot = (site.get("footer", "").replace("{year}", str(datetime.date.today().year))
+                .replace("{title}", st).replace("{author}", site.get("author") or st))
+        footer = ""
+        flogo = brand_footer(site, prefix)
+        if foot.strip() or flogo:
+            footer = ('\n<footer class="site-footer"><div class="bar">%s%s</div></footer>'
+                      % (flogo, "<p>%s</p>" % Markdown(prefix).inline(foot) if foot.strip() else ""))
+        body = main if full else '<main id="main" class="wrap page-main">\n%s\n</main>' % main
+        site_lid = layout_id(c, "site")
+        has_side = 'class="collapse-button' in body
+        if site_lid in SPECIAL_LAYOUTS:
+            brand = brand_banner(site, prefix) + brand_title(site, prefix) + tagline
+            side = bool(nav.strip()) or has_side
+            if has_side:
+                body = collapse_button("in-main always") + "\n" + body.replace(collapse_button("in-main") + "\n", "", 1)
+            elif side:
+                body = with_button(body, collapse_button("in-main always"))
+            inner = special_body(site_lid, site, prefix, title=st, brand=brand, nav=nav, main=body, footer=footer)
+            return ('<!DOCTYPE html>\n<html lang="%s">\n<head>\n%s\n</head>\n<body class="%s">\n'
+                    '<a class="skip" href="#main">Skip to content</a>\n%s%s\n</body>\n</html>\n'
+                    % (attr(site.get("lang") or "en"), "\n".join(head), attr(classes), page_scripts(side, body), inner))
+        side = has_side or (site_lid == "sidebar" and bool(nav))
+        if side and not has_side:
+            body = with_button(body, collapse_button("in-main", "Collapse sidebar", "Expand sidebar"))
+        return (
+            '<!DOCTYPE html>\n<html lang="%s">\n<head>\n%s\n</head>\n<body class="%s">\n'
+            '<a class="skip" href="#main">Skip to content</a>\n%s'
+            '<input type="checkbox" id="nav-toggle" class="nav-toggle" aria-label="Show menu">\n'
+            '<header class="site-header">%s<div class="bar">\n<div class="brand">%s%s</div>\n'
+            '%s%s\n</div></header>\n%s%s\n</body>\n</html>\n'
+            % (attr(site.get("lang") or "en"), "\n".join(head), attr(classes), page_scripts(side, body),
+               brand_banner(site, prefix),
+               brand_title(site, prefix), tagline,
+               '<label for="nav-toggle" class="nav-button">Menu</label>\n' if nav else "", nav, body, footer)
+        )
+
+    def sidebar_layout(self, side_html, main_html, button="Browse", collapsible=True):
+        """collapsible: the side column can be hidden with the Hide menu button on wide screens.
+        Off for the Handbook wiki, where the side column is a menu bar."""
+        return ('<input type="checkbox" id="side-toggle" class="side-toggle" aria-label="Show %s">\n'
+                '<label for="side-toggle" class="side-button">%s</label>\n'
+                '<div class="with-sidebar%s">\n%s\n<main id="main">\n%s%s\n</main>\n</div>'
+                % (attr(button.lower()), esc(button), " collapsible" if collapsible else "", side_html,
+                   collapse_button("in-main") + "\n" if collapsible else "", main_html))
+
+    # ---- pages
+    def render_page(self, c, page, markdown, css=None, base=None):
+        rel = page_rel(page["slug"])
+        M = self.md(c, up(rel))
+        body = M.render(markdown)
+        parts = []
+        if page.get("show_title", True):
+            parts.append('<h1 class="page-title">%s</h1>' % esc(page["title"]))
+        if body:
+            parts.append(body)
+        site = c["site"]
+        desc = page.get("description") or (site.get("description") if page["slug"] == "index" else "") \
+            or auto_summary(body) or site.get("tagline", "")
+        return self.doc(c, rel=rel, body_class="page-" + page["slug"], title=page["title"],
+                        main='<article class="content">\n%s\n</article>' % "\n".join(parts), desc=desc,
+                        image=page.get("image"), seo_title=page.get("seo_title"), canonical=page.get("canonical"),
+                        noindex=page.get("noindex"), css=css, base=base)
+
+    def render_home(self, c, css=None, base=None):
+        home = c["home"]
+        if home == "blog":
+            return self.blog_landing(c, "index.html", css=css, base=base)
+        if home == "wiki":
+            return self.wiki_landing(c, "index.html", css=css, base=base)
+        if home == "library":
+            return self.lib_landing(c, "index.html", css=css, base=base)
+        if home == "podcast":
+            return self.pod_landing(c, "index.html", css=css, base=base)
+        return self.render_page(c, self.find_page("index", c), read_text(self.page_md("index")), css=css, base=base)
+
+    def add_page(self, d):
+        title = str(d.get("title") or "").strip()[:120]
+        if not title:
+            raise ApiError("Give the page a title.")
+        slug = slugify(title) or "page"
+        taken = self.taken_root_names()
+        base, n = slug, 2
+        while slug in taken:
+            slug = "%s-%d" % (base, n)
+            n += 1
+        template = {"about": ABOUT_MD, "privacy": PRIVACY_MD.replace("{date}", nice_date(today()))}.get(d.get("template"), "")
+        self.cfg["pages"].append({"slug": slug, "title": title, "show_title": True})
+        write_text(self.page_md(slug), template)
+        self.normalize_nav()
+        self.save_cfg()
+        self.build()
+        return {"slug": slug}
+
+    def get_page(self, slug):
+        p = self.get_page_rec(slug)
+        return {"page": p, "markdown": read_text(self.page_md(slug))}
+
+    def save_page(self, slug, d):
+        p = self.get_page_rec(slug)
+        p["title"] = str(d.get("title") or "").strip()[:120] or p["title"]
+        if "show_title" in d:
+            p["show_title"] = bool(d["show_title"])
+        seo_fields(d, p)
+        wanted = slugify(str(d.get("new_slug") or "")) or p["slug"]
+        if p["slug"] != "index" and wanted != p["slug"]:
+            if wanted in self.taken_root_names(exclude=p["slug"]):
+                raise ApiError("The address %s is already used or reserved." % wanted)
+            rename_path(self.page_md(p["slug"]), self.page_md(wanted))
+            for n in self.cfg["nav"]:
+                if n.get("type") == "page" and n.get("slug") == p["slug"]:
+                    n["slug"] = wanted
+            p["slug"] = wanted
+        write_text(self.page_md(p["slug"]), str(d.get("markdown") or ""))
+        self.save_cfg()
+        self.build()
+        return {"slug": p["slug"]}
+
+    def delete_page(self, slug):
+        if slug == "index":
+            raise ApiError("The home page cannot be deleted.")
+        p = self.get_page_rec(slug)
+        self.cfg["pages"].remove(p)
+        self.to_trash(self.page_md(slug))
+        self.normalize_nav()
+        self.save_cfg()
+        self.build()
+        return {"ok": True}
+
+    # ---- menu
+    def save_nav(self, items):
+        if not isinstance(items, list):
+            raise ApiError("Bad menu.")
+        clean = []
+        for n in items:
+            if not isinstance(n, dict):
+                continue
+            if n.get("type") == "link":
+                url = str(n.get("url") or "").strip()
+                if not url:
+                    continue
+                if _SCHEME.match(url) and not re.match(r"^(https?|mailto|tel):", url, re.I):
+                    raise ApiError("Menu links must be http, https, mailto or tel links, or paths on this site.")
+                clean.append({"type": "link", "label": str(n.get("label") or "Link").strip()[:60], "url": url[:400],
+                              "visible": bool(n.get("visible", True))})
+            elif n.get("type") in ("page", "module"):
+                key = "slug" if n["type"] == "page" else "id"
+                clean.append({"type": n["type"], key: str(n.get(key) or ""), "label": str(n.get("label") or "")[:60],
+                              "visible": bool(n.get("visible", True))})
+        self.cfg["nav"] = clean
+        self.normalize_nav()
+        self.save_cfg()
+        self.build()
+        return {"nav": self.cfg["nav"]}
+
+    # ---- css
+    def get_css(self):
+        return {"css": read_text(self.css_path())}
+
+    def save_css(self, css):
+        write_text(self.css_path(), str(css))
+        c = self.cfg
+        if text_active(c["site"].get("text")):
+            # text.css repeats font sizes from style.css, so it follows every CSS save
+            lay = layout_css(c, [m for m in MODULES if self.enabled(m, c)])
+            write_if_changed(self.root / TEXT_FILE, text_css(lay + "\n" + str(css), c["site"]["text"]))
+        return {"ok": True}
+
+    # ---- settings
+    @staticmethod
+    def clean_site(d, current):
+        out = dict(current)
+        for k, limit in (("title", 120), ("tagline", 200), ("footer", 400), ("author", 120), ("lang", 12),
+                         ("description", 320), ("image", 400), ("twitter", 60)):
+            if k in d:
+                out[k] = str(d[k]).strip()[:limit]
+        if "url" in d:
+            out["url"] = str(d["url"]).strip().rstrip("/")[:300]
+        if d.get("search") in SEARCH_MODES:
+            out["search"] = d["search"]
+        if d.get("prose") in ("indented", "spaced"):
+            out["prose"] = d["prose"]
+        for axis, key in LAYOUT_KEYS.items():
+            if d.get(key) in LAYOUTS[axis]:
+                out[key] = d[key]
+        if "wpm" in d:
+            try:
+                out["wpm"] = max(60, min(1000, int(d["wpm"])))
+            except (TypeError, ValueError):
+                pass
+        for k in SITE_BOOLS:
+            if k in d:
+                out[k] = bool(d[k])
+        if isinstance(d.get("secure"), dict):
+            out["secure"] = clean_portal(d["secure"], current.get("secure"))
+        if isinstance(d.get("frame"), dict):
+            out["frame"] = clean_frame(d["frame"], current.get("frame"))
+        if isinstance(d.get("text"), dict):
+            out["text"] = clean_text(d["text"], current.get("text"))
+        if isinstance(d.get("brand"), dict):
+            out["brand"] = clean_brand(d["brand"], current.get("brand"))
+        out["title"] = out.get("title") or current.get("title") or "My site"
+        out["lang"] = out.get("lang") or "en"
+        return out
+
+    def save_settings(self, d):
+        site = self.clean_site(d, self.cfg["site"])
+        url = site.get("url", "")
+        if url and not re.match(r"^https?://[^\s/]+", url):
+            raise ApiError("The site URL must start with http:// or https://, for example https://example.com")
+        if site.get("feeds") and not url:
+            raise ApiError("Enter the site URL to publish feeds. Feed readers need full web addresses.")
+        if site.get("sitemap") and not url:
+            raise ApiError("Enter the site URL to generate a sitemap. It needs full web addresses.")
+        if site.get("search") == "web" and not url:
+            raise ApiError("Web search needs the site URL, so the search engine knows which site to look in.")
+        backup = copy.deepcopy(self.cfg)
+        self.cfg["site"] = site
+        moved = self.pod_feed_moved(backup)
+        if moved and not d.get("confirm_feed_move"):
+            self.cfg = backup
+            return {"needs_confirm": True, "message": moved}
+        if moved:
+            self.pod_accept_move()
+        self.save_cfg()
+        self.build()
+        return {"ok": True}
+
+    def upload(self, name, data):
+        stem, ext = os.path.splitext(os.path.basename(name))
+        ext = ext.lower()
+        if ext not in IMG_EXT:
+            raise ApiError("Only image files can be added (png, jpg, gif, webp, svg, avif).")
+        if not data:
+            raise ApiError("That file is empty.")
+        stem = re.sub(r"[^A-Za-z0-9_-]+", "-", stem).strip("-") or "image"
+        folder = self.root / "assets"
+        folder.mkdir(exist_ok=True)
+        fn, n = stem + ext, 2
+        while (folder / fn).exists():
+            fn = "%s-%d%s" % (stem, n, ext)
+            n += 1
+        (folder / fn).write_bytes(data)
+        return {"path": "assets/" + fn}
+
+    # ---- build
+    def build(self):
+        c = self.cfg
+        self._mds = []
+        self._res = (None, None)
+        if self.enabled("library"):
+            self.lib_count_words(c)
+        files = {"index.html": self.render_home(c), "layout.css": layout_css(c, [m for m in MODULES if self.enabled(m, c)])}
+        if text_active(c["site"].get("text")):
+            files[TEXT_FILE] = text_css(files["layout.css"] + "\n" + read_text(self.css_path()), c["site"]["text"])
+        for p in c["pages"]:
+            if p["slug"] != "index":
+                files[page_rel(p["slug"])] = self.render_page(c, p, read_text(self.page_md(p["slug"])))
+        if self.enabled("blog"):
+            files.update(self.blog_files(c))
+        if self.enabled("wiki"):
+            files.update(self.wiki_files(c))
+        if self.enabled("library"):
+            files.update(self.lib_files(c))
+        if self.enabled("podcast"):
+            files.update(self.pod_files(c))
+        if c["site"].get("feeds") and c["site"].get("url") and (self.enabled("blog") or self.enabled("library")):
+            xml = self.feed_xml(c, self.feed_items(c, blog=True, library=True), c["site"]["title"], "rss.xml")
+            files["rss"] = xml
+            files["rss.xml"] = xml
+        for rel, text in files.items():
+            write_if_changed(self.root / rel, text)
+        for rel in set(c.get("generated", [])) - set(files):
+            self.remove_generated(rel)
+        c["generated"] = sorted(files)
+        self._pod_check = self.pod_check(c, files.get(self.feed_rel(c), "")) if self.enabled("podcast") else []
+        self.write_seo_files()
+        self.save_cfg()
+        self._mds = []
+
+    def remove_generated(self, rel):
+        """Delete a file this app generated earlier and no longer produces. Paths are checked so a
+        tampered config can never reach outside the site folder or into the sources."""
+        try:
+            p = (self.root / str(rel)).resolve()
+            parts = p.relative_to(self.root.resolve()).parts
+        except (ValueError, OSError):
+            return
+        if not parts or parts[0].startswith(".") or parts[0] == "assets":
+            return
+        chapters = p.suffix == ".json" and len(parts) > 1 and parts[-2] == "chapters"
+        if p.suffix not in (".html", ".xml", ".js") and p.name != "rss" and parts != (TEXT_FILE,) and not chapters:
+            return
+        if p.is_file():
+            p.unlink()
+        parent = p.parent
+        root = self.root.resolve()
+        while parent != root and root in parent.parents:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+    # ---- feeds
+    def feed_items(self, c, blog, library):
+        """(date, title, rel, html) for recent posts and chapters, newest first."""
+        items = []
+        # Feed readers resolve relative links against the item's page or the feed, never the
+        # site root, so bodies are rendered with absolute links.
+        base = c["site"]["url"].rstrip("/") + "/"
+        if blog and self.enabled("blog", c):
+            for p in self.published_posts(c):
+                items.append((p["date"], p["title"], self.post_rel(p["slug"], c),
+                              Markdown(base).render(read_text(self.post_md(p["slug"]))), p.get("tags", [])))
+        if library and self.enabled("library", c):
+            for s, ch in self.lib_recent(c, 50):
+                items.append((ch["date"], "%s: %s" % (s["title"], ch["title"]), self.chapter_rel(s, ch, c),
+                              Markdown(base).render(read_text(self.chapter_md(s["slug"], ch["slug"]))), [s["title"]]))
+        items.sort(key=lambda x: x[0], reverse=True)
+        return items[:50]
+
+    def feed_xml(self, c, items, title, self_rel):
+        site = c["site"]
+        url = site["url"].rstrip("/")
+        out = []
+        for date, t, rel, body, cats in items:
+            link = "%s/%s" % (url, rel)
+            when = email.utils.format_datetime(datetime.datetime.combine(
+                datetime.date.fromisoformat(clean_date(date)), datetime.time(12, 0), tzinfo=datetime.timezone.utc))
+            out.append(
+                "<item>\n<title>%s</title>\n<link>%s</link>\n<guid isPermaLink=\"true\">%s</guid>\n<pubDate>%s</pubDate>\n%s"
+                "<description>%s</description>\n<content:encoded><![CDATA[%s]]></content:encoded>\n</item>"
+                % (_escape(t, quote=False), _escape(link, quote=False), _escape(link, quote=False), when,
+                   "".join("<category>%s</category>\n" % _escape(x, quote=False) for x in cats),
+                   _escape(auto_summary(body), quote=False), body.replace("]]>", "]]]]><![CDATA[>"))
+            )
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" '
+            'xmlns:atom="http://www.w3.org/2005/Atom">\n<channel>\n'
+            "<title>%s</title>\n<link>%s/index.html</link>\n<description>%s</description>\n<language>%s</language>\n"
+            '<generator>SiteForge</generator>\n<atom:link href="%s/%s" rel="self" type="application/rss+xml"/>\n%s\n'
+            "</channel>\n</rss>\n"
+            % (_escape(title, quote=False), _escape(url, quote=False),
+               _escape(site.get("description") or site.get("tagline") or site["title"], quote=False),
+               _escape(site.get("lang") or "en", quote=False), _escape(url, quote=False), _escape(self_rel, quote=False),
+               "\n".join(out))
+        )
+
+    # ---- sitemap and robots
+    def sitemap_rows(self, c):
+        rows = [("index.html", "")]
+        rows += [(page_rel(p["slug"]), "") for p in c["pages"] if p["slug"] != "index" and not p.get("noindex")]
+        if self.enabled("blog", c):
+            rows += self.blog_sitemap(c)
+        if self.enabled("wiki", c):
+            rows += self.wiki_sitemap(c)
+        if self.enabled("library", c):
+            rows += self.lib_sitemap(c)
+        if self.enabled("podcast", c):
+            rows += self.pod_sitemap(c)
+        return rows
+
+    def write_seo_files(self):
+        site = self.cfg["site"]
+        url = (site.get("url") or "").rstrip("/")
+        sm, rb = self.root / "sitemap.xml", self.root / "robots.txt"
+
+        def ours(path):
+            return path.is_file() and "generated by SiteForge" in read_text(path)[:300]
+
+        want = bool(site.get("sitemap")) and bool(url) and not site.get("noindex")
+        if want and not sm.is_dir() and (not sm.exists() or ours(sm)):
+            seen, rows = set(), []
+            for rel, lastmod in self.sitemap_rows(self.cfg):
+                if rel in seen:
+                    continue
+                seen.add(rel)
+                lm = "<lastmod>%s</lastmod>" % lastmod if lastmod else ""
+                rows.append("<url><loc>%s</loc>%s</url>" % (_escape("%s/%s" % (url, rel), quote=False), lm))
+            write_if_changed(sm, '<?xml version="1.0" encoding="UTF-8"?>\n<!-- generated by SiteForge -->\n'
+                                 '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n%s\n</urlset>\n' % "\n".join(rows))
+        elif not want and ours(sm):
+            sm.unlink()
+        if url and site.get("noindex"):
+            robots = "# generated by SiteForge\nUser-agent: *\nDisallow: /\n"
+        elif want:
+            robots = "# generated by SiteForge\nUser-agent: *\nAllow: /\nSitemap: %s/sitemap.xml\n" % url
+        else:
+            robots = None
+        if robots and not rb.is_dir() and (not rb.exists() or ours(rb)):
+            write_if_changed(rb, robots)
+        elif robots is None and ours(rb):
+            rb.unlink()
+
+    # ---- preview
+    def preview(self, p):
+        cfg = copy.deepcopy(self.cfg)
+        self._mds = []
+        self._res = (None, None)
+        if isinstance(p.get("site"), dict):
+            cfg["site"] = self.clean_site(p["site"], cfg["site"])
+        if isinstance(p.get("nav"), list):
+            cfg["nav"] = [n for n in p["nav"] if isinstance(n, dict)]
+        if isinstance(p.get("layouts"), dict):
+            for axis, key in LAYOUT_KEYS.items():
+                if p["layouts"].get(key) in LAYOUTS[axis]:
+                    cfg["site"][key] = p["layouts"][key]
+        css = p.get("css") if isinstance(p.get("css"), str) else read_text(self.css_path())
+        view = p.get("view")
+        md = str(p.get("markdown") or "")
+        base = "/site/"
+        html_ = None
+        if view == "page":
+            page = self.find_page(str(p.get("slug") or ""), cfg)
+            if not page:
+                raise ApiError("That page does not exist.", 404)
+            page["title"] = str(p.get("title") or "").strip() or page["title"]
+            page["show_title"] = bool(p.get("show_title", True))
+            seo_fields(p, page)
+            if page["slug"] == "index" and cfg["home"] != "page":
+                cfg["home"] = "page"
+            html_ = self.render_page(cfg, page, md, css=css, base=base)
+        elif view in ("post", "blogintro", "tag"):
+            html_ = self.blog_preview(cfg, p, md, css, base)
+        elif view in ("wikihome", "section", "article"):
+            html_ = self.wiki_preview(cfg, p, md, css, base)
+        elif view in ("libhome", "story", "chapter"):
+            html_ = self.lib_preview(cfg, p, md, css, base)
+        elif view in ("podcasthome", "episode") and self.enabled("podcast", cfg):
+            if isinstance(p.get("show"), dict):
+                for k in ("title", "author", "image", "link"):
+                    if k in p["show"]:
+                        cfg["podcast"]["show"][k] = str(p["show"][k] or "").strip()[:400]
+                for k in ("explicit", "complete"):
+                    if k in p["show"]:
+                        cfg["podcast"]["show"][k] = bool(p["show"][k])
+                if p["show"].get("type") in ("episodic", "serial"):
+                    cfg["podcast"]["show"]["type"] = p["show"]["type"]
+            html_ = self.pod_preview(cfg, p, md, css, base)
+        if html_ is None:
+            html_ = self.preview_target(cfg, str(p.get("target") or "home"), css)
+        missing = sorted({x for m in self._mds for x in m.missing})
+        self._mds = []
+        return {"html": html_, "missing": missing}
+
+    def preview_target(self, c, target, css):
+        """Existing pages, for the CSS, menu, settings and structure views."""
+        kind, _, rest = target.partition(":")
+        rel_base = "/site/"
+        if kind == "page":
+            page = self.find_page(rest, c)
+            if page:
+                return self.render_page(c, page, read_text(self.page_md(page["slug"])), css=css, base=rel_base)
+        if kind == "blog" and self.enabled("blog", c):
+            r = self.blog_preview_target(c, rest, css)
+            if r:
+                return r
+        if kind == "wiki" and self.enabled("wiki", c):
+            r = self.wiki_preview_target(c, rest, css)
+            if r:
+                return r
+        if kind == "library" and self.enabled("library", c):
+            r = self.lib_preview_target(c, rest, css)
+            if r:
+                return r
+        if kind == "podcast" and self.enabled("podcast", c):
+            r = self.pod_preview_target(c, rest, css)
+            if r:
+                return r
+        return self.render_home(c, css=css, base=rel_base)
+
+    def preview_targets(self):
+        """Choices for the CSS view's preview list."""
+        c = self.cfg
+        out = [{"id": "home", "label": "Homepage"}]
+        out += [{"id": "page:" + p["slug"], "label": "Page: " + p["title"]} for p in c["pages"] if p["slug"] != "index"]
+        if self.enabled("blog"):
+            out.append({"id": "blog:", "label": "Blog feed"})
+            out += [{"id": "blog:" + p["slug"], "label": "Post: " + p["title"]} for p in self.published_posts(c)[:20]]
+        if self.enabled("wiki"):
+            out.append({"id": "wiki:", "label": "Wiki home"})
+            for s in c["wiki"]["sections"]:
+                out.append({"id": "wiki:" + s["slug"], "label": "Wiki section: " + s["title"]})
+                out += [{"id": "wiki:%s/%s" % (s["slug"], a["slug"]), "label": "   Article: " + a["title"]}
+                        for a in s["articles"]]
+        if self.enabled("library"):
+            out.append({"id": "library:", "label": "Library"})
+            for s in c["library"]["stories"]:
+                out.append({"id": "library:" + s["slug"], "label": "Story: " + s["title"]})
+                out += [{"id": "library:%s/%s" % (s["slug"], ch["slug"]), "label": "   Chapter: " + ch["title"]}
+                        for ch in s["chapters"]]
+        if self.enabled("podcast"):
+            out += self.pod_preview_targets(c)
+        return {"targets": out}
+
+
+# ----------------------------------------------------------------------------
+# Blog module
+# ----------------------------------------------------------------------------
+
+class BlogMixin:
+    def blog_intro_md(self):
+        return self.meta / "blog" / "_index.md"
+
+    def post_md(self, slug):
+        return self.meta / "blog" / "posts" / (slug + ".md")
+
+    def post_rel(self, slug, c=None):
+        return self.mbase("blog", c) + "posts/%s.html" % slug
+
+    def tag_rel(self, name, c=None):
+        return self.mbase("blog", c) + "tag/%s.html" % slugify(name)
+
+    def normalize_blog(self):
+        posts, seen = [], set()
+        for p in self.cfg["posts"]:
+            if not isinstance(p, dict) or not slugify(p.get("slug", "")) or p["slug"] in seen:
+                continue
+            p["slug"] = slugify(p["slug"])
+            seen.add(p["slug"])
+            p["title"] = str(p.get("title") or title_from_name(p["slug"]))
+            p["date"] = clean_date(p.get("date"))
+            p["summary"] = str(p.get("summary") or "")
+            p["tags"] = clean_tags(p.get("tags"))
+            p["status"] = "published" if p.get("status") == "published" else "draft"
+            for k in ("seo_title", "description", "image", "canonical"):
+                p[k] = str(p.get(k) or "")
+            p["noindex"] = bool(p.get("noindex"))
+            posts.append(p)
+        self.cfg["posts"] = posts
+
+    def published_posts(self, c):
+        posts = [p for p in c["posts"] if p.get("status") == "published"]
+        return sorted(posts, key=lambda p: (p["date"], p["title"].lower()), reverse=True)
+
+    def tag_map(self, c):
+        out = {}
+        for p in self.published_posts(c):
+            for t in p.get("tags", []):
+                out.setdefault(slugify(t), {"name": t, "posts": []})["posts"].append(p)
+        return dict(sorted(out.items()))
+
+    def tags_html(self, c, tags, prefix):
+        if not tags:
+            return ""
+        return '<ul class="tags">%s</ul>\n' % "".join(
+            '<li><a href="%s%s">%s</a></li>' % (prefix, attr(self.tag_rel(t, c)), esc(t)) for t in tags)
+
+    def post_list(self, c, posts, prefix):
+        """The blog feed, shaped by the blog layout: a list, a card grid or a dated archive."""
+        if not posts:
+            return '<p class="empty">No posts yet.</p>'
+        lay = layout_opt(c, "blog")
+        style = lay.get("feed", "list")
+        items = []
+        for n, p in enumerate(posts):
+            summary = p.get("summary", "").strip() or auto_summary(Markdown("").render(read_text(self.post_md(p["slug"]))))
+            href = prefix + attr(self.post_rel(p["slug"], c))
+            when = nice_date(p["date"])
+            if style == "archive":
+                d = datetime.date.fromisoformat(clean_date(p["date"]))
+                when = d.strftime("%b ") + str(d.day)
+            title = '<h2><a href="%s">%s</a></h2>\n' % (href, esc(p["title"]))
+            meta = '<p class="post-meta"><time datetime="%s">%s</time></p>\n' % (attr(p["date"]), esc(when))
+            tags = self.tags_html(c, p.get("tags", []), prefix)
+            summ = '<p class="post-summary">%s</p>\n' % esc(summary) if summary else ""
+            if style == "cards":
+                img = card_image(p.get("image"), prefix)
+                cls = ["post-item"] + (["has-thumb"] if img else []) + (["post-feature"] if lay.get("feature") and n == 0 else [])
+                thumb = ('<a class="post-thumb" href="%s" tabindex="-1" aria-hidden="true"><img src="%s" alt="" loading="lazy"></a>\n'
+                         % (href, attr(img)) if img else "")
+                items.append('<li class="%s">\n%s<div class="post-body">\n%s%s%s%s</div>\n</li>'
+                             % (" ".join(cls), thumb, title, meta, tags, summ))
+            else:
+                items.append('<li class="post-item">\n%s%s%s%s</li>' % (title, meta, tags, summ))
+        if style == "archive":
+            years = []
+            for p, item in zip(posts, items):
+                y = clean_date(p["date"])[:4]
+                if not years or years[-1][0] != y:
+                    years.append((y, []))
+                years[-1][1].append(item)
+            return "\n".join('<section class="post-year">\n<h2>%s</h2>\n<ul class="post-list archive">\n%s\n</ul>\n</section>'
+                             % (y, "\n".join(rows)) for y, rows in years)
+        return '<ul class="post-list%s">\n%s\n</ul>' % (" cards" if style == "cards" else "", "\n".join(items))
+
+    def blog_landing(self, c, rel, css=None, base=None, intro=None):
+        prefix = up(rel)
+        body = self.md(c, prefix).render(read_text(self.blog_intro_md()) if intro is None else intro)
+        site = c["site"]
+        label = self.module_label("blog", c)
+        parts = []
+        if rel != "index.html" or not body:
+            parts.append('<h1 class="page-title">%s</h1>' % esc(label))
+        if body:
+            parts.append(body)
+        if site.get("feeds") and site.get("url"):
+            parts.append('<p class="feed-links"><a href="%s%srss.xml">RSS feed</a></p>' % (prefix, self.mbase("blog", c)))
+        parts.append(self.post_list(c, self.published_posts(c), prefix))
+        home = c["home"] == "blog"
+        return self.doc(c, rel=rel, body_class="mod-blog blog-feed", title="" if rel == "index.html" else label,
+                        main='<article class="content">\n%s\n</article>' % "\n".join(parts),
+                        desc=auto_summary(body) or site.get("description") or site.get("tagline"),
+                        current_mod="blog", css=css, base=base,
+                        canonical_rel="index.html" if home else None)
+
+    def render_post(self, c, post, markdown, css=None, base=None):
+        rel = self.post_rel(post["slug"], c)
+        prefix = up(rel)
+        body = self.md(c, prefix).render(strip_title_h1(markdown, post["title"]))
+        img = card_image(post.get("image"), prefix) if layout_opt(c, "blog").get("hero") else ""
+        parts = ['<figure class="post-hero"><img src="%s" alt=""></figure>' % attr(img) if img else "",
+                 '<h1 class="page-title">%s</h1>' % esc(post["title"]),
+                 '<p class="post-meta"><time datetime="%s">%s</time></p>' % (attr(post["date"]), esc(nice_date(post["date"]))),
+                 self.tags_html(c, post.get("tags", []), prefix), body]
+        posts = self.published_posts(c)
+        slugs = [p["slug"] for p in posts]
+        if c["site"].get("post_nav") and post["slug"] in slugs:
+            i = slugs.index(post["slug"])
+            pager = []
+            if i + 1 < len(posts):
+                o = posts[i + 1]
+                pager.append('<a class="prev" href="%s%s"><small>Older</small>%s</a>' % (prefix, attr(self.post_rel(o["slug"], c)), esc(o["title"])))
+            if i > 0:
+                n = posts[i - 1]
+                pager.append('<a class="next" href="%s%s"><small>Newer</small>%s</a>' % (prefix, attr(self.post_rel(n["slug"], c)), esc(n["title"])))
+            if pager:
+                parts.append('<nav class="pager" aria-label="More posts">%s</nav>' % "".join(pager))
+        parts.append('<p class="post-back"><a href="%s%s">Back to all posts</a></p>' % (prefix, self.landing_rel("blog", c)))
+        desc = post.get("description") or post.get("summary") or auto_summary(body)
+        return self.doc(c, rel=rel, body_class="mod-blog blog-post post-" + post["slug"], title=post["title"],
+                        main='<article class="content">\n%s\n</article>' % "\n".join(x for x in parts if x),
+                        desc=desc, og_type="article", published=post["date"], tags=post.get("tags"),
+                        image=post.get("image"), seo_title=post.get("seo_title"), canonical=post.get("canonical"),
+                        noindex=post.get("noindex"), current_mod="blog", css=css, base=base)
+
+    def render_tag(self, c, name, posts, css=None, base=None):
+        rel = self.tag_rel(name, c)
+        prefix = up(rel)
+        main = ('<article class="content">\n<h1 class="page-title">Posts tagged &ldquo;%s&rdquo;</h1>\n'
+                '<p class="tag-back"><a href="%s%s">All posts</a></p>\n%s\n</article>'
+                % (esc(name), prefix, self.landing_rel("blog", c), self.post_list(c, posts, prefix)))
+        return self.doc(c, rel=rel, body_class="mod-blog blog-tag tag-" + slugify(name), title="Tagged: " + name,
+                        main=main, desc="Posts tagged %s." % name, current_mod="blog", css=css, base=base)
+
+    def blog_files(self, c):
+        files = {self.mbase("blog", c) + "index.html": self.blog_landing(c, self.mbase("blog", c) + "index.html")}
+        for p in self.published_posts(c):
+            files[self.post_rel(p["slug"], c)] = self.render_post(c, p, read_text(self.post_md(p["slug"])))
+        for slug, t in self.tag_map(c).items():
+            files[self.tag_rel(t["name"], c)] = self.render_tag(c, t["name"], t["posts"])
+        site = c["site"]
+        if site.get("feeds") and site.get("url"):
+            rel = self.mbase("blog", c) + "rss.xml"
+            files[rel] = self.feed_xml(c, self.feed_items(c, blog=True, library=False),
+                                       "%s: %s" % (site["title"], self.module_label("blog", c)), rel)
+        return files
+
+    def blog_sitemap(self, c):
+        rows = []
+        if c["home"] != "blog":
+            rows.append((self.landing_rel("blog", c), ""))
+        rows += [(self.post_rel(p["slug"], c), p["date"]) for p in self.published_posts(c) if not p.get("noindex")]
+        rows += [(self.tag_rel(t["name"], c), "") for t in self.tag_map(c).values()]
+        return rows
+
+    # ---- API
+    def find_post(self, slug):
+        return next((p for p in self.cfg["posts"] if p["slug"] == slug), None)
+
+    def get_post(self, slug):
+        p = self.find_post(slug)
+        if not p:
+            raise ApiError("That post does not exist.", 404)
+        return {"post": p, "markdown": read_text(self.post_md(slug))}
+
+    def save_post(self, d):
+        title = str(d.get("title") or "").strip()[:160]
+        if not title:
+            raise ApiError("Give the post a title.")
+        known = {t for p in self.cfg["posts"] for t in p.get("tags", [])}
+        orig = str(d.get("orig_slug") or "")
+        post = self.find_post(orig) if orig else None
+        if orig and not post:
+            raise ApiError("That post does not exist.", 404)
+        wanted = slugify(str(d.get("new_slug") or "")) or slugify(title) or "post"
+        taken = {p["slug"] for p in self.cfg["posts"] if p is not post} | {"index"}
+        slug, n = wanted, 2
+        while slug in taken:
+            slug = "%s-%d" % (wanted, n)
+            n += 1
+        md = str(d.get("markdown") or "")
+        if post is None:
+            post = {"slug": slug, "status": "draft"}
+            self.cfg["posts"].append(post)
+        elif post["slug"] != slug:
+            old = self.post_md(post["slug"])
+            if old.exists():
+                old.unlink()
+            post["slug"] = slug
+        post.update(title=title, date=clean_date(d.get("date")), summary=str(d.get("summary") or "").strip()[:400],
+                    tags=clean_tags(d.get("tags"), known))
+        seo_fields(d, post)
+        if d.get("publish"):
+            post["status"] = "published"
+        write_text(self.post_md(slug), md)
+        self.normalize_blog()
+        self.save_cfg()
+        self.build()
+        return {"slug": slug, "post": self.find_post(slug)}
+
+    def unpublish_post(self, slug):
+        p = self.find_post(slug)
+        if not p:
+            raise ApiError("That post does not exist.", 404)
+        p["status"] = "draft"
+        self.save_cfg()
+        self.build()
+        return {"post": p}
+
+    def delete_post(self, slug):
+        p = self.find_post(slug)
+        if not p:
+            raise ApiError("That post does not exist.", 404)
+        self.cfg["posts"].remove(p)
+        self.to_trash(self.post_md(slug))
+        self.save_cfg()
+        self.build()
+        return {"ok": True}
+
+    def get_blog_intro(self):
+        return {"markdown": read_text(self.blog_intro_md())}
+
+    def save_blog_intro(self, d):
+        write_text(self.blog_intro_md(), str(d.get("markdown") or ""))
+        self.build()
+        return {"ok": True}
+
+    def blog_preview(self, c, p, md, css, base):
+        if p.get("view") == "blogintro":
+            rel = "index.html" if c["home"] == "blog" else self.mbase("blog", c) + "index.html"
+            return self.blog_landing(c, rel, css=css, base=base + (up(rel) and self.mbase("blog", c)), intro=md)
+        post = next((x for x in c["posts"] if x["slug"] == str(p.get("orig_slug") or "")), None)
+        if post is None:
+            post = {"slug": slugify(str(p.get("new_slug") or p.get("title") or "")) or "post", "tags": []}
+            c["posts"].append(post)
+        post.update(title=str(p.get("title") or "").strip() or "Untitled post", date=clean_date(p.get("date")),
+                    summary=str(p.get("summary") or ""), tags=clean_tags(p.get("tags")), status="published")
+        seo_fields(p, post)
+        return self.render_post(c, post, md, css=css, base=base + self.mbase("blog", c) + "posts/")
+
+    def blog_preview_target(self, c, rest, css):
+        if not rest:
+            rel = self.mbase("blog", c) + "index.html"
+            return self.blog_landing(c, rel, css=css, base="/site/" + self.mbase("blog", c))
+        post = next((x for x in c["posts"] if x["slug"] == rest), None)
+        if post:
+            return self.render_post(c, post, read_text(self.post_md(rest)), css=css,
+                                    base="/site/" + self.mbase("blog", c) + "posts/")
+        return None
+
+
+# ----------------------------------------------------------------------------
+# Wiki module
+# ----------------------------------------------------------------------------
+
+def preview_base(rel):
+    return "/site/" + (rel.rsplit("/", 1)[0] + "/" if "/" in rel else "")
+
+
+def wiki_published(sec):
+    return [a for a in sec.get("articles", []) if not a.get("draft")]
+
+
+class WikiMixin:
+    def wiki_home_md(self):
+        return self.meta / "wiki" / "home.md"
+
+    def wsec_dir(self, s):
+        return self.meta / "wiki" / "sections" / s
+
+    def wsec_md(self, s):
+        return self.wsec_dir(s) / "_index.md"
+
+    def wart_md(self, s, a):
+        return self.wsec_dir(s) / (a + ".md")
+
+    def wsec_rel(self, s, c=None):
+        return self.mbase("wiki", c) + "%s/index.html" % s
+
+    def wart_rel(self, s, a, c=None):
+        return self.mbase("wiki", c) + "%s/%s.html" % (s, a)
+
+    def normalize_wiki(self):
+        secs, seen = [], set()
+        for s in self.cfg["wiki"]["sections"]:
+            if not isinstance(s, dict) or not slugify(s.get("slug", "")) or s["slug"] in seen:
+                continue
+            s["slug"] = slugify(s["slug"])
+            seen.add(s["slug"])
+            s["title"] = str(s.get("title") or title_from_name(s["slug"]))
+            s["description"] = str(s.get("description") or "")
+            arts, aseen = [], set()
+            for a in s.get("articles") if isinstance(s.get("articles"), list) else []:
+                if not isinstance(a, dict) or not slugify(a.get("slug", "")) or a["slug"] in aseen:
+                    continue
+                aseen.add(a["slug"])
+                a["title"] = str(a.get("title") or title_from_name(a["slug"]))
+                a["description"] = str(a.get("description") or "")
+                a["draft"] = bool(a.get("draft"))
+                a["updated"] = clean_date(a.get("updated"))
+                arts.append(a)
+            s["articles"] = arts
+            secs.append(s)
+        self.cfg["wiki"]["sections"] = secs
+
+    def find_section(self, slug, c=None):
+        return next((s for s in (c or self.cfg)["wiki"]["sections"] if s["slug"] == slug), None)
+
+    def get_section_rec(self, slug):
+        s = self.find_section(slug)
+        if not s:
+            raise ApiError("That wiki section does not exist.", 404)
+        return s
+
+    def get_article_rec(self, sslug, aslug):
+        s = self.get_section_rec(sslug)
+        a = next((x for x in s["articles"] if x["slug"] == aslug), None)
+        if not a:
+            raise ApiError("That article does not exist.", 404)
+        return s, a
+
+    def unique_section_slug(self, base, exclude=None):
+        base = slugify(base) or "section"
+        taken = {s["slug"] for s in self.cfg["wiki"]["sections"] if s["slug"] != exclude} | RESERVED
+        if self.cfg["modules"]["wiki"]["mount"] == "":
+            taken |= self.taken_root_names(exclude=exclude)
+        slug, n = base, 2
+        while slug in taken or (slug != exclude and self.wsec_dir(slug).exists()):
+            slug = "%s-%d" % (base, n)
+            n += 1
+        return slug
+
+    def unique_article_slug(self, sec, base, exclude=None):
+        base = slugify(base) or "article"
+        taken = {a["slug"] for a in sec["articles"] if a["slug"] != exclude} | {"index", "_index"}
+        slug, n = base, 2
+        while slug in taken or (slug != exclude and self.wart_md(sec["slug"], slug).exists()):
+            slug = "%s-%d" % (base, n)
+            n += 1
+        return slug
+
+    # ---- rescan: pick up .md files written outside the editor
+    def wiki_rescan(self):
+        base = self.meta / "wiki" / "sections"
+        base.mkdir(parents=True, exist_ok=True)
+        r = {"wiki_sections_added": 0, "wiki_articles_added": 0, "wiki_articles_removed": 0}
+        known = {s["slug"] for s in self.cfg["wiki"]["sections"]}
+        for d in sorted(base.iterdir(), key=lambda p: p.name.lower()):
+            if not d.is_dir() or d.is_symlink() or d.name.startswith(".") or d.name in known:
+                continue
+            slug = self.unique_section_slug(d.name, exclude=d.name if slugify(d.name) == d.name else None)
+            if slug != d.name:
+                if (base / slug).exists() and not (base / slug).samefile(d):
+                    continue
+                rename_path(d, base / slug)
+            self.cfg["wiki"]["sections"].append({"slug": slug, "title": title_from_name(d.name), "description": "", "articles": []})
+            known.add(slug)
+            r["wiki_sections_added"] += 1
+        for sec in self.cfg["wiki"]["sections"]:
+            d = self.wsec_dir(sec["slug"])
+            d.mkdir(parents=True, exist_ok=True)
+            arts = {a["slug"]: a for a in sec["articles"]}
+            for f in sorted(md_files(d), key=lambda p: p.name.lower()):
+                if f.name == "_index.md" or f.name.startswith("."):
+                    continue
+                if f.stem in arts:
+                    mdate = file_date(f)
+                    if mdate > arts[f.stem].get("updated", ""):
+                        arts[f.stem]["updated"] = mdate
+                    continue
+                orig = f.stem
+                slug = orig if slugify(orig) == orig and orig not in ("index", "_index") else None
+                if slug is None:
+                    slug = self.unique_article_slug(sec, orig)
+                    target = self.wart_md(sec["slug"], slug)
+                    if target.exists() and not target.samefile(f):
+                        continue
+                    rename_path(f, target)
+                    f = target
+                art = {"slug": slug, "title": first_h1(read_text(f)) or title_from_name(orig), "description": "",
+                       "draft": False, "updated": file_date(f)}
+                sec["articles"].append(art)
+                arts[slug] = art
+                r["wiki_articles_added"] += 1
+            keep = [a for a in sec["articles"] if self.wart_md(sec["slug"], a["slug"]).is_file()]
+            r["wiki_articles_removed"] += len(sec["articles"]) - len(keep)
+            sec["articles"] = keep
+        return r
+
+    # ---- rendering
+    def make_resolver(self, c):
+        """[[wiki links]] to site-root-relative URLs. Section/Article paths win, then article titles
+        and slugs, then section titles and slugs, then page, post and story titles. Drafts are
+        not linkable."""
+        idx = {}
+
+        def norm(s):
+            return re.sub(r"\s+", " ", str(s).strip().lower())
+
+        arts = [(s, a) for s in c["wiki"]["sections"] for a in wiki_published(s)]
+        for s, a in arts:
+            u = self.wart_rel(s["slug"], a["slug"], c)
+            for key in (s["slug"] + "/" + a["slug"], norm(s["title"]) + "/" + norm(a["title"])):
+                idx.setdefault(key, u)
+        for s, a in arts:
+            idx.setdefault(norm(a["title"]), self.wart_rel(s["slug"], a["slug"], c))
+        for s, a in arts:
+            idx.setdefault(a["slug"], self.wart_rel(s["slug"], a["slug"], c))
+        for s in c["wiki"]["sections"]:
+            idx.setdefault(norm(s["title"]), self.wsec_rel(s["slug"], c))
+            idx.setdefault(s["slug"], self.wsec_rel(s["slug"], c))
+        # then the rest of the site, so [[Title]] also reaches pages, posts and stories
+        for p in c["pages"]:
+            idx.setdefault(norm(p["title"]), page_rel(p["slug"]))
+        if self.enabled("blog", c):
+            for p in self.published_posts(c):
+                idx.setdefault(norm(p["title"]), self.post_rel(p["slug"], c))
+        if self.enabled("library", c):
+            for st in lib_visible(c):
+                idx.setdefault(norm(st["title"]), self.story_rel(st["slug"], c))
+        idx.setdefault("home", "index.html")
+
+        def resolve(target):
+            t = norm(target)
+            if t in idx:
+                return idx[t]
+            if "/" in t:
+                sec, _, art = t.partition("/")
+                key = slugify(sec) + "/" + slugify(art)
+                if key in idx:
+                    return idx[key]
+            return idx.get(slugify(t))
+
+        return resolve
+
+    def wiki_search_box(self, c, prefix):
+        site = c["site"]
+        if site.get("search") == "builtin":
+            return ('<div class="search" data-root="%s">\n<input type="search" id="wiki-search" placeholder="Search the wiki" '
+                    'aria-label="Search the wiki" autocomplete="off" spellcheck="false">\n'
+                    '<ul class="search-results" id="wiki-results" hidden></ul>\n</div>' % attr(prefix))
+        if site.get("search") == "web" and site.get("url"):
+            return ('<form class="search" role="search" action="https://duckduckgo.com/" method="get">\n'
+                    '<input type="hidden" name="sites" value="%s">\n'
+                    '<input type="search" name="q" placeholder="Search the wiki" aria-label="Search the wiki">\n</form>'
+                    % attr(urlsplit(site["url"]).netloc))
+        return ""
+
+    def wiki_sidebar(self, c, prefix, cur_sec=None, cur_art=None, home=False):
+        out = ['<nav class="side wiki-side" aria-label="Wiki">', self.wiki_search_box(c, prefix)]
+        out.append('<ul class="nav-home"><li><a href="%s%s"%s>%s home</a></li></ul>'
+                   % (prefix, self.landing_rel("wiki", c), ' aria-current="page"' if home else "",
+                      esc(self.module_label("wiki", c))))
+        if not c["wiki"]["sections"]:
+            out.append('<p class="nav-empty">No sections yet.</p>')
+        for s in c["wiki"]["sections"]:
+            arts = wiki_published(s)
+            is_cur = s["slug"] == cur_sec
+            items = ['<li><a href="%s%s"%s>Overview</a></li>' % (prefix, self.wsec_rel(s["slug"], c),
+                                                               ' aria-current="page"' if is_cur and cur_art is None else "")]
+            for a in arts:
+                cur = ' aria-current="page"' if is_cur and a["slug"] == cur_art else ""
+                items.append('<li><a href="%s%s"%s>%s</a></li>' % (prefix, self.wart_rel(s["slug"], a["slug"], c), cur, esc(a["title"])))
+            bar = layout_opt(c, "wiki").get("bar")
+            out.append('<details class="nav-section%s"%s>\n<summary>%s<span class="nav-count">%d</span></summary>\n<ul>\n%s\n</ul>\n</details>'
+                       % (" is-current" if is_cur else "",
+                          " data-drop" if bar else (" open" if c["site"].get("expand") or is_cur else ""),
+                          esc(s["title"]), len(arts), "\n".join(items)))
+        out.append("</nav>")
+        return "\n".join(x for x in out if x)
+
+    def wiki_head(self, c, prefix):
+        if c["site"].get("search") == "builtin":
+            return ['<script src="%s%ssearch.js" defer></script>' % (prefix, self.mbase("wiki", c)),
+                    "<noscript><style>.search { display: none; }</style></noscript>"]
+        return []
+
+    @staticmethod
+    def breadcrumbs(trail):
+        items = []
+        for label, href in trail:
+            items.append('<li><a href="%s">%s</a></li>' % (attr(href), esc(label)) if href
+                         else '<li aria-current="page">%s</li>' % esc(label))
+        return '<nav class="breadcrumbs" aria-label="Breadcrumbs"><ol>%s</ol></nav>' % "".join(items)
+
+    @staticmethod
+    def toc_html(headings):
+        if len(headings) < 3:
+            return ""
+        groups = []
+        for level, hid, text in headings:
+            if level == 2 or not groups:
+                groups.append([(hid, text), []])
+            else:
+                groups[-1][1].append((hid, text))
+        out = ['<nav class="wiki-toc" aria-label="Contents"><details open><summary>Contents</summary><ol>']
+        for (hid, text), subs in groups:
+            sub = "<ol>%s</ol>" % "".join('<li><a href="#%s">%s</a></li>' % (h, t) for h, t in subs) if subs else ""
+            out.append('<li><a href="#%s">%s</a>%s</li>' % (hid, text, sub))
+        out.append("</ol></details></nav>")
+        return "".join(out)
+
+    def wiki_page(self, c, rel, side, parts, rail="", **kw):
+        prefix = up(rel)
+        article = '<article class="content">\n%s\n</article>' % "\n".join(x for x in parts if x)
+        if rail:
+            article = '<div class="wiki-body has-rail">\n<aside class="toc-rail">%s</aside>\n%s\n</div>' % (rail, article)
+        main = self.sidebar_layout(side, article, button="Browse the " + self.module_label("wiki", c).lower(),
+                                   collapsible=not layout_opt(c, "wiki").get("bar"))
+        return self.doc(c, rel=rel, main=main, full=True, current_mod="wiki", head_extra=self.wiki_head(c, prefix), **kw)
+
+    def wiki_landing(self, c, rel, css=None, base=None, intro=None):
+        site = c["site"]
+        prefix = up(rel)
+        body = self.md(c, prefix).render(read_text(self.wiki_home_md()) if intro is None else intro)
+        parts = [body]
+        secs = [s for s in c["wiki"]["sections"] if wiki_published(s)]
+        if site.get("wiki_cards") and secs:
+            cards = []
+            for s in secs:
+                arts = wiki_published(s)
+                lis = "".join('<li><a href="%s%s">%s</a></li>' % (prefix, self.wart_rel(s["slug"], a["slug"], c), esc(a["title"]))
+                              for a in arts[:6])
+                more = ('<a class="more" href="%s%s">%d more</a>' % (prefix, self.wsec_rel(s["slug"], c), len(arts) - 6)
+                        if len(arts) > 6 else "")
+                desc = "<p>%s</p>" % esc(s["description"]) if s.get("description") else ""
+                cards.append('<div class="wiki-card"><h3><a href="%s%s">%s</a></h3>%s<ul>%s</ul>%s</div>'
+                             % (prefix, self.wsec_rel(s["slug"], c), esc(s["title"]), desc, lis, more))
+            parts.append('<h2>Sections</h2>\n<div class="wiki-cards">\n%s\n</div>' % "\n".join(cards))
+        if site.get("wiki_recent"):
+            recent = [(a, s) for s in c["wiki"]["sections"] for a in wiki_published(s)]
+            recent.sort(key=lambda x: (x[0].get("updated", ""), x[0]["title"].lower()), reverse=True)
+            if recent:
+                lis = ['<li><a href="%s%s">%s</a><span class="when">%s, %s</span></li>'
+                       % (prefix, self.wart_rel(s["slug"], a["slug"], c), esc(a["title"]), esc(s["title"]), esc(nice_date(a["updated"])))
+                       for a, s in recent[:6]]
+                parts.append('<h2>Recently updated</h2>\n<ul class="article-list">\n%s\n</ul>' % "\n".join(lis))
+        label = self.module_label("wiki", c)
+        return self.wiki_page(c, rel, self.wiki_sidebar(c, prefix, home=True), parts,
+                              body_class="mod-wiki wiki-home", title="" if rel == "index.html" else label,
+                              desc=auto_summary(body) or site.get("description"), css=css, base=base,
+                              canonical_rel="index.html" if c["home"] == "wiki" else None)
+
+    def render_section(self, c, sec, markdown, css=None, base=None):
+        rel = self.wsec_rel(sec["slug"], c)
+        prefix = up(rel)
+        intro = self.md(c, prefix).render(markdown)
+        arts = wiki_published(sec)
+        parts = [self.breadcrumbs([(self.module_label("wiki", c), prefix + self.landing_rel("wiki", c)), (sec["title"], "")]),
+                 "<h1>%s</h1>" % esc(sec["title"])]
+        if sec.get("description"):
+            parts.append('<p class="lead">%s</p>' % esc(sec["description"]))
+        parts.append(intro)
+        if arts:
+            lis = ['<li><a href="%s.html">%s</a>%s</li>' % (attr(a["slug"]), esc(a["title"]),
+                                                          "<p>%s</p>" % esc(a["description"]) if a.get("description") else "")
+                   for a in arts]
+            parts.append('<h2>Articles</h2>\n<ul class="article-list">\n%s\n</ul>' % "\n".join(lis))
+        else:
+            parts.append('<p class="empty">No articles in this section yet.</p>')
+        return self.wiki_page(c, rel, self.wiki_sidebar(c, prefix, sec["slug"]), parts,
+                              body_class="mod-wiki wiki-section sec-" + sec["slug"], title=sec["title"],
+                              desc=sec.get("description") or auto_summary(intro) or "Articles in %s." % sec["title"],
+                              css=css, base=base)
+
+    def render_article(self, c, sec, art, markdown, css=None, base=None):
+        site = c["site"]
+        rel = self.wart_rel(sec["slug"], art["slug"], c)
+        prefix = up(rel)
+        M = self.md(c, prefix)
+        body = M.render(strip_title_h1(markdown, art["title"]))
+        parts = [self.breadcrumbs([(self.module_label("wiki", c), prefix + self.landing_rel("wiki", c)),
+                                   (sec["title"], "index.html"), (art["title"], "")]),
+                 "<h1>%s</h1>" % esc(art["title"])]
+        rail = ""
+        if site.get("toc"):
+            if layout_opt(c, "wiki").get("toc") == "rail":
+                rail = self.toc_html(M.headings)
+            else:
+                parts.append(self.toc_html(M.headings))
+        parts.append(body)
+        if site.get("updated"):
+            parts.append('<p class="article-meta">Last updated <time datetime="%s">%s</time> in <a href="index.html">%s</a></p>'
+                         % (attr(art["updated"]), esc(nice_date(art["updated"])), esc(sec["title"])))
+        arts = wiki_published(sec)
+        slugs = [a["slug"] for a in arts]
+        if art["slug"] in slugs:
+            i = slugs.index(art["slug"])
+            pager = []
+            if i > 0:
+                pager.append('<a class="prev" href="%s.html"><small>Previous</small>%s</a>' % (attr(arts[i - 1]["slug"]), esc(arts[i - 1]["title"])))
+            if i + 1 < len(arts):
+                pager.append('<a class="next" href="%s.html"><small>Next</small>%s</a>' % (attr(arts[i + 1]["slug"]), esc(arts[i + 1]["title"])))
+            if pager:
+                parts.append('<nav class="pager" aria-label="More in this section">%s</nav>' % "".join(pager))
+        self._last_body = body
+        return self.wiki_page(c, rel, self.wiki_sidebar(c, prefix, sec["slug"], art["slug"]), parts,
+                              body_class="mod-wiki wiki-article sec-%s art-%s-%s" % (sec["slug"], sec["slug"], art["slug"]),
+                              title=art["title"], desc=art.get("description") or auto_summary(body), og_type="article",
+                              published=art.get("updated", ""), css=css, base=base, rail=rail)
+
+    def wiki_files(self, c):
+        files = {}
+        if self.mbase("wiki", c):
+            files[self.mbase("wiki", c) + "index.html"] = self.wiki_landing(c, self.mbase("wiki", c) + "index.html")
+        entries = []
+        for s in c["wiki"]["sections"]:
+            intro_md = read_text(self.wsec_md(s["slug"]))
+            files[self.wsec_rel(s["slug"], c)] = self.render_section(c, s, intro_md)
+            entries.append({"t": s["title"], "s": "Section", "u": self.wsec_rel(s["slug"], c), "d": s.get("description", ""),
+                            "x": plain_text(Markdown("").render(intro_md))[:2000]})
+            for a in wiki_published(s):
+                files[self.wart_rel(s["slug"], a["slug"], c)] = self.render_article(c, s, a, read_text(self.wart_md(s["slug"], a["slug"])))
+                entries.append({"t": a["title"], "s": s["title"], "u": self.wart_rel(s["slug"], a["slug"], c),
+                                "d": a.get("description", ""), "x": plain_text(self._last_body)[:SEARCH_TEXT_LIMIT]})
+        if c["site"].get("search") == "builtin":
+            data = json.dumps(entries, ensure_ascii=True, separators=(",", ":")).replace("</", "<\\/")
+            files[self.mbase("wiki", c) + "search.js"] = ("/* generated by SiteForge: search index and script */\n"
+                                                         + SEARCH_JS.replace("__INDEX__", data))
+        return files
+
+    def wiki_sitemap(self, c):
+        rows = []
+        if c["home"] != "wiki":
+            rows.append((self.landing_rel("wiki", c), ""))
+        for s in c["wiki"]["sections"]:
+            rows.append((self.wsec_rel(s["slug"], c), ""))
+            rows += [(self.wart_rel(s["slug"], a["slug"], c), a["updated"]) for a in wiki_published(s)]
+        return rows
+
+    # ---- API
+    def get_wiki_home(self):
+        return {"markdown": read_text(self.wiki_home_md())}
+
+    def save_wiki_home(self, d):
+        write_text(self.wiki_home_md(), str(d.get("markdown") or ""))
+        self.build()
+        return {"ok": True}
+
+    def add_section(self, title):
+        title = str(title or "").strip()[:120]
+        if not title:
+            raise ApiError("Give the section a name.")
+        slug = self.unique_section_slug(title)
+        self.cfg["wiki"]["sections"].append({"slug": slug, "title": title, "description": "", "articles": []})
+        write_text(self.wsec_md(slug), "")
+        self.save_cfg()
+        self.build()
+        return {"slug": slug}
+
+    def get_section(self, slug):
+        s = self.get_section_rec(slug)
+        return {"section": s, "markdown": read_text(self.wsec_md(slug))}
+
+    def save_section(self, slug, d):
+        s = self.get_section_rec(slug)
+        s["title"] = str(d.get("title") or "").strip()[:120] or s["title"]
+        s["description"] = str(d.get("description") or "").strip()[:320]
+        wanted = slugify(str(d.get("new_slug") or "")) or s["slug"]
+        if wanted != s["slug"]:
+            if wanted != self.unique_section_slug(wanted, exclude=s["slug"]):
+                raise ApiError("The address %s is already used or reserved." % wanted)
+            rename_path(self.wsec_dir(s["slug"]), self.wsec_dir(wanted))
+            s["slug"] = wanted
+        write_text(self.wsec_md(s["slug"]), str(d.get("markdown") or ""))
+        self.save_cfg()
+        self.build()
+        return {"slug": s["slug"]}
+
+    def delete_section(self, slug):
+        s = self.get_section_rec(slug)
+        self.cfg["wiki"]["sections"].remove(s)
+        self.to_trash(self.wsec_dir(slug))
+        self.save_cfg()
+        self.build()
+        return {"ok": True}
+
+    def move_section(self, slug, direction):
+        secs = self.cfg["wiki"]["sections"]
+        s = self.get_section_rec(slug)
+        i = secs.index(s)
+        secs.insert(max(0, min(len(secs) - 1, i + (1 if int(direction) > 0 else -1))), secs.pop(i))
+        self.save_cfg()
+        self.build()
+        return {"ok": True}
+
+    def order_articles(self, slug, order):
+        s = self.get_section_rec(slug)
+        by = {a["slug"]: a for a in s["articles"]}
+        s["articles"] = [by.pop(x) for x in (order if isinstance(order, list) else []) if x in by] + list(by.values())
+        self.save_cfg()
+        self.build()
+        return {"ok": True}
+
+    def get_article(self, sslug, aslug):
+        s, a = self.get_article_rec(sslug, aslug)
+        return {"section": s["slug"], "article": a, "markdown": read_text(self.wart_md(s["slug"], a["slug"]))}
+
+    def save_article(self, d):
+        title = str(d.get("title") or "").strip()[:160]
+        if not title:
+            raise ApiError("Give the article a title.")
+        target = self.find_section(str(d.get("section") or ""))
+        if not target:
+            raise ApiError("Pick a section for this article.")
+        md = str(d.get("markdown") or "")
+        wanted = slugify(str(d.get("new_slug") or "")) or slugify(title) or "article"
+        orig_sec, orig_slug = str(d.get("orig_section") or ""), str(d.get("orig_slug") or "")
+        if orig_slug:
+            osec, art = self.get_article_rec(orig_sec, orig_slug)
+            old_path = self.wart_md(osec["slug"], art["slug"])
+            changed = read_text(old_path) != md or art["title"] != title
+            same = osec is target
+            if not same or wanted != art["slug"]:
+                new_slug = self.unique_article_slug(target, wanted, exclude=art["slug"] if same else None)
+                if not same:
+                    osec["articles"].remove(art)
+                    target["articles"].append(art)
+                art["slug"] = new_slug
+            new_path = self.wart_md(target["slug"], art["slug"])
+            write_text(new_path, md)
+            if old_path != new_path and old_path.exists():
+                old_path.unlink()
+        else:
+            art = {"slug": self.unique_article_slug(target, wanted), "draft": False}
+            target["articles"].append(art)
+            changed = True
+            write_text(self.wart_md(target["slug"], art["slug"]), md)
+        art.update(title=title, description=str(d.get("description") or "").strip()[:320], draft=bool(d.get("draft")))
+        if changed or not art.get("updated"):
+            art["updated"] = today()
+        self.save_cfg()
+        self.build()
+        return {"section": target["slug"], "slug": art["slug"], "article": art}
+
+    def delete_article(self, sslug, aslug):
+        s, a = self.get_article_rec(sslug, aslug)
+        s["articles"].remove(a)
+        self.to_trash(self.wart_md(s["slug"], a["slug"]))
+        self.save_cfg()
+        self.build()
+        return {"ok": True}
+
+    def wiki_preview(self, c, p, md, css, base):
+        view = p.get("view")
+        if view == "wikihome":
+            rel = self.landing_rel("wiki", c)
+            return self.wiki_landing(c, rel, css=css, base=preview_base(rel), intro=md)
+        if view == "section":
+            sec = self.find_section(str(p.get("slug") or ""), c)
+            if not sec:
+                raise ApiError("That section does not exist.", 404)
+            sec["title"] = str(p.get("title") or "").strip() or sec["title"]
+            sec["description"] = str(p.get("description") or "").strip()
+            return self.render_section(c, sec, md, css=css, base=preview_base(self.wsec_rel(sec["slug"], c)))
+        target = self.find_section(str(p.get("section") or ""), c)
+        if not target:
+            raise ApiError("Create a wiki section first. Articles live inside sections.", 409)
+        osec = self.find_section(str(p.get("orig_section") or ""), c)
+        orig, pos = None, None
+        if osec:
+            orig = next((a for a in osec["articles"] if a["slug"] == str(p.get("orig_slug") or "")), None)
+            if orig:
+                pos = osec["articles"].index(orig) if osec is target else None
+                osec["articles"].remove(orig)
+        art = dict(orig or {})
+        art.update(slug=slugify(str(p.get("new_slug") or "")) or slugify(str(p.get("title") or "")) or "article",
+                   title=str(p.get("title") or "").strip() or "Untitled article",
+                   description=str(p.get("description") or "").strip(), draft=False, updated=art.get("updated") or today())
+        if pos is None:
+            target["articles"].append(art)
+        else:
+            target["articles"].insert(pos, art)
+        self._res = (None, None)
+        return self.render_article(c, target, art, md, css=css, base=preview_base(self.wart_rel(target["slug"], art["slug"], c)))
+
+    def wiki_preview_target(self, c, rest, css):
+        if not rest:
+            rel = self.landing_rel("wiki", c)
+            return self.wiki_landing(c, rel, css=css, base=preview_base(rel))
+        sslug, _, aslug = rest.partition("/")
+        sec = self.find_section(sslug, c)
+        if not sec:
+            return None
+        if not aslug:
+            return self.render_section(c, sec, read_text(self.wsec_md(sslug)), css=css, base=preview_base(self.wsec_rel(sslug, c)))
+        art = next((a for a in sec["articles"] if a["slug"] == aslug), None)
+        if art:
+            return self.render_article(c, sec, art, read_text(self.wart_md(sslug, aslug)), css=css,
+                                       base=preview_base(self.wart_rel(sslug, aslug, c)))
+        return None
+
+
+# ----------------------------------------------------------------------------
+# Built-in search (the only script in a generated wiki; Settings can turn it off)
+# ----------------------------------------------------------------------------
+
+SEARCH_JS = r"""(function () {
+  "use strict";
+  var INDEX = __INDEX__;
+  var box = document.querySelector(".search[data-root]");
+  var input = document.getElementById("wiki-search");
+  var list = document.getElementById("wiki-results");
+  if (!box || !input || !list) return;
+  var root = box.getAttribute("data-root") || "";
+  var active = -1, links = [];
+
+  function low(s) { return (s || "").toLowerCase(); }
+  INDEX.forEach(function (e) { e._t = low(e.t); e._s = low(e.s); e._d = low(e.d); e._x = low(e.x); });
+
+  function hits(hay, term) {
+    var n = 0, i = hay.indexOf(term);
+    while (i !== -1 && n < 25) { n++; i = hay.indexOf(term, i + term.length); }
+    return n;
+  }
+
+  function score(e, terms) {
+    var total = 0;
+    for (var i = 0; i < terms.length; i++) {
+      var t = terms[i];
+      var a = hits(e._t, t), b = hits(e._s, t), c = hits(e._d, t), d = hits(e._x, t);
+      if (!a && !b && !c && !d) return 0;
+      total += a * 25 + (e._t.indexOf(t) === 0 ? 15 : 0) + b * 5 + c * 8 + d;
+    }
+    return total;
+  }
+
+  function snippet(e, terms) {
+    var at = -1;
+    terms.forEach(function (t) { var k = e._x.indexOf(t); if (k !== -1 && (at === -1 || k < at)) at = k; });
+    if (at === -1) return e.d || e.x.slice(0, 110);
+    var start = Math.max(0, at - 35);
+    var s = e.x.slice(start, start + 110);
+    return (start > 0 ? "..." : "") + s + (start + 110 < e.x.length ? "..." : "");
+  }
+
+  function marked(el, text, terms) {
+    var l = low(text), pos = 0;
+    while (pos < text.length) {
+      var best = -1, len = 0;
+      terms.forEach(function (t) {
+        var k = l.indexOf(t, pos);
+        if (k !== -1 && (best === -1 || k < best || (k === best && t.length > len))) { best = k; len = t.length; }
+      });
+      if (best === -1) { el.appendChild(document.createTextNode(text.slice(pos))); break; }
+      if (best > pos) el.appendChild(document.createTextNode(text.slice(pos, best)));
+      var m = document.createElement("mark");
+      m.textContent = text.substr(best, len);
+      el.appendChild(m);
+      pos = best + len;
+    }
+  }
+
+  function span(cls, text, terms) {
+    var s = document.createElement("span");
+    s.className = cls;
+    if (terms) marked(s, text, terms); else s.textContent = text;
+    return s;
+  }
+
+  function render(q) {
+    var terms = low(q).split(/\s+/).filter(Boolean);
+    list.innerHTML = "";
+    active = -1;
+    links = [];
+    if (!terms.length) { list.hidden = true; return; }
+    var found = [];
+    INDEX.forEach(function (e) { var s = score(e, terms); if (s) found.push([s, e]); });
+    found.sort(function (a, b) { return b[0] - a[0] || a[1].t.localeCompare(b[1].t); });
+    if (!found.length) {
+      var li = document.createElement("li");
+      li.className = "search-empty";
+      li.textContent = "No matches";
+      list.appendChild(li);
+    }
+    found.slice(0, 12).forEach(function (r) {
+      var e = r[1];
+      var li = document.createElement("li");
+      var a = document.createElement("a");
+      a.href = root + e.u;
+      a.appendChild(span("r-title", e.t, terms));
+      a.appendChild(span("r-sec", e.s));
+      a.appendChild(span("r-snip", snippet(e, terms), terms));
+      li.appendChild(a);
+      list.appendChild(li);
+      links.push(a);
+    });
+    list.hidden = false;
+  }
+
+  function setActive(i) {
+    links.forEach(function (a, k) { a.className = k === i ? "active" : ""; });
+    active = i;
+    if (links[i]) links[i].scrollIntoView({ block: "nearest" });
+  }
+
+  input.addEventListener("input", function () { render(input.value); });
+  input.addEventListener("focus", function () { if (input.value) render(input.value); });
+  input.addEventListener("keydown", function (ev) {
+    if (ev.key === "ArrowDown") { ev.preventDefault(); if (links.length) setActive(Math.min(active + 1, links.length - 1)); }
+    else if (ev.key === "ArrowUp") { ev.preventDefault(); if (links.length) setActive(Math.max(active - 1, 0)); }
+    else if (ev.key === "Enter") { if (links.length) { ev.preventDefault(); window.location.href = links[active < 0 ? 0 : active].href; } }
+    else if (ev.key === "Escape") { input.value = ""; render(""); }
+  });
+  document.addEventListener("keydown", function (ev) {
+    var tag = (document.activeElement && document.activeElement.tagName) || "";
+    if (ev.key === "/" && !/^(INPUT|TEXTAREA|SELECT)$/.test(tag)) { ev.preventDefault(); input.focus(); }
+  });
+  document.addEventListener("click", function (ev) { if (!box.contains(ev.target)) list.hidden = true; });
+})();
+"""
+
+
+# ----------------------------------------------------------------------------
+# Library module: short stories and serials
+# ----------------------------------------------------------------------------
+
+def count_words(markdown):
+    return len(re.findall(r"[^\s]+", plain_text(Markdown("").render(str(markdown or "")))))
+
+
+def lib_visible(c):
+    return [s for s in c["library"]["stories"] if not s.get("draft")]
+
+
+def ch_visible(story):
+    return [ch for ch in story.get("chapters", []) if not ch.get("draft")]
+
+
+class LibraryMixin:
+    def lib_home_md(self):
+        return self.meta / "library" / "home.md"
+
+    def story_dir(self, s):
+        return self.meta / "library" / "stories" / s
+
+    def story_md(self, s):
+        return self.story_dir(s) / "_index.md"
+
+    def chapter_md(self, s, ch):
+        return self.story_dir(s) / (ch + ".md")
+
+    def story_rel(self, slug, c=None):
+        return self.mbase("library", c) + "%s/index.html" % slug
+
+    def chapter_rel(self, story, ch, c=None):
+        return self.mbase("library", c) + "%s/%s.html" % (story["slug"], ch["slug"])
+
+    def genre_rel(self, name, c=None):
+        return self.mbase("library", c) + "genre/%s.html" % slugify(name)
+
+    def normalize_library(self):
+        stories, seen = [], set()
+        for s in self.cfg["library"]["stories"]:
+            if not isinstance(s, dict) or not slugify(s.get("slug", "")) or s["slug"] in seen:
+                continue
+            s["slug"] = slugify(s["slug"])
+            seen.add(s["slug"])
+            s["title"] = str(s.get("title") or title_from_name(s["slug"]))
+            for k in ("subtitle", "author", "blurb", "cover", "warnings", "series", "series_no", "description"):
+                s[k] = str(s.get(k) or "")
+            s["status"] = s.get("status") if s.get("status") in STATUS_LABELS else "ongoing"
+            s["kind"] = "single" if s.get("kind") == "single" else "chaptered"
+            s["genres"] = clean_tags(s.get("genres"), limit=8)
+            s["draft"] = bool(s.get("draft"))
+            s["started"] = clean_date(s.get("started"))
+            s["completed"] = str(s.get("completed") or "")
+            chs, cseen = [], set()
+            for ch in s.get("chapters") if isinstance(s.get("chapters"), list) else []:
+                if not isinstance(ch, dict) or not slugify(ch.get("slug", "")) or ch["slug"] in cseen:
+                    continue
+                cseen.add(ch["slug"])
+                ch["title"] = str(ch.get("title") or title_from_name(ch["slug"]))
+                ch["note"] = str(ch.get("note") or "")
+                ch["draft"] = bool(ch.get("draft"))
+                ch["date"] = clean_date(ch.get("date"))
+                ch["words"] = int(ch.get("words") or 0)
+                chs.append(ch)
+            s["chapters"] = chs
+            stories.append(s)
+        self.cfg["library"]["stories"] = stories
+
+    def find_story(self, slug, c=None):
+        return next((s for s in (c or self.cfg)["library"]["stories"] if s["slug"] == slug), None)
+
+    def get_story_rec(self, slug):
+        s = self.find_story(slug)
+        if not s:
+            raise ApiError("That story does not exist.", 404)
+        return s
+
+    def get_chapter_rec(self, sslug, cslug):
+        s = self.get_story_rec(sslug)
+        ch = next((x for x in s["chapters"] if x["slug"] == cslug), None)
+        if not ch:
+            raise ApiError("That chapter does not exist.", 404)
+        return s, ch
+
+    def unique_story_slug(self, base, exclude=None):
+        base = slugify(base) or "story"
+        taken = {s["slug"] for s in self.cfg["library"]["stories"] if s["slug"] != exclude} | RESERVED
+        if self.cfg["modules"]["library"]["mount"] == "":
+            taken |= self.taken_root_names(exclude=exclude)
+        slug, n = base, 2
+        while slug in taken or (slug != exclude and self.story_dir(slug).exists()):
+            slug = "%s-%d" % (base, n)
+            n += 1
+        return slug
+
+    def unique_chapter_slug(self, story, base, exclude=None):
+        base = slugify(base) or "chapter"
+        taken = {ch["slug"] for ch in story["chapters"] if ch["slug"] != exclude} | {"index", "_index"}
+        slug, n = base, 2
+        while slug in taken or (slug != exclude and self.chapter_md(story["slug"], slug).exists()):
+            slug = "%s-%d" % (base, n)
+            n += 1
+        return slug
+
+    def lib_count_words(self, c):
+        for s in c["library"]["stories"]:
+            if s["kind"] == "single":
+                s["words"] = count_words(read_text(self.story_md(s["slug"])))
+            else:
+                s.pop("words", None)
+                for ch in s["chapters"]:
+                    ch["words"] = count_words(read_text(self.chapter_md(s["slug"], ch["slug"])))
+
+    def story_words(self, s):
+        return s.get("words", 0) if s["kind"] == "single" else sum(ch.get("words", 0) for ch in ch_visible(s))
+
+    def lib_recent(self, c, limit):
+        rows = [(s, ch) for s in lib_visible(c) for ch in ch_visible(s)]
+        rows.sort(key=lambda x: (x[1]["date"], x[1]["title"]), reverse=True)
+        return rows[:limit]
+
+    def genre_map(self, c):
+        out = {}
+        for s in lib_visible(c):
+            for g in s.get("genres", []):
+                out.setdefault(slugify(g), {"name": g, "stories": []})["stories"].append(s)
+        return dict(sorted(out.items()))
+
+    # ---- rescan
+    def lib_rescan(self):
+        base = self.meta / "library" / "stories"
+        base.mkdir(parents=True, exist_ok=True)
+        r = {"stories_added": 0, "chapters_added": 0, "chapters_removed": 0}
+        known = {s["slug"] for s in self.cfg["library"]["stories"]}
+        for d in sorted(base.iterdir(), key=lambda p: p.name.lower()):
+            if not d.is_dir() or d.is_symlink() or d.name.startswith(".") or d.name in known:
+                continue
+            slug = self.unique_story_slug(d.name, exclude=d.name if slugify(d.name) == d.name else None)
+            if slug != d.name:
+                if (base / slug).exists() and not (base / slug).samefile(d):
+                    continue
+                rename_path(d, base / slug)
+            self.cfg["library"]["stories"].append({
+                "slug": slug, "title": title_from_name(d.name), "subtitle": "", "author": "", "status": "ongoing",
+                "kind": "chaptered", "blurb": "", "cover": "", "genres": [], "warnings": "", "series": "", "series_no": "",
+                "started": today(), "completed": "", "draft": False, "description": "", "chapters": []})
+            known.add(slug)
+            r["stories_added"] += 1
+        for st in self.cfg["library"]["stories"]:
+            d = self.story_dir(st["slug"])
+            d.mkdir(parents=True, exist_ok=True)
+            chs = {ch["slug"]: ch for ch in st["chapters"]}
+            for f in sorted(md_files(d), key=lambda p: p.name.lower()):
+                if f.name == "_index.md" or f.name.startswith(".") or f.stem in chs:
+                    continue
+                orig = f.stem
+                slug = orig if slugify(orig) == orig and orig not in ("index", "_index") else None
+                if slug is None:
+                    slug = self.unique_chapter_slug(st, orig)
+                    target = self.chapter_md(st["slug"], slug)
+                    if target.exists() and not target.samefile(f):
+                        continue
+                    rename_path(f, target)
+                    f = target
+                ch = {"slug": slug, "title": first_h1(read_text(f)) or title_from_name(orig), "date": file_date(f),
+                      "draft": False, "note": "", "words": 0}
+                st["chapters"].append(ch)
+                chs[slug] = ch
+                r["chapters_added"] += 1
+            keep = [ch for ch in st["chapters"] if self.chapter_md(st["slug"], ch["slug"]).is_file()]
+            r["chapters_removed"] += len(st["chapters"]) - len(keep)
+            st["chapters"] = keep
+            if st["chapters"] and st["kind"] == "single":
+                st["kind"] = "chaptered"
+        return r
+
+    # ---- rendering
+    def lib_classes(self, c, extra):
+        site = c["site"]
+        cls = ["mod-library", "prose-" + site.get("prose", "indented")] + extra
+        if site.get("dropcap"):
+            cls.append("dropcap")
+        return " ".join(cls)
+
+    @staticmethod
+    def cover_src(story, prefix):
+        url = fix_url(story.get("cover", ""), prefix) if story.get("cover") else ""
+        return "" if url in ("", "#") else url
+
+    def story_facts(self, c, story, prefix, words=None, chapters=None):
+        site = c["site"]
+        out = ['<li><span class="tag status">%s</span></li>' % esc(STATUS_LABELS[story["status"]])]
+        for g in story.get("genres", []):
+            out.append('<li><a class="tag" href="%s%s">%s</a></li>' % (prefix, attr(self.genre_rel(g, c)), esc(g)))
+        if chapters is not None and story["kind"] == "chaptered":
+            out.append("<li>%d chapter%s</li>" % (chapters, "" if chapters == 1 else "s"))
+        if words and site.get("wordcount"):
+            out.append("<li>%s</li>" % esc(nice_words(words)))
+        if words and site.get("reading_time"):
+            out.append("<li>%s</li>" % esc(reading_time(words, site.get("wpm", 240))))
+        if story.get("series"):
+            out.append("<li>%s</li>" % esc(story["series"] + (" #%s" % story["series_no"] if story.get("series_no") else "")))
+        return '<ul class="facts">%s</ul>' % "".join(out)
+
+    def book_card(self, c, s, prefix, featured=False):
+        src = self.cover_src(s, prefix)
+        cover = ('<img class="cover" src="%s" alt="Cover of %s" loading="lazy">' % (attr(src), attr(s["title"]))
+                 if src else '<span class="cover none">%s</span>' % esc(s["title"]))
+        href = prefix + self.story_rel(s["slug"], c)
+        button = ""
+        if featured:
+            chs = ch_visible(s)
+            first = prefix + self.chapter_rel(s, chs[0], c) if s["kind"] == "chaptered" and chs else href
+            button = '<p><a class="read-button" href="%s">Start reading</a></p>\n' % attr(first)
+        return ('<article class="book%s">\n<a href="%s" tabindex="-1" aria-hidden="true">%s</a>\n<div>\n<h2><a href="%s">%s</a></h2>\n%s%s%s%s</div>\n</article>'
+                % (" featured" if featured else "", attr(href), cover, attr(href), esc(s["title"]),
+                   '<p class="subtitle">%s</p>' % esc(s["subtitle"]) if s.get("subtitle") else "",
+                   "<p>%s</p>" % esc(s["blurb"]) if s.get("blurb") else "",
+                   self.story_facts(c, s, prefix, self.story_words(s), len(ch_visible(s))), button))
+
+    def chapters_nav(self, c, story, prefix, current=None):
+        author = story.get("author") or c["site"].get("author") or ""
+        items = ['<li><a href="%s.html"%s>%s</a></li>' % (attr(ch["slug"]), ' aria-current="page"' if ch["slug"] == current else "",
+                                                        esc(ch["title"])) for ch in ch_visible(story)]
+        return ('<nav class="side chapters-nav" aria-label="Chapters">\n<a class="in-story" href="index.html">%s</a>%s\n<ol>\n%s\n</ol>\n'
+                '<a class="all-stories" href="%s%s">All stories</a>\n</nav>'
+                % (esc(story["title"]), '<span class="by">%s</span>' % esc(author) if author else "",
+                   "\n".join(items) or '<li class="nav-empty">No chapters yet.</li>', prefix, self.landing_rel("library", c)))
+
+    def lib_landing(self, c, rel, css=None, base=None, intro=None):
+        site = c["site"]
+        prefix = up(rel)
+        body = self.md(c, prefix).render(read_text(self.lib_home_md()) if intro is None else intro)
+        label = self.module_label("library", c)
+        parts = ['<main id="main" class="wide">']
+        if rel != "index.html":
+            parts.append('<h1 class="page-title">%s</h1>' % esc(label))
+        if body:
+            parts.append('<div class="prose">%s</div>' % body)
+        lay = layout_opt(c, "library")
+        cards = [self.book_card(c, s, prefix, featured=bool(lay.get("featured")) and n == 0) for n, s in enumerate(lib_visible(c))]
+        shelf_at = len(parts)
+        parts.append('<h2 class="section-title">Stories</h2>\n<div class="shelf">\n%s\n</div>' % "\n".join(cards)
+                     if cards else '<p class="empty">No stories yet.</p>')
+        if site.get("lib_updates"):
+            recent = self.lib_recent(c, 6)
+            if recent:
+                lis = ['<li><a href="%s%s">%s</a><span class="when">%s, %s</span></li>'
+                       % (prefix, self.chapter_rel(s, ch, c), esc(ch["title"]), esc(s["title"]), esc(nice_date(ch["date"])))
+                       for s, ch in recent]
+                updates = '<h2 class="section-title">Latest chapters</h2>\n<ul class="updates">\n%s\n</ul>' % "\n".join(lis)
+                if lay.get("updates_first"):
+                    parts.insert(shelf_at, updates)
+                else:
+                    parts.append(updates)
+        parts.append("</main>")
+        return self.doc(c, rel=rel, body_class=self.lib_classes(c, ["lib-home"]), title="" if rel == "index.html" else label,
+                        main="\n".join(parts), full=True, desc=auto_summary(body) or site.get("description") or site.get("tagline"),
+                        current_mod="library", css=css, base=base,
+                        canonical_rel="index.html" if c["home"] == "library" else None)
+
+    def render_story(self, c, story, markdown, css=None, base=None):
+        site = c["site"]
+        rel = self.story_rel(story["slug"], c)
+        prefix = up(rel)
+        body = self.md(c, prefix).render(markdown)
+        chs = ch_visible(story)
+        words = self.story_words(story)
+        author = story.get("author") or site.get("author") or ""
+        lay = layout_opt(c, "library")
+        src = self.cover_src(story, prefix)
+        head = ['<div class="story-head%s">' % ("" if src else " no-cover")]
+        if src:
+            head.append('<img class="cover" src="%s" alt="Cover of %s">' % (attr(src), attr(story["title"])))
+        head.append('<div class="about">\n<h1>%s</h1>' % esc(story["title"]))
+        if story.get("subtitle"):
+            head.append('<p class="subtitle">%s</p>' % esc(story["subtitle"]))
+        if author:
+            head.append('<p class="byline">by %s</p>' % esc(author))
+        head.append(self.story_facts(c, story, prefix, words, len(chs)))
+        if story.get("blurb"):
+            head.append('<p class="blurb">%s</p>' % esc(story["blurb"]))
+        if story.get("warnings"):
+            head.append('<p class="warnings"><strong>Content notes:</strong> %s</p>' % esc(story["warnings"]))
+        if story["kind"] == "chaptered" and chs:
+            head.append('<p><a class="read-button" href="%s.html">Start reading</a></p>' % attr(chs[0]["slug"]))
+        head.append("</div>\n</div>")
+        parts = list(head)
+        if story["kind"] == "single":
+            if body:
+                parts.append('<article class="prose opening">\n%s\n</article>' % body)
+                if story["status"] == "complete":
+                    parts.append('<p class="the-end">The end</p>')
+        else:
+            if body:
+                parts.append('<div class="prose foreword">%s</div>' % body)
+            if chs:
+                lis = []
+                for ch in chs:
+                    meta = ([nice_words(ch["words"])] if site.get("wordcount") and ch.get("words") else []) + [nice_date(ch["date"])]
+                    lis.append('<li><a href="%s.html"><span class="ch-title">%s</span><span class="ch-meta">%s</span></a></li>'
+                               % (attr(ch["slug"]), esc(ch["title"]), esc(" \u00b7 ".join(meta))))
+                parts.append('<section class="chapter-list">\n<h2>Chapters</h2>\n<ol>\n%s\n</ol>\n</section>' % "\n".join(lis))
+            else:
+                parts.append('<p class="empty">No chapters published yet.</p>')
+        inner = '<div class="sheet">\n%s\n</div>' % "\n".join(parts)
+        if story["kind"] == "chaptered" and lay.get("chapters") == "solo":
+            main = '<main id="main" class="solo">\n%s\n</main>' % inner
+        elif story["kind"] == "chaptered":
+            main = self.sidebar_layout(self.chapters_nav(c, story, prefix), inner, button="Chapters")
+        else:
+            main = '<main id="main" class="wrap page-main">\n%s\n</main>' % inner
+        if lay.get("backdrop"):
+            main = ('<div class="story-backdrop" aria-hidden="true">%s</div>\n%s'
+                    % ('<img src="%s" alt="">' % attr(src) if src else "", main))
+        return self.doc(c, rel=rel, body_class=self.lib_classes(c, ["lib-story", "story-" + story["slug"]]),
+                        title=story["title"], desc=story.get("description") or story.get("blurb") or auto_summary(body),
+                        main=main, full=True, og_type="article", image=story.get("cover"), current_mod="library",
+                        css=css, base=base)
+
+    def render_chapter(self, c, story, ch, markdown, css=None, base=None):
+        site = c["site"]
+        rel = self.chapter_rel(story, ch, c)
+        prefix = up(rel)
+        body = self.md(c, prefix).render(strip_title_h1(markdown, ch["title"]))
+        chs = ch_visible(story)
+        slugs = [x["slug"] for x in chs]
+        n = slugs.index(ch["slug"]) + 1 if ch["slug"] in slugs else 0
+        meta = ["Chapter %d of %d" % (n, len(chs))] if n else []
+        if site.get("wordcount") and ch.get("words"):
+            meta.append(nice_words(ch["words"]))
+        if site.get("reading_time") and ch.get("words"):
+            meta.append(reading_time(ch["words"], site.get("wpm", 240)))
+        meta.append(nice_date(ch["date"]))
+        parts = ['<header class="chapter-head">\n<span class="in"><a href="index.html">%s</a></span>\n<h1>%s</h1>\n<p class="meta">%s</p>\n</header>'
+                 % (esc(story["title"]), esc(ch["title"]), esc(" \u00b7 ".join(meta))),
+                 '<article class="prose opening">\n%s\n</article>' % body]
+        if ch.get("note"):
+            parts.append('<aside class="note prose">\n<h2>Author\u2019s note</h2>\n%s\n</aside>' % Markdown(prefix).render(ch["note"]))
+        if n and n == len(chs) and story["status"] == "complete":
+            parts.append('<p class="the-end">The end</p>')
+        lay = layout_opt(c, "library")
+        pager = []
+        if n > 1:
+            pager.append('<a class="prev" href="%s.html"><small>Previous</small>%s</a>' % (attr(chs[n - 2]["slug"]), esc(chs[n - 2]["title"])))
+        if lay.get("pager_top"):
+            pager.append('<a class="index" href="index.html"><small>Story</small>Contents</a>')
+        if n and n < len(chs):
+            pager.append('<a class="next" href="%s.html"><small>Next</small>%s</a>' % (attr(chs[n]["slug"]), esc(chs[n]["title"])))
+        if pager:
+            parts.append('<nav class="pager" aria-label="Chapters">%s</nav>' % "".join(pager))
+            if lay.get("pager_top"):
+                parts.insert(0, '<nav class="pager top" aria-label="Chapters">%s</nav>' % "".join(pager))
+        if lay.get("chapters") == "solo":
+            drop = ""
+            if lay.get("drop"):
+                drop = ('<details class="contents-drop" data-drop><summary>Contents</summary>\n%s\n</details>\n'
+                        % self.chapters_nav(c, story, prefix, ch["slug"]))
+            main = '<main id="main" class="solo">\n<div class="sheet">\n%s%s\n</div>\n</main>' % (drop, "\n".join(parts))
+        else:
+            main = self.sidebar_layout(self.chapters_nav(c, story, prefix, ch["slug"]),
+                                       '<div class="sheet">\n%s\n</div>' % "\n".join(parts), button="Chapters")
+        return self.doc(c, rel=rel, body_class=self.lib_classes(c, ["lib-chapter", "story-" + story["slug"], "chapter-" + ch["slug"]]),
+                        title="%s | %s" % (ch["title"], story["title"]), desc=auto_summary(body) or story.get("blurb", ""),
+                        main=main, full=True, og_type="article", published=ch["date"], image=story.get("cover"),
+                        current_mod="library", css=css, base=base)
+
+    def render_genre(self, c, name, stories, css=None, base=None):
+        rel = self.genre_rel(name, c)
+        prefix = up(rel)
+        main = ('<main id="main" class="wide">\n<h1 class="page-title">%s</h1>\n<div class="shelf">\n%s\n</div>\n'
+                '<p><a href="%s%s">All stories</a></p>\n</main>'
+                % (esc(name), "\n".join(self.book_card(c, s, prefix) for s in stories), prefix, self.landing_rel("library", c)))
+        return self.doc(c, rel=rel, body_class=self.lib_classes(c, ["lib-genre", "genre-" + slugify(name)]), title=name,
+                        desc="Stories tagged %s." % name, main=main, full=True, current_mod="library", css=css, base=base)
+
+    def lib_files(self, c):
+        files = {}
+        mb = self.mbase("library", c)
+        if mb:
+            files[mb + "index.html"] = self.lib_landing(c, mb + "index.html")
+        for s in lib_visible(c):
+            files[self.story_rel(s["slug"], c)] = self.render_story(c, s, read_text(self.story_md(s["slug"])))
+            for ch in ch_visible(s):
+                files[self.chapter_rel(s, ch, c)] = self.render_chapter(c, s, ch, read_text(self.chapter_md(s["slug"], ch["slug"])))
+        for g in self.genre_map(c).values():
+            files[self.genre_rel(g["name"], c)] = self.render_genre(c, g["name"], g["stories"])
+        site = c["site"]
+        if mb and site.get("feeds") and site.get("url"):
+            files[mb + "rss.xml"] = self.feed_xml(c, self.feed_items(c, blog=False, library=True),
+                                                  "%s: %s" % (site["title"], self.module_label("library", c)), mb + "rss.xml")
+        return files
+
+    def lib_sitemap(self, c):
+        rows = [] if c["home"] == "library" else [(self.landing_rel("library", c), "")]
+        for s in lib_visible(c):
+            rows.append((self.story_rel(s["slug"], c), ""))
+            rows += [(self.chapter_rel(s, ch, c), ch["date"]) for ch in ch_visible(s)]
+        rows += [(self.genre_rel(g["name"], c), "") for g in self.genre_map(c).values()]
+        return rows
+
+    # ---- API
+    def get_lib_home(self):
+        return {"markdown": read_text(self.lib_home_md())}
+
+    def save_lib_home(self, d):
+        write_text(self.lib_home_md(), str(d.get("markdown") or ""))
+        self.build()
+        return {"ok": True}
+
+    def add_story(self, d):
+        title = str(d.get("title") or "").strip()[:160]
+        if not title:
+            raise ApiError("Give the story a title.")
+        slug = self.unique_story_slug(title)
+        self.cfg["library"]["stories"].append({
+            "slug": slug, "title": title, "subtitle": "", "author": "", "status": "ongoing",
+            "kind": "single" if d.get("kind") == "single" else "chaptered", "blurb": "", "cover": "", "genres": [],
+            "warnings": "", "series": "", "series_no": "", "started": today(), "completed": "", "draft": False,
+            "description": "", "chapters": []})
+        write_text(self.story_md(slug), "")
+        self.save_cfg()
+        self.build()
+        return {"slug": slug}
+
+    def get_story(self, slug):
+        s = self.get_story_rec(slug)
+        return {"story": s, "markdown": read_text(self.story_md(slug))}
+
+    def save_story(self, slug, d):
+        s = self.get_story_rec(slug)
+        s["title"] = str(d.get("title") or "").strip()[:160] or s["title"]
+        for k, limit in (("subtitle", 200), ("author", 120), ("blurb", 600), ("cover", 400), ("warnings", 400),
+                         ("series", 120), ("series_no", 12), ("description", 320)):
+            if k in d:
+                s[k] = str(d.get(k) or "").strip()[:limit]
+        if d.get("status") in STATUS_LABELS:
+            s["status"] = d["status"]
+        if d.get("kind") in ("single", "chaptered"):
+            if d["kind"] == "single" and s["chapters"]:
+                raise ApiError("This story has chapters, so it cannot become a single piece. Delete the chapters first.")
+            s["kind"] = d["kind"]
+        if "genres" in d:
+            known = {g for st in self.cfg["library"]["stories"] for g in st.get("genres", [])}
+            s["genres"] = clean_tags(d.get("genres"), known, limit=8)
+        if "draft" in d:
+            s["draft"] = bool(d["draft"])
+        if "started" in d:
+            s["started"] = clean_date(d.get("started"))
+        if "completed" in d:
+            done = str(d.get("completed") or "").strip()
+            s["completed"] = clean_date(done) if done else ""
+        wanted = slugify(str(d.get("new_slug") or "")) or s["slug"]
+        if wanted != s["slug"]:
+            if wanted != self.unique_story_slug(wanted, exclude=s["slug"]):
+                raise ApiError("The address %s is already used or reserved." % wanted)
+            rename_path(self.story_dir(s["slug"]), self.story_dir(wanted))
+            s["slug"] = wanted
+        write_text(self.story_md(s["slug"]), str(d.get("markdown") or ""))
+        self.save_cfg()
+        self.build()
+        return {"slug": s["slug"]}
+
+    def delete_story(self, slug):
+        s = self.get_story_rec(slug)
+        self.cfg["library"]["stories"].remove(s)
+        self.to_trash(self.story_dir(slug))
+        self.save_cfg()
+        self.build()
+        return {"ok": True}
+
+    def move_story(self, slug, direction):
+        items = self.cfg["library"]["stories"]
+        s = self.get_story_rec(slug)
+        i = items.index(s)
+        items.insert(max(0, min(len(items) - 1, i + (1 if int(direction) > 0 else -1))), items.pop(i))
+        self.save_cfg()
+        self.build()
+        return {"ok": True}
+
+    def order_chapters(self, slug, order):
+        s = self.get_story_rec(slug)
+        by = {ch["slug"]: ch for ch in s["chapters"]}
+        s["chapters"] = [by.pop(x) for x in (order if isinstance(order, list) else []) if x in by] + list(by.values())
+        self.save_cfg()
+        self.build()
+        return {"ok": True}
+
+    def get_chapter(self, sslug, cslug):
+        s, ch = self.get_chapter_rec(sslug, cslug)
+        return {"story": s["slug"], "chapter": ch, "markdown": read_text(self.chapter_md(s["slug"], ch["slug"]))}
+
+    def save_chapter(self, d):
+        title = str(d.get("title") or "").strip()[:160]
+        if not title:
+            raise ApiError("Give the chapter a title.")
+        target = self.find_story(str(d.get("story") or ""))
+        if not target:
+            raise ApiError("Pick a story for this chapter.")
+        if target["kind"] == "single":
+            raise ApiError("%s is a single piece. Change it to chaptered in the story editor first." % target["title"])
+        md = str(d.get("markdown") or "")
+        wanted = slugify(str(d.get("new_slug") or "")) or slugify(title) or "chapter"
+        orig_story, orig_slug = str(d.get("orig_story") or ""), str(d.get("orig_slug") or "")
+        if orig_slug:
+            ostory, ch = self.get_chapter_rec(orig_story, orig_slug)
+            old_path = self.chapter_md(ostory["slug"], ch["slug"])
+            same = ostory is target
+            if not same or wanted != ch["slug"]:
+                new_slug = self.unique_chapter_slug(target, wanted, exclude=ch["slug"] if same else None)
+                if not same:
+                    ostory["chapters"].remove(ch)
+                    target["chapters"].append(ch)
+                ch["slug"] = new_slug
+            new_path = self.chapter_md(target["slug"], ch["slug"])
+            write_text(new_path, md)
+            if old_path != new_path and old_path.exists():
+                old_path.unlink()
+        else:
+            ch = {"slug": self.unique_chapter_slug(target, wanted), "date": today(), "draft": False, "note": "", "words": 0}
+            target["chapters"].append(ch)
+            write_text(self.chapter_md(target["slug"], ch["slug"]), md)
+        ch["title"] = title
+        ch["note"] = str(d.get("note") or "")[:4000]
+        ch["draft"] = bool(d.get("draft"))
+        if d.get("date"):
+            ch["date"] = clean_date(d.get("date"))
+        ch["words"] = count_words(md)
+        self.save_cfg()
+        self.build()
+        return {"story": target["slug"], "slug": ch["slug"], "chapter": ch}
+
+    def delete_chapter(self, sslug, cslug):
+        s, ch = self.get_chapter_rec(sslug, cslug)
+        s["chapters"].remove(ch)
+        self.to_trash(self.chapter_md(s["slug"], ch["slug"]))
+        self.save_cfg()
+        self.build()
+        return {"ok": True}
+
+    def lib_preview(self, c, p, md, css, base):
+        view = p.get("view")
+        if view == "libhome":
+            rel = self.landing_rel("library", c)
+            return self.lib_landing(c, rel, css=css, base=preview_base(rel), intro=md)
+        if view == "story":
+            s = self.find_story(str(p.get("slug") or ""), c)
+            if not s:
+                raise ApiError("That story does not exist.", 404)
+            for k in ("title", "subtitle", "author", "blurb", "cover", "warnings", "series", "series_no"):
+                if k in p:
+                    s[k] = str(p.get(k) or "").strip()
+            if p.get("status") in STATUS_LABELS:
+                s["status"] = p["status"]
+            if p.get("kind") in ("single", "chaptered") and not (p["kind"] == "single" and s["chapters"]):
+                s["kind"] = p["kind"]
+            if "genres" in p:
+                s["genres"] = clean_tags(p.get("genres"), limit=8)
+            s["draft"] = False
+            if s["kind"] == "single":
+                s["words"] = count_words(md)
+            return self.render_story(c, s, md, css=css, base=preview_base(self.story_rel(s["slug"], c)))
+        target = self.find_story(str(p.get("story") or ""), c)
+        if not target:
+            raise ApiError("Create a story first. Chapters live inside stories.", 409)
+        ostory = self.find_story(str(p.get("orig_story") or ""), c)
+        orig, pos = None, None
+        if ostory:
+            orig = next((x for x in ostory["chapters"] if x["slug"] == str(p.get("orig_slug") or "")), None)
+            if orig:
+                pos = ostory["chapters"].index(orig) if ostory is target else None
+                ostory["chapters"].remove(orig)
+        ch = dict(orig or {})
+        ch.update(slug=slugify(str(p.get("new_slug") or "")) or slugify(str(p.get("title") or "")) or "chapter",
+                  title=str(p.get("title") or "").strip() or "Untitled chapter", note=str(p.get("note") or ""), draft=False,
+                  date=clean_date(p.get("date") or ch.get("date")), words=count_words(md))
+        if pos is None:
+            target["chapters"].append(ch)
+        else:
+            target["chapters"].insert(pos, ch)
+        target["kind"] = "chaptered"
+        return self.render_chapter(c, target, ch, md, css=css, base=preview_base(self.chapter_rel(target, ch, c)))
+
+    def lib_preview_target(self, c, rest, css):
+        if not rest:
+            rel = self.landing_rel("library", c)
+            return self.lib_landing(c, rel, css=css, base=preview_base(rel))
+        sslug, _, cslug = rest.partition("/")
+        s = self.find_story(sslug, c)
+        if not s:
+            return None
+        self.lib_count_words(c)
+        if not cslug:
+            return self.render_story(c, s, read_text(self.story_md(sslug)), css=css, base=preview_base(self.story_rel(sslug, c)))
+        ch = next((x for x in s["chapters"] if x["slug"] == cslug), None)
+        if ch:
+            return self.render_chapter(c, s, ch, read_text(self.chapter_md(sslug, cslug)), css=css,
+                                       base=preview_base(self.chapter_rel(s, ch, c)))
+        return None
+
+
+# ----------------------------------------------------------------------------
+# Importing sites made with SiteGen, WikiGen or StoryGen
+#
+# The source folder is only read. Markdown is copied as text (never as symlinks), slugs are
+# re-checked, and anything that clashes with existing content gets a new address, which the
+# summary reports. Generated .html in the source folder is ignored; everything is rebuilt.
+# ----------------------------------------------------------------------------
+
+IMPORT_KINDS = {".sitegen": "sitegen", ".wikigen": "wikigen", ".storygen": "storygen", ".podcastgen": "podcastgen"}
+
+
+def detect_import(path):
+    root = Path(str(path or "")).expanduser()
+    for d, kind in IMPORT_KINDS.items():
+        f = root / d / "config.json"
+        if f.is_file():
+            try:
+                cfg = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                raise ApiError("%s exists but is not valid JSON." % f)
+            if not isinstance(cfg, dict):
+                raise ApiError("%s is not a site settings file." % f)
+            return kind, root, cfg
+    raise ApiError("No SiteGen, WikiGen, StoryGen or PodcastGen site found in %s. Pick the folder that contains the "
+                   "hidden .sitegen, .wikigen, .storygen or .podcastgen folder." % root)
+
+
+IMPORT_RENAMES = {}
+
+
+def src_text(path):
+    """Read a markdown file from the source, refusing symlinks and anything that is not a file.
+    References to assets that were renamed on the way in are rewritten."""
+    p = Path(path)
+    if p.is_symlink() or not p.is_file():
+        return ""
+    text = read_text(p)
+    for old, new in IMPORT_RENAMES.items():
+        text = re.sub(r"(assets/)%s(?![\w.-])" % re.escape(old), lambda m, n=new: m.group(1) + n, text)
+    return text
+
+
+class ImportMixin:
+    def import_site(self, d):
+        kind, src, scfg = detect_import(d.get("path"))
+        if src.resolve() == self.root.resolve():
+            raise ApiError("That is this site's own folder.")
+        report = {"kind": kind, "notes": []}
+        # Assets first, so Markdown read during the import can point at any renamed copies.
+        copied, renames = self._import_assets(src)
+        IMPORT_RENAMES.clear()
+        IMPORT_RENAMES.update(renames)
+        try:
+            if kind == "sitegen":
+                self._import_sitegen(src, scfg, report, bool(d.get("settings")))
+            elif kind == "wikigen":
+                self._import_wikigen(src, scfg, report, bool(d.get("settings")))
+            elif kind == "podcastgen":
+                self._import_podcastgen(src, scfg, report, bool(d.get("settings")))
+            else:
+                self._import_storygen(src, scfg, report, bool(d.get("settings")))
+        finally:
+            IMPORT_RENAMES.clear()
+        if d.get("settings"):
+            self._import_layout(kind, scfg, report)
+        if copied:
+            report["notes"].append("Copied %d file(s) from assets/." % copied)
+        for old, new in sorted(renames.items()):
+            report["notes"].append("assets/%s was already taken by a different file, so it came over as "
+                                   "assets/%s. Links in the imported text were updated; check covers, logos "
+                                   "and other settings that name it." % (old, new))
+        old_css = src / "style.css"
+        if old_css.is_file() and not old_css.is_symlink():
+            dest = self.meta / "imported" / ("%s-style.css" % kind)
+            write_text(dest, read_text(old_css))
+            report["notes"].append("Your old stylesheet was saved to %s for reference; it is not applied." % dest)
+        home = d.get("home")
+        if home in MODULES and self.enabled(home):
+            self.cfg["home"] = home
+            if home in ROOT_MOUNTABLE and d.get("root_mount"):
+                self.cfg["modules"][home]["mount"] = ""
+        self.normalize()
+        pending = report.pop("_podcastgen", None)
+        if pending:
+            self._finish_podcastgen(pending, report)
+        self.save_cfg()
+        self.build()
+        report["state"] = self.state()
+        return report
+
+    def _import_layout(self, kind, scfg, report):
+        """Carry the layout the old tool used over to the matching SiteForge layout."""
+        old = str((scfg.get("site") or {}).get("layout") or "") if isinstance(scfg, dict) else ""
+        site = self.cfg["site"]
+        if old in SPECIAL_LAYOUTS:
+            site["layout"] = old
+            site["secure"] = clean_portal((scfg.get("site") or {}).get("secure"))
+            site["frame"] = clean_frame((scfg.get("site") or {}).get("frame"))
+            report["notes"].append("Matched the %s layout it used, with its settings."
+                                   % LAYOUTS["site"][old]["label"])
+            return
+        if kind == "sitegen" and old in ("sidebar", "magazine", "journal", "landing"):
+            site["layout"] = old
+            site["blog_layout"] = {"magazine": "magazine", "journal": "archive", "landing": "cards"}.get(old, "list")
+        elif kind == "wikigen" and old in ("docs", "handbook", "portal"):
+            site["wiki_layout"] = "right" if old == "portal" else old
+        elif kind == "storygen" and old in LAYOUTS["library"] and old != "classic":
+            site["lib_layout"] = old
+        else:
+            return
+        report["notes"].append("Matched the %s layout it used." % old.title())
+
+    def _copy_site_settings(self, s, keys):
+        for k in keys:
+            if k in s and s[k] not in (None, ""):
+                self.cfg["site"][k] = s[k]
+        if isinstance(s.get("brand"), dict):
+            self.cfg["site"]["brand"] = clean_brand(s["brand"])
+
+    def _import_assets(self, src):
+        """Copy assets/ over. A file whose name is taken by a different file is copied under a
+        new name, and IMPORT_RENAMES carries old to new so src_text() rewrites references in the
+        Markdown it reads. Returns (files copied, renames)."""
+        a = src / "assets"
+        if not a.is_dir() or a.is_symlink():
+            return 0, {}
+        n, renames = 0, {}
+        dest = self.root / "assets"
+        dest.mkdir(exist_ok=True)
+        for f in sorted(a.iterdir()):
+            if not f.is_file() or f.is_symlink() or f.name.startswith("."):
+                continue
+            target = dest / f.name
+            if target.exists():
+                if target.is_file() and filecmp.cmp(f, target, shallow=False):
+                    continue
+                stem, ext, i = Path(f.name).stem, Path(f.name).suffix, 2
+                while (dest / ("%s-%d%s" % (stem, i, ext))).exists():
+                    i += 1
+                target = dest / ("%s-%d%s" % (stem, i, ext))
+                renames[f.name] = target.name
+            shutil.copy2(f, target, follow_symlinks=False)
+            n += 1
+        fonts = a / "fonts"
+        if fonts.is_dir() and not fonts.is_symlink():
+            (dest / "fonts").mkdir(exist_ok=True)
+            for f in sorted(fonts.iterdir()):
+                if (f.is_file() and not f.is_symlink() and f.suffix.lower() in FONT_EXT
+                        and not (dest / "fonts" / f.name).exists()):
+                    shutil.copy2(f, dest / "fonts" / f.name, follow_symlinks=False)
+                    n += 1
+        return n, renames
+
+    def _new_page_slug(self, wanted):
+        taken = self.taken_root_names()
+        slug, n = wanted, 2
+        while slug in taken:
+            slug = "%s-%d" % (wanted, n)
+            n += 1
+        return slug
+
+    def _import_sitegen(self, src, scfg, report, settings):
+        meta = src / ".sitegen"
+        s = scfg.get("site") if isinstance(scfg.get("site"), dict) else {}
+        if settings:
+            self._copy_site_settings(s, ("title", "tagline", "author", "footer", "lang", "url", "description", "image",
+                                         "twitter", "noindex", "sitemap"))
+            if s.get("rss"):
+                self.cfg["site"]["feeds"] = True
+        pages = posts = 0
+        for p in scfg.get("pages") if isinstance(scfg.get("pages"), list) else []:
+            if not isinstance(p, dict) or not slugify(str(p.get("slug", ""))):
+                continue
+            slug = "index" if p.get("slug") == "index" else slugify(p["slug"])
+            text = src_text(meta / "pages" / (slug + ".md"))
+            seo = {k: p.get(k) for k in ("seo_title", "description", "image", "canonical", "noindex") if k in p}
+            if p.get("kind") == "home" or slug == "index":
+                write_text(self.page_md("index"), text)
+                seo_fields(seo, self.find_page("index"))
+            elif p.get("kind") == "blog":
+                self.enable_module("blog")
+                self.cfg["modules"]["blog"]["label"] = str(p.get("title") or "Blog")[:40]
+                write_text(self.blog_intro_md(), text)
+            else:
+                new = self._new_page_slug(slug)
+                if new != slug:
+                    report["notes"].append("Page %s was renamed to %s because the name was taken." % (slug, new))
+                rec = {"slug": new, "title": str(p.get("title") or title_from_name(new)), "show_title": bool(p.get("show_title", True))}
+                seo_fields(seo, rec)
+                self.cfg["pages"].append(rec)
+                write_text(self.page_md(new), text)
+                pages += 1
+        existing = {p["slug"] for p in self.cfg["posts"]}
+        for p in scfg.get("posts") if isinstance(scfg.get("posts"), list) else []:
+            if not isinstance(p, dict) or not slugify(str(p.get("slug", ""))):
+                continue
+            self.enable_module("blog")
+            slug = base = slugify(p["slug"])
+            n = 2
+            while slug in existing:
+                slug = "%s-%d" % (base, n)
+                n += 1
+            existing.add(slug)
+            published = p.get("status") == "published"
+            text = src_text(meta / ("posts" if published else "drafts") / (p["slug"] + ".md")) or \
+                src_text(meta / ("drafts" if published else "posts") / (p["slug"] + ".md"))
+            rec = {"slug": slug, "title": str(p.get("title") or title_from_name(slug)), "date": clean_date(p.get("date")),
+                   "summary": str(p.get("summary") or ""), "tags": clean_tags(p.get("tags")),
+                   "status": "published" if published else "draft"}
+            seo_fields({k: p.get(k) for k in ("seo_title", "description", "image", "canonical", "noindex") if k in p}, rec)
+            self.cfg["posts"].append(rec)
+            write_text(self.post_md(slug), text)
+            posts += 1
+        links = 0
+        for n_ in scfg.get("nav") if isinstance(scfg.get("nav"), list) else []:
+            if isinstance(n_, dict) and n_.get("type") == "link" and str(n_.get("url") or "").strip():
+                self.cfg["nav"].append({"type": "link", "label": str(n_.get("label") or "Link")[:60],
+                                        "url": str(n_["url"])[:400], "visible": bool(n_.get("visible", True))})
+                links += 1
+        report["notes"].insert(0, "Imported %d page(s), %d post(s) and %d menu link(s) from SiteGen." % (pages, posts, links))
+
+    def _copy_tree_md(self, src_dir, dest_dir):
+        n = 0
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        if not src_dir.is_dir() or src_dir.is_symlink():
+            return 0
+        for f in sorted(src_dir.glob("*.md")):
+            if f.is_file() and not f.is_symlink() and not f.name.startswith("."):
+                write_text(dest_dir / f.name, read_text(f))
+                n += 1
+        return n
+
+    def _import_wikigen(self, src, scfg, report, settings):
+        meta = src / ".wikigen"
+        self.enable_module("wiki")
+        s = scfg.get("site") if isinstance(scfg.get("site"), dict) else {}
+        if settings:
+            self._copy_site_settings(s, ("title", "tagline", "author", "footer", "lang", "url", "description", "noindex", "sitemap"))
+        for k, dest in (("search", "search"), ("toc", "toc"), ("updated", "updated"), ("expand", "expand"),
+                        ("home_sections", "wiki_cards"), ("home_recent", "wiki_recent")):
+            if k in s:
+                self.cfg["site"][dest] = s[k]
+        text = src_text(meta / "home.md")
+        if text:
+            write_text(self.wiki_home_md(), text)
+        secs = arts = 0
+        for sec in scfg.get("sections") if isinstance(scfg.get("sections"), list) else []:
+            if not isinstance(sec, dict) or not slugify(str(sec.get("slug", ""))):
+                continue
+            old = slugify(sec["slug"])
+            new = self.unique_section_slug(old)
+            if new != old:
+                report["notes"].append("Wiki section %s was renamed to %s because the name was taken." % (old, new))
+            self._copy_tree_md(meta / "sections" / sec["slug"], self.wsec_dir(new))
+            rec = {"slug": new, "title": str(sec.get("title") or title_from_name(new)), "description": str(sec.get("description") or ""),
+                   "articles": []}
+            for a in sec.get("articles") if isinstance(sec.get("articles"), list) else []:
+                if isinstance(a, dict) and slugify(str(a.get("slug", ""))) and self.wart_md(new, slugify(a["slug"])).is_file():
+                    rec["articles"].append({"slug": slugify(a["slug"]), "title": str(a.get("title") or ""),
+                                            "description": str(a.get("description") or ""), "draft": bool(a.get("draft")),
+                                            "updated": clean_date(a.get("updated"))})
+                    arts += 1
+            self.cfg["wiki"]["sections"].append(rec)
+            secs += 1
+        self.normalize_wiki()
+        extra = self.wiki_rescan()
+        report["notes"].insert(0, "Imported %d wiki section(s) and %d article(s) from WikiGen%s." % (
+            secs, arts + extra.get("wiki_articles_added", 0),
+            "" if not extra.get("wiki_articles_added") else ", including %d file(s) found on disk" % extra["wiki_articles_added"]))
+
+    def _import_storygen(self, src, scfg, report, settings):
+        meta = src / ".storygen"
+        self.enable_module("library")
+        s = scfg.get("site") if isinstance(scfg.get("site"), dict) else {}
+        if settings:
+            self._copy_site_settings(s, ("title", "tagline", "author", "footer", "lang", "url", "description", "noindex", "sitemap"))
+            if s.get("rss"):
+                self.cfg["site"]["feeds"] = True
+        for k, dest in (("prose", "prose"), ("dropcap", "dropcap"), ("wordcount", "wordcount"),
+                        ("reading_time", "reading_time"), ("wpm", "wpm"), ("updates", "lib_updates")):
+            if k in s:
+                self.cfg["site"][dest] = s[k]
+        text = src_text(meta / "home.md")
+        if text:
+            write_text(self.lib_home_md(), text)
+        pages = 0
+        for p in scfg.get("pages") if isinstance(scfg.get("pages"), list) else []:
+            if isinstance(p, dict) and slugify(str(p.get("slug", ""))):
+                new = self._new_page_slug(slugify(p["slug"]))
+                self.cfg["pages"].append({"slug": new, "title": str(p.get("title") or title_from_name(new)), "show_title": True,
+                                          "description": str(p.get("description") or "")})
+                write_text(self.page_md(new), src_text(meta / "pages" / (p["slug"] + ".md")))
+                pages += 1
+        stories = chapters = 0
+        for st in scfg.get("stories") if isinstance(scfg.get("stories"), list) else []:
+            if not isinstance(st, dict) or not slugify(str(st.get("slug", ""))):
+                continue
+            old = slugify(st["slug"])
+            new = self.unique_story_slug(old)
+            if new != old:
+                report["notes"].append("Story %s was renamed to %s because the name was taken." % (old, new))
+            self._copy_tree_md(meta / "stories" / st["slug"], self.story_dir(new))
+            rec = {k: st.get(k) for k in ("title", "subtitle", "author", "status", "kind", "blurb", "cover", "genres", "warnings",
+                                          "series", "series_no", "started", "completed", "draft", "description")}
+            rec["slug"] = new
+            rec["chapters"] = []
+            for ch in st.get("chapters") if isinstance(st.get("chapters"), list) else []:
+                if isinstance(ch, dict) and slugify(str(ch.get("slug", ""))) and self.chapter_md(new, slugify(ch["slug"])).is_file():
+                    rec["chapters"].append({"slug": slugify(ch["slug"]), "title": str(ch.get("title") or ""),
+                                            "date": clean_date(ch.get("date")), "draft": bool(ch.get("draft")),
+                                            "note": str(ch.get("note") or "")})
+                    chapters += 1
+            self.cfg["library"]["stories"].append(rec)
+            stories += 1
+        self.normalize_library()
+        self.lib_rescan()
+        report["notes"].insert(0, "Imported %d stor%s, %d chapter(s) and %d page(s) from StoryGen." % (
+            stories, "y" if stories == 1 else "ies", chapters, pages))
+
+
+# ----------------------------------------------------------------------------
+# Podcast module
+#
+# A show page, one page per episode and an RSS feed that podcast apps and directories read.
+# Directories pull the feed; nothing is pushed to them. Audio is an upload kept in
+# <podcast>/audio/ that a build never deletes. ffprobe and ffmpeg are optional: they measure,
+# normalize and encode, and without them MP3 and M4A files are used exactly as they are.
+# ----------------------------------------------------------------------------
+
+PODCAST_GUID_NS = uuid.UUID("ead4c236-bf58-58c6-a2c6-a6b28d128cb6")
+PODCAST_INDEX_PING = "https://api.podcastindex.org/api/1.0/hub/pubnotify?url="
+WEBSUB_HUB = "https://pubsubhubbub.appspot.com/"
+CLOUDFLARE_TERMS = "https://www.cloudflare.com/service-specific-terms-application-services/"
+PODCAST_FEED_NS = ('xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" '
+                   'xmlns:content="http://purl.org/rss/1.0/modules/content/" '
+                   'xmlns:atom="http://www.w3.org/2005/Atom" '
+                   'xmlns:podcast="https://podcastindex.org/namespace/1.0"')
+PODCAST_ABOUT_MD = "Tell listeners what the show is about, who makes it and how often new episodes come out.\n"
+
+# Apple's category list, as the feed writes it. A show has a primary and an optional
+# secondary category, each with an optional subcategory.
+APPLE_CATEGORIES = [
+    ("Arts", ["Books", "Design", "Fashion & Beauty", "Food", "Performing Arts", "Visual Arts"]),
+    ("Business", ["Careers", "Entrepreneurship", "Investing", "Management", "Marketing", "Non-Profit"]),
+    ("Comedy", ["Comedy Interviews", "Improv", "Stand-Up"]),
+    ("Education", ["Courses", "How To", "Language Learning", "Self-Improvement"]),
+    ("Fiction", ["Comedy Fiction", "Drama", "Science Fiction"]),
+    ("Government", []),
+    ("Health & Fitness", ["Alternative Health", "Fitness", "Medicine", "Mental Health", "Nutrition", "Sexuality"]),
+    ("History", []),
+    ("Kids & Family", ["Education for Kids", "Parenting", "Pets & Animals", "Stories for Kids"]),
+    ("Leisure", ["Animation & Manga", "Automotive", "Aviation", "Crafts", "Games", "Hobbies", "Home & Garden",
+                 "Video Games"]),
+    ("Music", ["Music Commentary", "Music History", "Music Interviews"]),
+    ("News", ["Business News", "Daily News", "Entertainment News", "News Commentary", "Politics", "Sports News",
+              "Tech News"]),
+    ("Religion & Spirituality", ["Buddhism", "Christianity", "Hinduism", "Islam", "Judaism", "Religion",
+                                 "Spirituality"]),
+    ("Science", ["Astronomy", "Chemistry", "Earth Sciences", "Life Sciences", "Mathematics", "Natural Sciences",
+                 "Nature", "Physics", "Social Sciences"]),
+    ("Society & Culture", ["Documentary", "Personal Journals", "Philosophy", "Places & Travel", "Relationships"]),
+    ("Sports", ["Baseball", "Basketball", "Cricket", "Fantasy Sports", "Football", "Golf", "Hockey", "Rugby",
+                "Running", "Soccer", "Swimming", "Tennis", "Volleyball", "Wilderness", "Wrestling"]),
+    ("Technology", []),
+    ("True Crime", []),
+    ("TV & Film", ["After Shows", "Film History", "Film Interviews", "Film Reviews", "TV Reviews"]),
+]
+APPLE_CATEGORY_MAP = dict(APPLE_CATEGORIES)
+
+# The one-time directory submissions, in the order they are best done. The listing URL pasted
+# back for a row becomes a subscribe link on the show page.
+DIRECTORIES = [
+    {"id": "apple", "name": "Apple Podcasts", "where": "Podcasts Connect", "url": "https://podcastsconnect.apple.com/",
+     "needs": "An Apple Account with two-factor authentication. Choose +, New Show, then Add a show with an RSS "
+              "feed. Do this one first: Overcast and other apps take their shows from Apple's directory."},
+    {"id": "spotify", "name": "Spotify", "where": "Spotify for Creators", "url": "https://creators.spotify.com/",
+     "needs": "Any Spotify account. Add a new show, Find an existing show, Somewhere else, then enter the "
+              "8-digit code Spotify sends to the feed's owner email."},
+    {"id": "amazon", "name": "Amazon Music", "where": "Amazon Music for Podcasters",
+     "url": "https://podcasters.amazon.com/",
+     "needs": "An Amazon login. Add or Claim Your Podcast, verified through the feed's owner email. This also "
+              "covers Audible."},
+    {"id": "youtube", "name": "YouTube", "where": "YouTube Studio", "url": "https://studio.youtube.com/",
+     "needs": "Optional. For an audio-only show: Create, New podcast, Submit RSS feed, then identity verification "
+              "and a code to the feed's owner email. YouTube makes a still-image video per episode. Skip this "
+              "row when episodes go up as real video by hand."},
+    {"id": "iheart", "name": "iHeartRadio", "where": "iHeart for Podcasters",
+     "url": "https://help.iheart.com/hc/en-au/articles/228920687-Submitting-a-podcast-to-iHeartRadio",
+     "needs": "An iHeart account. Add Your Podcast, then the feed. Approval is not guaranteed."},
+    {"id": "pocketcasts", "name": "Pocket Casts", "where": "pocketcasts.com/submit",
+     "url": "https://pocketcasts.com/submit/",
+     "needs": "Nothing. It no longer adds shows from Apple's directory on its own, so it needs its own submission."},
+    {"id": "podcastindex", "name": "Podcast Index", "where": "podcastindex.org/add",
+     "url": "https://podcastindex.org/add",
+     "needs": "Nothing. Many smaller apps read from it. After this, every publish pings it so new episodes show "
+              "up quickly."},
+    {"id": "overcast", "name": "Overcast", "where": "Nothing to submit", "url": "https://overcast.fm/podcasterinfo",
+     "needs": "Overcast, Castro, Podcast Addict and Goodpods list shows from Apple's directory, usually within a "
+              "day or two of Apple. Tick this once the show turns up and paste its Overcast address."},
+]
+DIRECTORY_IDS = [d["id"] for d in DIRECTORIES]
+
+EPISODE_KINDS = ("full", "trailer", "bonus")
+AUDIO_TYPES = {"mp3": "audio/mpeg", "m4a": "audio/x-m4a"}
+TRANSCRIPT_TYPES = {".vtt": "text/vtt", ".srt": "application/x-subrip"}
+MAX_TRANSCRIPT = 5 * 1024 * 1024
+PODCAST_SHOW_DEFAULTS = {
+    "title": "", "author": "", "owner_name": "", "owner_email": "", "language": "", "categories": [],
+    "explicit": False, "type": "episodic", "image": "", "link": "", "copyright": "", "complete": False,
+    "block": False, "locked": True, "funding": [], "guid": "", "feed_lock": "", "locked_at": "",
+    "legacy_feeds": [], "normalize": True, "format": "mp3", "mono": False, "kbps_mono": 64, "kbps_stereo": 128,
+    "tags": True, "upload_limit_mb": 2048, "media_mode": "site", "media_url": "", "media_target": {},
+    "ping": True, "websub": False, "last_ping": {}, "checklist": {}, "links": {}, "saved": "", "live_seen": "",
+    "verified": [],
+}
+PODCAST_SHOW_BOOLS = ("explicit", "complete", "block", "locked", "normalize", "mono", "tags", "ping", "websub")
+_RCLONE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*:[A-Za-z0-9_./-]*$")
+_EMAIL_RE = re.compile(r"^[^@\s<>\"']+@[^@\s<>\"']+\.[^@\s<>\"']+$")
+_LANG_RE = re.compile(r"^[a-z]{2,3}(-[A-Za-z]{2,4})?$")
+PKG_MANAGERS = [("apt", "sudo apt install %s"), ("dnf", "sudo dnf install %s"), ("zypper", "sudo zypper install %s"),
+                ("pacman", "sudo pacman -S %s"), ("apk", "sudo apk add %s"), ("emerge", "sudo emerge --ask %s")]
+GENTOO_NAMES = {"ffmpeg": "media-video/ffmpeg", "rclone": "net-misc/rclone"}
+
+
+def xml_text(s):
+    """Text for an XML element. HTML entities are decoded first, so &copy; becomes a real
+    copyright sign, then &, < and > are escaped. No HTML named entity reaches the feed."""
+    return _escape(_unescape(str(s or "")), quote=False)
+
+
+def xml_attr(s):
+    """Text for an XML attribute, with &quot; and &apos;, the forms Apple asks for."""
+    return xml_text(s).replace('"', "&quot;").replace("'", "&apos;")
+
+
+def cdata(html_):
+    """A CDATA section. A ]]> inside the text is split so it cannot end the section early."""
+    return "<![CDATA[%s]]>" % html_.replace("]]>", "]]]]><![CDATA[>")
+
+
+_VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+_HTML_TOKEN = re.compile(r"<!--.*?-->|<[^>]*>|[^<]+", re.S)
+
+
+def cut_html(html_, limit, by_bytes=False):
+    """Shorten HTML to a size limit at a tag boundary, closing whatever was left open. The limit
+    counts characters, or bytes of UTF-8 when by_bytes is set. Text cut short ends in ..."""
+    size = (lambda s: len(s.encode("utf-8"))) if by_bytes else len
+    if size(html_) <= limit:
+        return html_
+    out, stack, used = [], [], 0
+
+    def closers():
+        return "".join("</%s>" % t for t in reversed(stack))
+
+    for tok in _HTML_TOKEN.findall(html_):
+        if tok.startswith("<!--"):
+            continue
+        if tok.startswith("<"):
+            m = re.match(r"<(/?)([A-Za-z][A-Za-z0-9]*)", tok)
+            if not m:
+                continue
+            name = m.group(2).lower()
+            if m.group(1):
+                # A close tag was already counted in closers(), so it always fits.
+                if name in stack:
+                    while stack:
+                        t = stack.pop()
+                        out.append("</%s>" % t)
+                        used += size("</%s>" % t)
+                        if t == name:
+                            break
+                continue
+            void = name in _VOID_TAGS or tok.endswith("/>")
+            need = size(tok) + (0 if void else size("</%s>" % name))
+            if used + need + size(closers()) > limit:
+                break
+            out.append(tok)
+            used += size(tok)
+            if not void:
+                stack.append(name)
+            continue
+        room = limit - used - size(closers())
+        if size(tok) <= room:
+            out.append(tok)
+            used += size(tok)
+            continue
+        cut = tok[:max(0, room - 3)]
+        while cut and size(cut) + 3 > room:
+            cut = cut[:-1]
+        if " " in cut[-60:]:
+            cut = cut.rsplit(" ", 1)[0]
+        cut = re.sub(r"&[#A-Za-z0-9]*$", "", cut).rstrip()
+        if cut:
+            out.append(cut + "...")
+        break
+    return "".join(out) + closers()
+
+
+def parse_when(s):
+    """An aware datetime from an ISO date or date-time. One typed without an offset gets this
+    computer's offset for that moment, which is the offset at save time."""
+    s = str(s or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00").replace(" ", "T", 1))
+    except ValueError:
+        try:
+            dt = datetime.datetime.combine(datetime.date.fromisoformat(s[:10]), datetime.time(6, 0))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.replace(microsecond=0)
+
+
+def now_when():
+    return datetime.datetime.now().astimezone().replace(microsecond=0)
+
+
+def clean_when(s):
+    return (parse_when(s) or now_when().replace(second=0)).isoformat()
+
+
+def podcast_guid(feed_url):
+    """The podcast:guid for a feed URL: UUID version 5 of the URL without its scheme and
+    trailing slashes, in the namespace the Podcasting 2.0 spec gives."""
+    u = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", str(feed_url or "").strip()).rstrip("/")
+    return str(uuid.uuid5(PODCAST_GUID_NS, u)) if u else ""
+
+
+def fmt_duration(sec):
+    """50 min, 1 h 12 min. Empty when the length is unknown."""
+    try:
+        sec = int(round(float(sec or 0)))
+    except (TypeError, ValueError):
+        return ""
+    if sec <= 0:
+        return ""
+    if sec < 60:
+        return "%d sec" % sec
+    m = (sec + 30) // 60
+    if m < 60:
+        return "%d min" % m
+    return ("%d h %d min" % (m // 60, m % 60)) if m % 60 else "%d h" % (m // 60)
+
+
+def clock(sec):
+    """00:00 under an hour, 1:02:30 from an hour up: the form YouTube reads as chapters."""
+    sec = int(round(float(sec or 0)))
+    h, rest = divmod(sec, 3600)
+    m, s = divmod(rest, 60)
+    return "%d:%02d:%02d" % (h, m, s) if h else "%02d:%02d" % (m, s)
+
+
+def parse_clock(s):
+    """Seconds from H:MM:SS, MM:SS or plain seconds. None when it is not a time."""
+    s = str(s if s is not None else "").strip()
+    m = re.match(r"^(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d+)?)$", s)
+    if m:
+        return int(m.group(1) or 0) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    if re.match(r"^\d+(\.\d+)?$", s):
+        return float(s)
+    return None
+
+
+def fmt_size(n):
+    n = int(n or 0)
+    if n >= 1024 ** 3:
+        return "%.1f GB" % (n / 1024.0 ** 3)
+    if n >= 1024 ** 2:
+        return "%d MB" % round(n / 1024.0 ** 2)
+    if n >= 1024:
+        return "%d KB" % round(n / 1024.0)
+    return "%d bytes" % n
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def install_hint(*pkgs):
+    """The install line for the package manager this machine has, or a general hint."""
+    for name, line in PKG_MANAGERS:
+        if shutil.which(name):
+            names = [GENTOO_NAMES.get(p, p) for p in pkgs] if name == "emerge" else list(pkgs)
+            return "Install it with: " + line % " ".join(names)
+    return "Install %s with your system's package manager." % " and ".join(pkgs)
+
+
+def run_quiet(cmd, timeout=60):
+    """Run a program and collect its output: (exit code, stdout, stderr)."""
+    try:
+        p = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, errors="replace", timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        return 127, "", "%s is not installed." % cmd[0]
+    except subprocess.TimeoutExpired:
+        return 124, "", "%s took longer than %d seconds." % (cmd[0], timeout)
+
+
+def tool_versions():
+    """The outside programs the podcast tools use, with the first line of their version."""
+    out = {}
+    for name, flag in (("ffmpeg", "-version"), ("ffprobe", "-version"), ("rclone", "version")):
+        path = shutil.which(name)
+        if not path:
+            out[name] = ""
+            continue
+        code, text, _ = run_quiet([path, flag], 15)
+        first = (text.strip().splitlines() or [""])[0]
+        out[name] = (first[:80] or "found") if code == 0 else "found"
+    return out
+
+
+def sniff_audio(path):
+    """mp3 or m4a from the first bytes of a file (an ID3 header or MPEG frame sync, or an ftyp
+    box), or None."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+    except OSError:
+        return None
+    if head[:3] == b"ID3" or (len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+        return "mp3"
+    if head[4:8] == b"ftyp":
+        return "m4a"
+    return None
+
+
+def probe_audio(path):
+    """What an audio file is: kind (mp3, m4a or other), codec, duration in seconds, bit rate
+    in kbps, sample rate and channels. Raises ApiError when it holds no usable audio."""
+    if shutil.which("ffprobe"):
+        code, out, err = run_quiet(["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json",
+                                    str(Path(path).resolve())], 60)
+        if code != 0:
+            raise ApiError("ffprobe could not read that file: %s" % ((err.strip().splitlines() or ["no details"])[-1]))
+        try:
+            d = json.loads(out or "{}")
+        except ValueError:
+            raise ApiError("ffprobe gave an answer that could not be read.")
+        streams = d.get("streams") or []
+        audio = [s for s in streams if s.get("codec_type") == "audio"]
+        if not audio:
+            raise ApiError("That file has no audio in it.")
+        video = [s for s in streams if s.get("codec_type") == "video"
+                 and not (s.get("disposition") or {}).get("attached_pic")]
+        a, fmt = audio[0], d.get("format") or {}
+        codec, names = a.get("codec_name") or "", fmt.get("format_name") or ""
+        kind = "other"
+        if not video and codec == "mp3" and "mp3" in names:
+            kind = "mp3"
+        elif not video and codec == "aac" and "mp4" in names:
+            kind = "m4a"
+
+        def num(*vals):
+            for v in vals:
+                try:
+                    if v not in (None, "", "N/A"):
+                        return float(v)
+                except (TypeError, ValueError):
+                    continue
+            return 0.0
+
+        return {"kind": kind, "codec": codec, "duration": num(fmt.get("duration"), a.get("duration")),
+                "kbps": int(num(fmt.get("bit_rate"), a.get("bit_rate")) // 1000),
+                "sample_rate": int(num(a.get("sample_rate"))), "channels": int(num(a.get("channels"))), "probed": True}
+    kind = sniff_audio(path)
+    if not kind:
+        raise ApiError("Without ffprobe only MP3 and M4A files can be added, and this is neither. "
+                       + install_hint("ffmpeg"))
+    return {"kind": kind, "codec": "mp3" if kind == "mp3" else "aac", "duration": 0, "kbps": 0, "sample_rate": 0,
+            "channels": 0, "probed": False}
+
+
+def image_header(path):
+    """Width, height and colour facts read straight from a PNG IHDR chunk or a JPEG SOF marker,
+    with no outside program. None when the file is neither."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+            if head[:8] == b"\x89PNG\r\n\x1a\n" and head[12:16] == b"IHDR":
+                w, h, ct = int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big"), head[25]
+                alpha = ct in (4, 6)
+                if ct == 3:
+                    # A palette image is transparent when it carries a tRNS chunk before its data.
+                    f.seek(8)
+                    while True:
+                        hdr = f.read(8)
+                        if len(hdr) < 8 or hdr[4:8] in (b"IDAT", b"IEND"):
+                            break
+                        if hdr[4:8] == b"tRNS":
+                            alpha = True
+                            break
+                        f.seek(int.from_bytes(hdr[:4], "big") + 4, 1)
+                color = {0: "gray", 2: "rgb", 3: "palette", 4: "gray", 6: "rgb"}.get(ct, "rgb")
+                return {"format": "png", "width": w, "height": h, "alpha": alpha, "color": color}
+            if head[:2] != b"\xff\xd8":
+                return None
+            f.seek(2)
+            while True:
+                b = f.read(1)
+                if not b:
+                    return None
+                if b != b"\xff":
+                    continue
+                m = f.read(1)
+                while m == b"\xff":
+                    m = f.read(1)
+                if not m:
+                    return None
+                mk = m[0]
+                if mk in (0x01, 0xD8) or 0xD0 <= mk <= 0xD7:
+                    continue
+                if mk == 0xD9:
+                    return None
+                ln = int.from_bytes(f.read(2), "big")
+                if 0xC0 <= mk <= 0xCF and mk not in (0xC4, 0xC8, 0xCC):
+                    seg = f.read(6)
+                    if len(seg) < 6:
+                        return None
+                    return {"format": "jpeg", "width": int.from_bytes(seg[3:5], "big"),
+                            "height": int.from_bytes(seg[1:3], "big"), "alpha": False,
+                            "color": {1: "gray", 3: "rgb", 4: "cmyk"}.get(seg[5], "rgb")}
+                f.seek(max(0, ln - 2), 1)
+    except OSError:
+        return None
+
+
+def image_info(path):
+    """Format, size, colour and alpha of an image file, from ffprobe when it is installed and
+    from the file header otherwise. None when the file does not exist."""
+    p = Path(path)
+    if not p.is_file() or p.is_symlink():
+        return None
+    info = None
+    if shutil.which("ffprobe"):
+        code, out, _ = run_quiet(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                  "stream=codec_name,width,height,pix_fmt", "-of", "json", str(p.resolve())], 30)
+        try:
+            st = json.loads(out)["streams"][0] if code == 0 else None
+            if st:
+                pf = st.get("pix_fmt") or ""
+                info = {"format": {"mjpeg": "jpeg", "png": "png"}.get(st.get("codec_name"), st.get("codec_name") or ""),
+                        "width": int(st["width"]), "height": int(st["height"]),
+                        "alpha": bool(re.search(r"rgba|bgra|argb|abgr|ya8|ya16|yuva|gbrap", pf)),
+                        "color": "gray" if pf.startswith(("gray", "ya")) else ("cmyk" if "cmyk" in pf else "rgb")}
+                if pf == "pal8":
+                    hdr = image_header(p)
+                    info["alpha"], info["color"] = bool(hdr and hdr["alpha"]), "palette"
+        except (ValueError, KeyError, IndexError, TypeError):
+            info = None
+    if info is None:
+        info = image_header(p) or {"format": "", "width": 0, "height": 0, "alpha": False, "color": ""}
+    info["bytes"] = p.stat().st_size
+    return info
+
+
+def art_problems(info, what):
+    """Feed check lines for show or episode art, against Apple's cover rules."""
+    if info is None:
+        return [("fail", "%s is missing." % what, "Upload a square JPG or PNG between 1400 and 3000 pixels.")]
+    out = []
+    if info["format"] not in ("png", "jpeg"):
+        out.append(("fail", "%s must be a JPG or PNG file." % what, "Use Fix artwork, or export it as JPG or PNG."))
+        return out
+    w, h = info["width"], info["height"]
+    if w != h:
+        out.append(("fail", "%s is %d x %d pixels, and it must be square." % (what, w, h),
+                    "Fix artwork crops it to a 3000 pixel square."))
+    elif not 1400 <= w <= 3000:
+        out.append(("fail", "%s is %d pixels square; Apple needs 1400 to 3000." % (what, w),
+                    "Fix artwork scales it to 3000 pixels. Starting from a larger original looks better."))
+    if info.get("alpha"):
+        out.append(("warn", "%s has transparency, which Apple does not accept." % what,
+                    "Fix artwork flattens it onto the theme background."))
+    elif info.get("color") in ("gray", "cmyk", "palette"):
+        out.append(("warn", "%s is not plain RGB (%s)." % (what, info["color"]), "Fix artwork writes an RGB copy."))
+    if info.get("bytes", 0) > 1024 * 1024:
+        out.append(("warn", "%s is %s; podcast apps fetch it often, so under 1 MB is kinder." % (what, fmt_size(info["bytes"])),
+                    "Fix artwork writes a smaller JPG."))
+    return out
+
+
+def parse_transcript(text, ext):
+    """Cues from a WebVTT or SubRip file as (speaker, words). Raises ApiError when the file is
+    not the format its name says."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("﻿")
+    if ext == ".vtt" and not text.startswith("WEBVTT"):
+        raise ApiError("A .vtt transcript must start with WEBVTT.")
+    cues = []
+    for block in re.split(r"\n[ \t]*\n", text):
+        lines = [x for x in block.split("\n") if x.strip()]
+        at = next((k for k, x in enumerate(lines) if "-->" in x), None)
+        if at is None:
+            continue
+        if ext == ".srt" and at > 0 and not re.match(r"^\s*\d+\s*$", lines[at - 1]):
+            continue
+        words = " ".join(x.strip() for x in lines[at + 1:])
+        speaker = ""
+        m = re.match(r"^<v(?:\.[^\s>]*)?\s+([^>]+)>", words)
+        if m:
+            speaker = m.group(1).strip()
+        words = re.sub(r"\s+", " ", _unescape(re.sub(r"<[^>]*>", "", words))).strip()
+        if not speaker:
+            m = re.match(r"^([A-Z][\w .'-]{0,30}):\s+(.+)$", words)
+            if m:
+                speaker, words = m.group(1).strip(), m.group(2)
+        if words:
+            cues.append((speaker, words))
+    if not cues:
+        raise ApiError("No cues found. A cue is a line with --> between two times and the words under it.")
+    return cues
+
+
+def transcript_html(cues):
+    """The words of a transcript as paragraphs: a new one when the speaker changes, or every few
+    cues when there are no speaker labels. Timestamps are dropped."""
+    paras, cur, spk = [], [], None
+    for speaker, words in cues:
+        if cur and (speaker != spk or (not speaker and len(cur) >= 6)):
+            paras.append((spk, " ".join(cur)))
+            cur = []
+        spk = speaker
+        cur.append(words)
+    if cur:
+        paras.append((spk, " ".join(cur)))
+    return "\n".join("<p>%s%s</p>" % ("<b>%s:</b> " % esc(s) if s else "", esc(t)) for s, t in paras)
+
+
+def html_to_text(html_):
+    """Plain text with paragraphs kept apart, for the YouTube description."""
+    t = re.sub(r'<a class="anchor"[^>]*>#</a>', "", html_)
+    t = re.sub(r"<(script|style)\b.*?</\1>", " ", t, flags=re.S | re.I)
+    t = re.sub(r"<li[^>]*>", "\n- ", t)
+    t = re.sub(r"</(p|h[1-6]|li|ul|ol|blockquote|pre|div|figure|table|tr)>|<br\s*/?>", "\n", t)
+    t = _unescape(re.sub(r"<[^>]+>", "", t))
+    lines = [re.sub(r"[ \t]+", " ", x).strip() for x in t.split("\n")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def http_check(url, method="HEAD", timeout=20):
+    """Ask a live server about a URL. (status, headers dict with lower-case keys, body or None,
+    error text). Follows redirects; never raises."""
+    req = urllib.request.Request(url, method=method, headers={"User-Agent": "%s podcast checker" % APP})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read() if method == "GET" else None
+            return r.status, {k.lower(): v for k, v in r.headers.items()}, body, ""
+    except urllib.error.HTTPError as e:
+        return e.code, {k.lower(): v for k, v in (e.headers or {}).items()}, None, "HTTP %d" % e.code
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return 0, {}, None, str(getattr(e, "reason", e))
+
+
+# ---- the media job: uploads, encoding and artwork fixes, one at a time, with a log
+
+MEDIA = {"running": False, "ok": None, "what": "", "lines": [], "base": 0, "proc": None, "cancel": False,
+         "queue": [], "current": ""}
+MEDIA_LOCK = threading.Lock()
+
+
+def media_say(line):
+    with MEDIA_LOCK:
+        MEDIA["lines"].append(str(line).rstrip("\r\n"))
+        extra = len(MEDIA["lines"]) - 1500
+        if extra > 0:
+            del MEDIA["lines"][:extra]
+            MEDIA["base"] += extra
+
+
+def media_status(since=0):
+    try:
+        since = max(0, int(since))
+    except (TypeError, ValueError):
+        since = 0
+    with MEDIA_LOCK:
+        lines = MEDIA["lines"][max(0, since - MEDIA["base"]):]
+        return {"running": MEDIA["running"], "ok": MEDIA["ok"], "what": MEDIA["what"], "queued": len(MEDIA["queue"]),
+                "current": MEDIA["current"], "total": MEDIA["base"] + len(MEDIA["lines"]), "lines": lines}
+
+
+def media_busy():
+    with MEDIA_LOCK:
+        return MEDIA["running"] or bool(MEDIA["queue"])
+
+
+def media_cancel():
+    """Stop the running media job. Queued jobs still run; the original upload is kept."""
+    with MEDIA_LOCK:
+        if not MEDIA["running"]:
+            return {"ok": False}
+        MEDIA["cancel"] = True
+        proc = MEDIA["proc"]
+    media_say("Stopping at your request...")
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+    return {"ok": True}
+
+
+def media_queue(what, run, episode=""):
+    """Add a job; one runs at a time, in the order they came in."""
+    with MEDIA_LOCK:
+        MEDIA["queue"].append({"what": what, "run": run, "episode": episode})
+        if MEDIA["running"]:
+            return
+        MEDIA["running"] = True
+    threading.Thread(target=media_worker, daemon=True, name="media").start()
+
+
+def media_worker():
+    while True:
+        with MEDIA_LOCK:
+            if not MEDIA["queue"]:
+                MEDIA.update(running=False, proc=None, current="")
+                return
+            task = MEDIA["queue"].pop(0)
+            MEDIA.update(cancel=False, what=task["what"], current=task["episode"], ok=None)
+        media_say("== %s (%s)" % (task["what"], datetime.datetime.now().isoformat(" ", "seconds")))
+        ok = False
+        try:
+            task["run"]()
+            ok = True
+            media_say("Done.")
+        except ApiError as e:
+            media_say("Stopped: %s" % e)
+        except Exception as e:  # noqa: BLE001  (report anything unexpected instead of dying silently)
+            media_say("Stopped: %s: %s" % (type(e).__name__, e))
+            traceback.print_exc()
+        with MEDIA_LOCK:
+            MEDIA["ok"] = ok
+
+
+def media_cancelled():
+    with MEDIA_LOCK:
+        return MEDIA["cancel"]
+
+
+def run_ffmpeg(cmd, log):
+    """Run ffmpeg or ffprobe for the media job. Output goes to the job log and to log (a list
+    kept with the episode). Returns (exit code, all stderr lines)."""
+    shown = "$ " + " ".join(shlex.quote(c) for c in cmd)
+    media_say(shown)
+    log.append(shown)
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                             text=True, errors="replace", bufsize=1)
+    except FileNotFoundError:
+        raise ApiError("%s is not installed. %s" % (cmd[0], install_hint("ffmpeg")))
+    with MEDIA_LOCK:
+        MEDIA["proc"] = p
+    lines = []
+    try:
+        for line in p.stderr:
+            line = line.rstrip()
+            lines.append(line)
+            if line:
+                media_say(line)
+        code = p.wait()
+    finally:
+        p.stderr.close()
+        with MEDIA_LOCK:
+            MEDIA["proc"] = None
+    if media_cancelled():
+        raise ApiError("Stopped at your request. The original upload is kept; Retry processing starts again.")
+    log.extend(lines[-30:])
+    return code, lines
+
+
+def loudnorm_json(lines):
+    """The statistics block loudnorm prints at the end of its run, or None."""
+    text = "\n".join(lines)
+    i, j = text.rfind("{"), text.rfind("}")
+    if i < 0 or j < i:
+        return None
+    try:
+        d = json.loads(text[i:j + 1])
+    except ValueError:
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def _pos_int(v):
+    try:
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _clamp_int(v, lo, hi, default):
+    try:
+        return max(lo, min(hi, int(v)))
+    except (TypeError, ValueError):
+        return default
+
+
+def clean_categories(raw):
+    """Up to two categories, each a known Apple category with an optional subcategory of it."""
+    out = []
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, (list, tuple)) and item:
+            item = {"cat": item[0], "sub": item[1] if len(item) > 1 else ""}
+        if not isinstance(item, dict):
+            continue
+        cat, sub = str(item.get("cat") or "").strip(), str(item.get("sub") or "").strip()
+        if cat not in APPLE_CATEGORY_MAP:
+            continue
+        if sub not in APPLE_CATEGORY_MAP[cat]:
+            sub = ""
+        if any(x["cat"] == cat and x["sub"] == sub for x in out):
+            continue
+        out.append({"cat": cat, "sub": sub})
+    return out[:2]
+
+
+def clean_funding(raw):
+    out = []
+    for f in raw if isinstance(raw, list) else []:
+        if not isinstance(f, dict):
+            continue
+        url, text = str(f.get("url") or "").strip()[:400], re.sub(r"\s+", " ", str(f.get("text") or "")).strip()[:127]
+        if re.match(r"^https?://\S+$", url, re.I):
+            out.append({"url": url, "text": text or "Support the show"})
+    return out[:3]
+
+
+def clean_chapters(raw):
+    out = []
+    for ch in raw if isinstance(raw, list) else []:
+        if not isinstance(ch, dict):
+            continue
+        t = ch.get("start")
+        t = float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) else parse_clock(t)
+        title = re.sub(r"\s+", " ", str(ch.get("title") or "")).strip()[:200]
+        if t is None or t < 0 or not title:
+            continue
+        url = str(ch.get("url") or "").strip()[:400]
+        out.append({"start": round(t, 3), "title": title, "url": url if re.match(r"^https?://\S+$", url, re.I) else ""})
+    out.sort(key=lambda x: x["start"])
+    return out[:500]
+
+
+def _no_scheme(url):
+    return re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", str(url or "")).rstrip("/")
+
+
+def _host_of(url):
+    return urlsplit(str(url or "")).netloc.lower()
+
+
+def media_secret_path(site):
+    return site.meta / "media-secret.json"
+
+
+def media_password(site, dep):
+    """The saved password for the media host, tied to that exact target, else the environment."""
+    try:
+        d = json.loads(media_secret_path(site).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        d = {}
+    if isinstance(d, dict) and d.get("for") == secret_key(dep) and d.get("password"):
+        return str(d["password"])
+    return os.environ.get(APP.upper() + "_MEDIA_PASSWORD", "")
+
+
+def store_media_password(site, dep, password, keep):
+    p = media_secret_path(site)
+    if not keep:
+        if p.exists():
+            p.unlink()
+        return
+    if not password:
+        return
+    tmp = p.with_name(p.name + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"for": secret_key(dep), "password": password}, f)
+    os.replace(tmp, p)
+
+
+def clean_media_target(t):
+    """The media host settings: rclone with a remote:path, or any publish method but git,
+    checked by the same rules as the site's own target."""
+    t = t if isinstance(t, dict) else {}
+    method = t.get("method") or "rsync"
+    if method == "rclone":
+        remote = str(t.get("remote") or "").strip()
+        if remote and not _RCLONE_RE.match(remote):
+            raise ApiError("The rclone target looks like remote:bucket/folder, for example r2:my-bucket/podcast. "
+                           "Letters, digits, dots, dashes, underscores and slashes only.")
+        return {"method": "rclone", "remote": remote, "save_password": False}
+    if method == "git":
+        raise ApiError("git cannot be the media host: it keeps every version of every audio file forever. "
+                       "Use rsync, SFTP, FTPS, a folder or rclone.")
+    dep = clean_deploy(t, {})
+    dep["mirror"] = False
+    return dep
+
+
+class MediaRecord:
+    """Stands in for the site in the publish helpers when the target is the media host, so its
+    record of what was sent lives in .siteforge/media/published.json and the site's own record
+    and the media host's never overwrite each other."""
+
+    def __init__(self, site):
+        self.root = site.root
+        self.meta = site.meta / "media"
+
+
+def deploy_rclone(dep, staged, dry):
+    """Copy the staged audio to an rclone remote such as r2:bucket/podcast. rclone copy never
+    deletes anything at the destination."""
+    if not shutil.which("rclone"):
+        raise ApiError("rclone is not installed on this machine. " + install_hint("rclone"))
+    if not _RCLONE_RE.match(dep.get("remote") or ""):
+        raise ApiError("Set the rclone target first, for example r2:my-bucket/podcast.")
+    cmd = ["rclone", "copy", "-v", "--stats-one-line", "--stats", "10s", "--transfers", "4"]
+    if dry:
+        cmd.append("--dry-run")
+    cmd += ["--", str(staged), dep["remote"]]
+    if run_stream(cmd) != 0:
+        raise ApiError("rclone exited with an error. The log above says why.")
+
+
+class PodcastMixin:
+    # ---- paths and addresses
+    def pod_meta(self):
+        return self.meta / "podcast"
+
+    def pod_intro_md(self):
+        return self.pod_meta() / "_index.md"
+
+    def episode_md(self, slug):
+        return self.pod_meta() / "episodes" / (slug + ".md")
+
+    def incoming_dir(self):
+        return self.pod_meta() / "incoming"
+
+    def pod_base(self, c=None):
+        return self.mbase("podcast", c)
+
+    def feed_rel(self, c=None):
+        return self.pod_base(c) + "feed.xml"
+
+    def episode_rel(self, slug, c=None):
+        return self.pod_base(c) + "episodes/%s.html" % slug
+
+    def chapters_rel(self, slug, c=None):
+        return self.pod_base(c) + "chapters/%s.json" % slug
+
+    def audio_dir(self, c=None):
+        return self.root / (self.pod_base(c) + "audio")
+
+    def transcript_dir(self, c=None):
+        return self.root / (self.pod_base(c) + "transcripts")
+
+    def feed_url(self, c=None):
+        c = c or self.cfg
+        return abs_url(c["site"].get("url"), self.feed_rel(c))
+
+    def media_host(self, c=None):
+        show = (c or self.cfg)["podcast"]["show"]
+        return show["media_mode"] == "host" and bool(show["media_url"])
+
+    def enclosure_url(self, c, ep):
+        f = (ep.get("audio") or {}).get("file")
+        if not f:
+            return ""
+        if self.media_host(c):
+            return c["podcast"]["show"]["media_url"].rstrip("/") + "/" + f
+        return abs_url(c["site"].get("url"), self.pod_base(c) + "audio/" + f)
+
+    def audio_src(self, c, ep, prefix):
+        f = ep["audio"]["file"]
+        if self.media_host(c):
+            return c["podcast"]["show"]["media_url"].rstrip("/") + "/" + f
+        return prefix + self.pod_base(c) + "audio/" + f
+
+    def art_url(self, c, path):
+        return resolve_img(c["site"], path)
+
+    def local_file(self, rel):
+        """A site-relative path as a file inside the site folder, or None."""
+        rel = str(rel or "").strip().lstrip("/")
+        if not rel or _SCHEME.match(rel) or not safe_rel(rel):
+            return None
+        p = self.root / rel
+        return p if p.is_file() and not p.is_symlink() else None
+
+    # ---- settings and records
+    def normalize_podcast(self):
+        c = self.cfg
+        pod = c.get("podcast") if isinstance(c.get("podcast"), dict) else {}
+        raw = pod.get("show") if isinstance(pod.get("show"), dict) else {}
+        show = dict(PODCAST_SHOW_DEFAULTS)
+        show.update({k: v for k, v in raw.items() if k in PODCAST_SHOW_DEFAULTS})
+        for k in PODCAST_SHOW_BOOLS:
+            show[k] = bool(show[k])
+        for k in ("title", "author", "owner_name", "owner_email", "language", "image", "link", "copyright", "guid",
+                  "feed_lock", "locked_at", "media_url", "saved", "live_seen"):
+            show[k] = str(show[k] or "")[:400]
+        show["type"] = "serial" if show["type"] == "serial" else "episodic"
+        show["format"] = "m4a" if show["format"] == "m4a" else "mp3"
+        show["media_mode"] = "host" if show["media_mode"] == "host" else "site"
+        show["kbps_mono"] = _clamp_int(show["kbps_mono"], 64, 128, 64)
+        show["kbps_stereo"] = _clamp_int(show["kbps_stereo"], 128, 256, 128)
+        show["upload_limit_mb"] = _clamp_int(show["upload_limit_mb"], 1, 1024 * 1024, 2048)
+        show["categories"] = clean_categories(show["categories"])
+        show["funding"] = clean_funding(show["funding"])
+        show["legacy_feeds"] = [str(u)[:400] for u in (show["legacy_feeds"] if isinstance(show["legacy_feeds"], list) else [])
+                                if re.match(r"^https?://\S+$", str(u))][:20]
+        show["verified"] = [str(u) for u in (show["verified"] if isinstance(show["verified"], list) else [])][-3000:]
+        cl = show["checklist"] if isinstance(show["checklist"], dict) else {}
+        show["checklist"] = {k: str(v)[:40] for k, v in cl.items() if k in DIRECTORY_IDS and v}
+        ln = show["links"] if isinstance(show["links"], dict) else {}
+        show["links"] = {k: str(v).strip()[:400] for k, v in ln.items()
+                         if k in DIRECTORY_IDS and re.match(r"^https?://\S+$", str(v).strip())}
+        show["last_ping"] = show["last_ping"] if isinstance(show["last_ping"], dict) else {}
+        show["media_target"] = show["media_target"] if isinstance(show["media_target"], dict) else {}
+        busy = media_busy()
+        eps, seen, guids = [], set(), set()
+        for e in pod.get("episodes") if isinstance(pod.get("episodes"), list) else []:
+            if not isinstance(e, dict) or not slugify(e.get("slug", "")) or slugify(e["slug"]) in seen:
+                continue
+            e["slug"] = slugify(e["slug"])
+            seen.add(e["slug"])
+            e["title"] = re.sub(r"\s+", " ", str(e.get("title") or title_from_name(e["slug"]))).strip()[:200]
+            g = str(e.get("guid") or "").strip()[:300]
+            if not g or g in guids:
+                g = "urn:uuid:%s" % uuid.uuid4()
+            guids.add(g)
+            e["guid"] = g
+            e["number"], e["season"] = _pos_int(e.get("number")), _pos_int(e.get("season"))
+            e["kind"] = e.get("kind") if e.get("kind") in EPISODE_KINDS else "full"
+            e["status"] = "published" if e.get("status") == "published" else "draft"
+            e["date"] = clean_when(e.get("date"))
+            e["summary"] = re.sub(r"\s+", " ", str(e.get("summary") or "")).strip()[:400]
+            e["explicit"] = e.get("explicit") if e.get("explicit") in ("yes", "no") else ""
+            for k in ("art", "seo_title", "description", "image", "canonical"):
+                e[k] = str(e.get(k) or "")[:400]
+            e["noindex"] = bool(e.get("noindex"))
+            try:
+                e["duration"] = max(0, int(round(float(e.get("duration") or 0))))
+            except (TypeError, ValueError):
+                e["duration"] = 0
+            a = e.get("audio") if isinstance(e.get("audio"), dict) else {}
+            name = str(a.get("file") or "")
+            if name and safe_rel(name) and "/" not in name:
+                e["audio"] = {"file": name, "bytes": _clamp_int(a.get("bytes"), 0, 1 << 50, 0),
+                              "type": a.get("type") if a.get("type") in AUDIO_TYPES.values() else AUDIO_TYPES["mp3"],
+                              "kbps": _clamp_int(a.get("kbps"), 0, 10000, 0), "channels": _clamp_int(a.get("channels"), 0, 16, 0),
+                              "sample_rate": _clamp_int(a.get("sample_rate"), 0, 1000000, 0), "codec": str(a.get("codec") or "")[:20],
+                              "lufs": a.get("lufs") if isinstance(a.get("lufs"), (int, float)) else None,
+                              "sha256": str(a.get("sha256") or "")[:64], "probed": bool(a.get("probed"))}
+            else:
+                e["audio"] = {}
+            m = e.get("media") if isinstance(e.get("media"), dict) else {}
+            state = m.get("state") if m.get("state") in ("queued", "processing", "ready", "failed") else ""
+            message = str(m.get("message") or "")[:400]
+            if state in ("queued", "processing") and not busy:
+                state, message = "failed", "Processing was interrupted. Retry processing starts it again."
+            e["media"] = {"state": state, "message": message,
+                          "log": [str(x)[:300] for x in (m.get("log") if isinstance(m.get("log"), list) else [])][-80:],
+                          "original": str(m.get("original") or "")[:200], "name": str(m.get("name") or "")[:200]}
+            t = e.get("transcript") if isinstance(e.get("transcript"), dict) else {}
+            tf = str(t.get("file") or "")
+            e["transcript"] = ({"file": tf, "type": t.get("type") if t.get("type") in TRANSCRIPT_TYPES.values() else "text/vtt",
+                                "cues": _clamp_int(t.get("cues"), 0, 10 ** 7, 0)}
+                               if tf and safe_rel(tf) and "/" not in tf else {})
+            e["chapters"] = clean_chapters(e.get("chapters"))
+            eps.append(e)
+        c["podcast"] = {"show": show, "episodes": eps}
+
+    def pod_show(self, c):
+        """Show settings with the blanks filled in from the site settings."""
+        s, site = dict(c["podcast"]["show"]), c["site"]
+        s["title"] = s["title"] or site["title"]
+        s["author"] = s["author"] or site.get("author") or s["title"]
+        s["language"] = s["language"] or site.get("lang") or "en"
+        if not s["copyright"]:
+            foot = (site.get("footer") or "").replace("{year}", str(datetime.date.today().year)) \
+                .replace("{title}", site["title"]).replace("{author}", site.get("author") or site["title"])
+            s["copyright"] = plain_text(Markdown("").inline(foot)) if foot.strip() else ""
+        s["link"] = s["link"] or re.sub(r"(^|/)index\.html$", r"\1", abs_url(site.get("url"), self.landing_rel("podcast", c)))
+        return s
+
+    def find_episode(self, slug, c=None):
+        return next((e for e in (c or self.cfg)["podcast"]["episodes"] if e["slug"] == slug), None)
+
+    def get_episode_rec(self, slug):
+        e = self.find_episode(slug)
+        if not e:
+            raise ApiError("That episode does not exist.", 404)
+        return e
+
+    def pod_episodes(self, c, scheduled=False):
+        """Published episodes newest first. scheduled: the ones dated in the future instead."""
+        now = now_when()
+        out = []
+        for e in c["podcast"]["episodes"]:
+            if e["status"] != "published":
+                continue
+            if (parse_when(e["date"]) > now) == scheduled:
+                out.append(e)
+        out.sort(key=lambda e: (parse_when(e["date"]), e["title"].lower()), reverse=True)
+        return out
+
+    def ep_label(self, e):
+        n, s = e.get("number"), e.get("season")
+        if not n:
+            return ""
+        return "S%d E%d" % (s, n) if s else "E%d" % n
+
+    def next_number(self):
+        nums = [e["number"] for e in self.cfg["podcast"]["episodes"] if e.get("number") and e["kind"] == "full"]
+        return (max(nums) + 1) if nums else 1
+
+    # ---- the feed
+    def pod_last_date(self, c, eps):
+        dates = [parse_when(e["date"]) for e in eps[:1]]
+        saved = parse_when(c["podcast"]["show"].get("saved"))
+        if saved:
+            dates.append(saved)
+        return max(dates) if dates else None
+
+    def pod_item(self, c, e, show, base):
+        site_url = c["site"]["url"]
+        notes = Markdown(base).render(strip_title_h1(read_text(self.episode_md(e["slug"])), e["title"]))
+        desc = (("<p>%s</p>\n" % esc(e["summary"])) if e["summary"] else "") + notes
+        if not desc.strip():
+            desc = "<p>%s</p>" % esc(e["title"])
+        a = e["audio"]
+        x = ["<item>",
+             "<title>%s</title>" % xml_text(e["title"]),
+             "<itunes:title>%s</itunes:title>" % xml_text(e["title"]),
+             "<link>%s</link>" % xml_text(abs_url(site_url, self.episode_rel(e["slug"], c))),
+             '<guid isPermaLink="false">%s</guid>' % xml_text(e["guid"]),
+             "<pubDate>%s</pubDate>" % email.utils.format_datetime(parse_when(e["date"])),
+             "<description>%s</description>" % cdata(cut_html(desc, 4000)),
+             "<content:encoded>%s</content:encoded>" % cdata(notes or desc),
+             '<enclosure url="%s" length="%d" type="%s"/>' % (xml_attr(self.enclosure_url(c, e)), a["bytes"],
+                                                             xml_attr(a["type"]))]
+        if e.get("duration"):
+            x.append("<itunes:duration>%d</itunes:duration>" % e["duration"])
+        if e.get("season"):
+            x.append("<itunes:season>%d</itunes:season>" % e["season"])
+        if e.get("number"):
+            x.append("<itunes:episode>%d</itunes:episode>" % e["number"])
+        x.append("<itunes:episodeType>%s</itunes:episodeType>" % e["kind"])
+        if e["explicit"]:
+            x.append("<itunes:explicit>%s</itunes:explicit>" % ("true" if e["explicit"] == "yes" else "false"))
+        art = self.art_url(c, e.get("art"))
+        if art:
+            x.append('<itunes:image href="%s"/>' % xml_attr(art))
+        t = e.get("transcript") or {}
+        if t.get("file"):
+            x.append('<podcast:transcript url="%s" type="%s" language="%s" rel="captions"/>'
+                     % (xml_attr(abs_url(site_url, self.pod_base(c) + "transcripts/" + t["file"])), xml_attr(t["type"]),
+                        xml_attr(show["language"])))
+        if e["chapters"]:
+            x.append('<podcast:chapters url="%s" type="application/json+chapters"/>'
+                     % xml_attr(abs_url(site_url, self.chapters_rel(e["slug"], c))))
+        x.append("</item>")
+        return "\n".join(x)
+
+    def pod_feed(self, c, self_url, new_url=""):
+        """The podcast feed. self_url is where this copy lives; new_url, for a feed that moved,
+        is where podcast apps should go instead."""
+        show = self.pod_show(c)
+        base = c["site"]["url"].rstrip("/") + "/"
+        eps = [e for e in self.pod_episodes(c) if e["audio"].get("file")]
+        about = Markdown(base).render(read_text(self.pod_intro_md()))
+        ch = ['<atom:link href="%s" rel="self" type="application/rss+xml"/>' % xml_attr(self_url)]
+        if show["websub"]:
+            ch.append('<atom:link href="%s" rel="hub"/>' % xml_attr(WEBSUB_HUB))
+        ch += ["<title>%s</title>" % xml_text(show["title"]),
+               "<itunes:title>%s</itunes:title>" % xml_text(show["title"]),
+               "<link>%s</link>" % xml_text(show["link"]),
+               "<description>%s</description>" % cdata(cut_html(about or "<p>%s</p>" % esc(show["title"]), 4000, by_bytes=True)),
+               "<language>%s</language>" % xml_text(show["language"])]
+        if show["copyright"]:
+            ch.append("<copyright>%s</copyright>" % xml_text(show["copyright"]))
+        last = self.pod_last_date(c, eps)
+        if last:
+            ch.append("<lastBuildDate>%s</lastBuildDate>" % email.utils.format_datetime(last))
+        ch.append("<generator>%s</generator>" % xml_text(APP))
+        img = self.art_url(c, show["image"])
+        if img:
+            ch.append("<image><url>%s</url><title>%s</title><link>%s</link></image>"
+                      % (xml_text(img), xml_text(show["title"]), xml_text(show["link"])))
+            ch.append('<itunes:image href="%s"/>' % xml_attr(img))
+        ch.append("<itunes:author>%s</itunes:author>" % xml_text(show["author"]))
+        if show["owner_name"] or show["owner_email"]:
+            ch.append("<itunes:owner><itunes:name>%s</itunes:name><itunes:email>%s</itunes:email></itunes:owner>"
+                      % (xml_text(show["owner_name"] or show["author"]), xml_text(show["owner_email"])))
+        for cat in show["categories"]:
+            if cat["sub"]:
+                ch.append('<itunes:category text="%s"><itunes:category text="%s"/></itunes:category>'
+                          % (xml_attr(cat["cat"]), xml_attr(cat["sub"])))
+            else:
+                ch.append('<itunes:category text="%s"/>' % xml_attr(cat["cat"]))
+        ch.append("<itunes:explicit>%s</itunes:explicit>" % ("true" if show["explicit"] else "false"))
+        ch.append("<itunes:type>%s</itunes:type>" % show["type"])
+        if show["complete"]:
+            ch.append("<itunes:complete>Yes</itunes:complete>")
+        if show["block"]:
+            ch.append("<itunes:block>Yes</itunes:block>")
+            ch.append("<podcast:block>yes</podcast:block>")
+        if new_url:
+            ch.append("<itunes:new-feed-url>%s</itunes:new-feed-url>" % xml_text(new_url))
+        guid = show["guid"] or podcast_guid(self.feed_url(c))
+        if guid:
+            ch.append("<podcast:guid>%s</podcast:guid>" % xml_text(guid))
+        owner = show["owner_email"]
+        ch.append("<podcast:locked%s>%s</podcast:locked>"
+                  % (' owner="%s"' % xml_attr(owner) if owner else "", "yes" if show["locked"] else "no"))
+        for f in show["funding"]:
+            ch.append('<podcast:funding url="%s">%s</podcast:funding>' % (xml_attr(f["url"]), xml_text(f["text"])))
+        items = [self.pod_item(c, e, show, base) for e in eps]
+        return ('<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" %s>\n<channel>\n%s\n%s%s</channel>\n</rss>\n'
+                % (PODCAST_FEED_NS, "\n".join(ch), "\n".join(items), "\n" if items else ""))
+
+    def chapters_json(self, e):
+        chs = []
+        for ch in e["chapters"]:
+            t = ch["start"]
+            d = {"startTime": int(t) if float(t).is_integer() else t, "title": ch["title"]}
+            if ch["url"]:
+                d["url"] = ch["url"]
+            chs.append(d)
+        return json.dumps({"version": "1.2.0", "chapters": chs}, indent=2, ensure_ascii=False) + "\n"
+
+    def legacy_rel(self, c, old):
+        """Where a feed that moved used to live, as a path in this site, or "" when it was elsewhere."""
+        here = _no_scheme(c["site"].get("url")) + "/"
+        o = _no_scheme(old)
+        if not here.strip("/") or not o.startswith(here):
+            return ""
+        rel = o[len(here):]
+        if (not safe_rel(rel) or not rel.endswith(".xml") or rel == self.feed_rel(c) or rel.startswith((".", "assets/"))
+                or rel in ("sitemap.xml",) or rel.endswith("/rss.xml") or rel == "rss.xml"):
+            return ""
+        return rel
+
+    def pod_files(self, c):
+        base = self.pod_base(c)
+        files = {}
+        rel = base + "index.html"
+        if rel != "index.html":
+            files[rel] = self.pod_landing(c, rel)
+        for e in self.pod_episodes(c):
+            files[self.episode_rel(e["slug"], c)] = self.render_episode(c, e, read_text(self.episode_md(e["slug"])))
+            if e["chapters"]:
+                files[self.chapters_rel(e["slug"], c)] = self.chapters_json(e)
+        if c["site"].get("url"):
+            url = self.feed_url(c)
+            files[self.feed_rel(c)] = self.pod_feed(c, url)
+            for old in c["podcast"]["show"]["legacy_feeds"]:
+                lrel = self.legacy_rel(c, old)
+                if lrel and lrel not in files:
+                    files[lrel] = self.pod_feed(c, old, new_url=url)
+        return files
+
+    def pod_legacy_rels(self, c=None):
+        c = c or self.cfg
+        return [r for r in (self.legacy_rel(c, u) for u in c["podcast"]["show"]["legacy_feeds"]) if r]
+
+    # ---- pages
+    def pod_head(self, c, prefix, extra=None):
+        out = []
+        if self.feed_url(c):
+            out.append('<link rel="alternate" type="application/rss+xml" title="%s" href="%s%s">'
+                       % (attr("%s (podcast)" % self.pod_show(c)["title"]), prefix, attr(self.feed_rel(c))))
+        return out + (extra or [])
+
+    def subscribe_html(self, c, prefix, compact=False):
+        show = c["podcast"]["show"]
+        items = ['<li><a href="%s">%s</a></li>' % (attr(show["links"][d["id"]]), esc(d["name"]))
+                 for d in DIRECTORIES if show["links"].get(d["id"])]
+        feed = self.feed_url(c)
+        if feed:
+            items.append('<li><a href="%s%s">RSS feed</a></li>' % (prefix, attr(self.feed_rel(c))))
+            if not compact:
+                items.append('<li class="pod-feed-url"><code>%s</code></li>' % esc(feed))
+        if not items:
+            return ""
+        return '<ul class="pod-subscribe%s" aria-label="Subscribe">%s</ul>' % (" compact" if compact else "", "".join(items))
+
+    def ep_meta_line(self, e, with_label=False):
+        bits = []
+        if with_label and self.ep_label(e):
+            bits.append(esc(self.ep_label(e)))
+        bits.append('<time datetime="%s">%s</time>' % (attr(e["date"]), esc(nice_date(e["date"][:10]))))
+        if fmt_duration(e.get("duration")):
+            bits.append(esc(fmt_duration(e["duration"])))
+        return '<p class="pod-meta">%s</p>' % " &middot; ".join(bits)
+
+    def ep_badge(self, e):
+        return ' <span class="pod-badge">%s</span>' % ("Trailer" if e["kind"] == "trailer" else "Bonus") if e["kind"] != "full" else ""
+
+    def ep_summary(self, e):
+        return e["summary"] or auto_summary(Markdown("").render(read_text(self.episode_md(e["slug"]))))
+
+    def player_html(self, c, e, prefix):
+        a = e.get("audio") or {}
+        if not a.get("file"):
+            return ""
+        src = attr(self.audio_src(c, e, prefix))
+        kind = "MP3" if a["type"] == AUDIO_TYPES["mp3"] else "M4A"
+        return ('<div class="pod-player"><audio controls preload="none"><source src="%s" type="%s"></audio>\n'
+                '<p class="pod-download"><a href="%s" download>Download (%s, %s)</a></p></div>'
+                % (src, attr(a["type"]), src, fmt_size(a["bytes"]), kind))
+
+    def episode_list(self, c, eps, prefix):
+        """The episodes on the show page, shaped by the podcast layout."""
+        if not eps:
+            return '<p class="empty">No episodes yet.</p>'
+        show = c["podcast"]["show"]
+        style = layout_opt(c, "podcast").get("list", "list")
+        serial = show["type"] == "serial"
+        if serial:
+            eps = list(reversed(eps))
+
+        def entry(e, featured=False):
+            href = prefix + attr(self.episode_rel(e["slug"], c))
+            label = self.ep_label(e)
+            num = '<span class="pod-num">%s</span> ' % esc(label) if label else ""
+            title = '<h3><a href="%s">%s%s</a>%s</h3>\n' % (href, num, esc(e["title"]), self.ep_badge(e))
+            meta = self.ep_meta_line(e) + "\n"
+            summary = "" if style == "archive" else self.ep_summary(e)
+            summ = '<p class="pod-summary">%s</p>\n' % esc(summary) if summary else ""
+            if featured:
+                img = card_image(e.get("art") or show["image"], prefix)
+                art = '<img class="pod-art" src="%s" alt="" loading="lazy">\n' % attr(img) if img else ""
+                return ('<section class="pod-spotlight">\n%s<div class="pod-body">\n<p class="pod-kicker">Latest episode</p>\n'
+                        '%s%s%s%s</div>\n</section>' % (art, title, meta, summ, self.player_html(c, e, prefix)))
+            if style == "cards":
+                img = card_image(e.get("art") or show["image"], prefix)
+                over = '<span class="pod-thumb-num">%s</span>' % esc(label) if label and not e.get("art") else ""
+                thumb = ('<a class="pod-thumb" href="%s" tabindex="-1" aria-hidden="true"><img src="%s" alt="" loading="lazy">%s</a>\n'
+                         % (href, attr(img), over)) if img else ""
+                return '<li class="pod-ep%s">\n%s<div class="pod-body">\n%s%s%s</div>\n</li>' % (
+                    " has-thumb" if img else "", thumb, title, meta, summ)
+            return '<li class="pod-ep">\n%s%s%s</li>' % (title, meta, summ)
+
+        head = '<h2 class="pod-episodes-title">Episodes</h2>\n'
+        lead = ""
+        if style == "spotlight" and not serial:
+            lead, eps = entry(eps[0], featured=True) + "\n", eps[1:]
+        ul = '<ul class="pod-episodes%s">\n%s\n</ul>' % (" cards" if style == "cards" else (" archive" if style == "archive" else ""), "%s")
+        seasons = any(e.get("season") for e in eps)
+        if style == "archive" or (serial and seasons):
+            groups = []
+            for e in eps:
+                key = ("Season %d" % e["season"] if e.get("season") else "Other episodes") if seasons else e["date"][:4]
+                if not groups or groups[-1][0] != key:
+                    groups.append((key, []))
+                groups[-1][1].append(entry(e))
+            body = "\n".join('<section class="pod-season">\n<h3 class="pod-group">%s</h3>\n%s\n</section>'
+                             % (esc(k), ul % "\n".join(rows)) for k, rows in groups)
+        else:
+            body = ul % "\n".join(entry(e) for e in eps) if eps else ""
+        return lead + head + body
+
+    def pod_landing(self, c, rel, css=None, base=None, intro=None):
+        prefix = up(rel)
+        show = self.pod_show(c)
+        body = self.md(c, prefix).render(read_text(self.pod_intro_md()) if intro is None else intro)
+        art = card_image(show["image"], prefix)
+        badge = ' <span class="pod-badge">Explicit</span>' if show["explicit"] else ""
+        parts = ['<header class="pod-show">%s<div class="pod-head">\n<h1 class="page-title">%s%s</h1>\n'
+                 '<p class="pod-author">%s</p>\n</div></header>'
+                 % ('<img class="pod-art" src="%s" alt="">\n' % attr(art) if art else "", esc(show["title"]), badge,
+                    esc(show["author"])),
+                 self.subscribe_html(c, prefix)]
+        if body:
+            parts.append('<section class="pod-about">\n%s\n</section>' % body)
+        parts.append(self.episode_list(c, self.pod_episodes(c), prefix))
+        home = c["home"] == "podcast"
+        site = c["site"]
+        return self.doc(c, rel=rel, body_class="mod-podcast podcast-show",
+                        title="" if rel == "index.html" else self.module_label("podcast", c),
+                        main='<article class="content">\n%s\n</article>' % "\n".join(x for x in parts if x),
+                        desc=auto_summary(body) or site.get("description") or site.get("tagline"),
+                        image=show["image"], current_mod="podcast", css=css, base=base,
+                        head_extra=self.pod_head(c, prefix), canonical_rel="index.html" if home else None)
+
+    def render_episode(self, c, e, markdown, css=None, base=None):
+        rel = self.episode_rel(e["slug"], c)
+        prefix = up(rel)
+        show = self.pod_show(c)
+        body = self.md(c, prefix).render(strip_title_h1(markdown, e["title"]))
+        img = card_image(e.get("art") or show["image"], prefix)
+        parts = ['<p class="pod-back"><a href="%s%s">%s</a></p>' % (prefix, self.landing_rel("podcast", c), esc(show["title"])),
+                 '<header class="pod-ep-head">%s<div class="pod-head">\n<h1 class="page-title">%s%s</h1>\n%s\n</div></header>'
+                 % ('<img class="pod-art" src="%s" alt="">\n' % attr(img) if img else "", esc(e["title"]),
+                    self.ep_badge(e), self.ep_meta_line(e, with_label=True)),
+                 self.player_html(c, e, prefix)]
+        if body:
+            parts.append('<div class="pod-notes">\n%s\n</div>' % body)
+        if e["chapters"]:
+            rows = []
+            for ch in e["chapters"]:
+                t = esc(ch["title"])
+                if ch["url"]:
+                    t = '<a href="%s">%s</a>' % (attr(ch["url"]), t)
+                rows.append('<li><span class="pod-time">%s</span> %s</li>' % (clock(ch["start"]), t))
+            parts.append('<section class="pod-chapters">\n<h2>Chapters</h2>\n<ol>\n%s\n</ol>\n</section>' % "\n".join(rows))
+        t = e.get("transcript") or {}
+        if t.get("file"):
+            path = self.transcript_dir(c) / t["file"]
+            try:
+                words = transcript_html(parse_transcript(read_text(path), Path(t["file"]).suffix.lower()))
+            except ApiError:
+                words = ""
+            parts.append('<details class="pod-transcript">\n<summary>Transcript</summary>\n%s\n'
+                         '<p class="pod-download"><a href="%s%s" download>Download the transcript</a></p>\n</details>'
+                         % (words, prefix, attr(self.pod_base(c) + "transcripts/" + t["file"])))
+        sub = self.subscribe_html(c, prefix, compact=True)
+        if sub:
+            parts.append(sub)
+        eps = self.pod_episodes(c)
+        slugs = [x["slug"] for x in eps]
+        if c["site"].get("post_nav") and e["slug"] in slugs:
+            i = slugs.index(e["slug"])
+            pager = []
+            if i + 1 < len(eps):
+                o = eps[i + 1]
+                pager.append('<a class="prev" href="%s%s"><small>Older</small>%s</a>'
+                             % (prefix, attr(self.episode_rel(o["slug"], c)), esc(o["title"])))
+            if i > 0:
+                n = eps[i - 1]
+                pager.append('<a class="next" href="%s%s"><small>Newer</small>%s</a>'
+                             % (prefix, attr(self.episode_rel(n["slug"], c)), esc(n["title"])))
+            if pager:
+                parts.append('<nav class="pager" aria-label="More episodes">%s</nav>' % "".join(pager))
+        extra = []
+        enc = self.enclosure_url(c, e)
+        if enc:
+            extra.append('<meta property="og:audio" content="%s">' % attr(enc))
+            extra.append('<meta property="og:audio:type" content="%s">' % attr(e["audio"]["type"]))
+        desc = e.get("description") or e["summary"] or auto_summary(body)
+        return self.doc(c, rel=rel, body_class="mod-podcast podcast-episode ep-" + e["slug"], title=e["title"],
+                        main='<article class="content">\n%s\n</article>' % "\n".join(x for x in parts if x),
+                        desc=desc, og_type="article", published=e["date"],
+                        image=e.get("image") or e.get("art") or show["image"], seo_title=e.get("seo_title"),
+                        canonical=e.get("canonical"), noindex=e.get("noindex"), current_mod="podcast", css=css,
+                        base=base, head_extra=self.pod_head(c, prefix, extra))
+
+    def pod_sitemap(self, c):
+        rows = []
+        if c["home"] != "podcast":
+            rows.append((self.landing_rel("podcast", c), ""))
+        rows += [(self.episode_rel(e["slug"], c), e["date"][:10]) for e in self.pod_episodes(c) if not e.get("noindex")]
+        return rows
+
+    # ---- preview
+    def pod_preview(self, c, p, md, css, base):
+        if p.get("view") == "podcasthome":
+            rel = "index.html" if c["home"] == "podcast" else self.pod_base(c) + "index.html"
+            return self.pod_landing(c, rel, css=css, base=preview_base(rel), intro=md)
+        e = self.find_episode(str(p.get("orig_slug") or ""), c)
+        if e is None:
+            e = {"slug": slugify(str(p.get("new_slug") or p.get("title") or "")) or "episode", "guid": "", "audio": {},
+                 "transcript": {}, "chapters": [], "media": {}, "duration": 0}
+            c["podcast"]["episodes"].append(e)
+        e.update(title=str(p.get("title") or "").strip() or "Untitled episode", number=_pos_int(p.get("number")),
+                 season=_pos_int(p.get("season")), kind=p.get("kind") if p.get("kind") in EPISODE_KINDS else "full",
+                 date=clean_when(p.get("date")), summary=str(p.get("summary") or "").strip()[:400],
+                 explicit=p.get("explicit") if p.get("explicit") in ("yes", "no") else "",
+                 art=str(p.get("art") or "").strip()[:400], chapters=clean_chapters(p.get("chapters")), status="published")
+        if not e["audio"].get("probed") and parse_clock(p.get("duration")) is not None:
+            e["duration"] = int(round(parse_clock(p.get("duration"))))
+        seo_fields(p, e)
+        rel = self.episode_rel(e["slug"], c)
+        return self.render_episode(c, e, md, css=css, base=preview_base(rel))
+
+    def pod_preview_target(self, c, rest, css):
+        if not rest:
+            rel = self.pod_base(c) + "index.html"
+            return self.pod_landing(c, rel, css=css, base=preview_base(rel))
+        e = self.find_episode(rest, c)
+        if e:
+            rel = self.episode_rel(e["slug"], c)
+            return self.render_episode(c, e, read_text(self.episode_md(rest)), css=css, base=preview_base(rel))
+        return None
+
+    def pod_preview_targets(self, c):
+        out = [{"id": "podcast:", "label": "Podcast show page"}]
+        out += [{"id": "podcast:" + e["slug"], "label": "Episode: " + e["title"]} for e in self.pod_episodes(c)[:20]]
+        return out
+
+    # ---- feed check
+    def art_info(self, path):
+        p = self.local_file(path)
+        if p is None:
+            return None
+        st = p.stat()
+        cache = self._art_cache
+        key = str(p)
+        hit = cache.get(key)
+        if hit and hit[0] == (st.st_mtime_ns, st.st_size):
+            return hit[1]
+        info = image_info(p)
+        cache[key] = ((st.st_mtime_ns, st.st_size), info)
+        return info
+
+    def pod_check(self, c, feed):
+        """The feed check: fail stops Build and publish, warn and info are advice."""
+        out = []
+
+        def add(level, text, fix=""):
+            out.append({"level": level, "text": text, "fix": fix})
+
+        site, show = c["site"], c["podcast"]["show"]
+        url = site.get("url") or ""
+        if not url:
+            add("fail", "The site URL is missing, so there is no feed yet.",
+                "Enter it under Settings, for example https://example.com.")
+        elif url.lower().startswith("http://"):
+            add("warn", "The site URL starts with http://. Apple and Spotify expect https.",
+                "Turn on HTTPS on the server, then change the URL under Settings.")
+        if not show["owner_email"]:
+            add("fail", "The owner email is missing.", "Fill it in under Owner. Directories send verification codes to it.")
+        if re.match(r"^https?://", show["image"], re.I):
+            add("info", "The show art is a web address, so it was not checked here.")
+        else:
+            for level, text, fix in art_problems(self.art_info(show["image"]) if show["image"] else None, "Show art"):
+                add(level, text, fix)
+        if not show["categories"]:
+            add("fail", "No category is chosen.", "Pick at least a primary category under Show.")
+        eps = self.pod_episodes(c)
+        if not eps:
+            add("fail", "No episode is published yet.", "Directories turn down a feed with no episodes.")
+        if show["media_mode"] == "host" and not show["media_url"]:
+            add("fail", "Audio is set to live on a separate media host, but the media base URL is blank.",
+                "Fill in Media base URL under Media.")
+        seen_url, seen_guid = {}, {}
+        for e in eps:
+            a = e["audio"]
+            name = '"%s"' % e["title"]
+            if not a.get("file"):
+                add("fail", "%s is published but has no audio." % name, "Upload its audio, or move it back to drafts.")
+                continue
+            path = self.audio_dir(c) / a["file"]
+            if not path.is_file():
+                add("fail", "The audio for %s is missing: %s." % (name, path), "Upload it again, or restore the file.")
+            elif path.stat().st_size != a["bytes"]:
+                add("fail", "The audio for %s changed size on disk (%d bytes, the record says %d)." % (name, path.stat().st_size, a["bytes"]),
+                    "Upload it again through the editor so the feed gets the right length.")
+            if not all(ord(ch) < 128 for ch in a["file"]):
+                add("fail", "The audio file name for %s has non-ASCII characters." % name, "Upload it again; new names are ASCII.")
+            u = self.enclosure_url(c, e)
+            if u in seen_url:
+                add("fail", "%s and %s share the same audio address." % (name, seen_url[u]), "Give each episode its own audio.")
+            seen_url[u] = name
+            if e["guid"] in seen_guid:
+                add("fail", "%s and %s share a GUID." % (name, seen_guid[e["guid"]]), "Edit config.json so each one is unique.")
+            seen_guid[e["guid"]] = name
+            if not e.get("duration"):
+                add("warn", "%s has no duration." % name, "Type the length into the episode, or install ffmpeg so it is measured.")
+            if re.match(r"^\s*(#|ep\.?\s*|episode\s+)?\d+\s*[:.)|-]", e["title"], re.I):
+                add("warn", "The title of %s starts with an episode number." % name,
+                    "Apple asks for the number in the episode number field, not the title.")
+            if isinstance(a.get("lufs"), (int, float)) and abs(a["lufs"] + 16) > 1:
+                add("warn", "%s measures %.1f LUFS; the target is -16." % (name, a["lufs"]),
+                    "Turn on Normalize loudness and Retry processing.")
+            if e.get("art") and not re.match(r"^https?://", e["art"], re.I):
+                for level, text, fix in art_problems(self.art_info(e["art"]), "Episode art for %s" % name):
+                    add("warn", text, fix)
+            notes_len = len(e["summary"]) + len(Markdown("").render(read_text(self.episode_md(e["slug"]))))
+            if notes_len > 4000:
+                add("info", "The description of %s is over 4,000 characters, so the feed's short description is cut; "
+                            "the full show notes still go out." % name)
+        for e in c["podcast"]["episodes"]:
+            if e["media"]["state"] == "failed":
+                add("warn", 'Processing failed for "%s".' % e["title"], "Open the episode to see the log, then Retry processing.")
+        if len(Markdown("").render(read_text(self.pod_intro_md())).encode("utf-8")) > 4000:
+            add("info", "About the show is over 4,000 bytes, so the feed carries a shortened copy.")
+        if show["block"]:
+            add("warn", "Keep out of directories is on, so directories will not list the show.", "Turn it off under Feed when you are ready.")
+        for e in self.pod_episodes(c, scheduled=True):
+            add("info", '"%s" is scheduled for %s. It goes out with the first publish after that time.'
+                % (e["title"], e["date"].replace("T", " ")))
+        if feed:
+            try:
+                ET.fromstring(feed.encode("utf-8"))
+            except ET.ParseError as err:
+                add("fail", "The built feed does not parse as XML: %s." % err, "Report this; it is a bug in the generator.")
+        return out
+
+    def pod_check_fails(self):
+        return [x for x in self._pod_check if x["level"] == "fail"]
+
+    # ---- publishing hooks (read by the shared publish code)
+    def publish_blocker(self):
+        if self.enabled("podcast") and media_busy():
+            return "Audio is still being processed. Publish when the media job has finished."
+        return ""
+
+    def publish_check(self):
+        if not self.enabled("podcast"):
+            return ""
+        fails = self.pod_check_fails()
+        if not fails:
+            return ""
+        return ("The podcast feed check failed: %s Fix it, or tick Publish anyway to send the site regardless."
+                % " ".join(x["text"] for x in fails[:4]))
+
+    def publish_plan(self, dep, dry):
+        """What the publish needs to do differently for the podcast: the feed files go last,
+        and with a separate media host the audio goes there first and stays off the site."""
+        if not self.enabled("podcast") or not self.cfg["site"].get("url"):
+            return {}
+        c = self.cfg
+        plan = {"last": [self.feed_rel(c)] + self.pod_legacy_rels(c)}
+        if c["podcast"]["show"]["media_mode"] == "host":
+            plan["exclude"] = [self.pod_base(c) + "audio/"]
+            plan["before"] = lambda: self.pod_send_media(dry)
+        plan["after"] = lambda: self.pod_after_publish()
+        return plan
+
+    def media_target(self):
+        t = self.cfg["podcast"]["show"]["media_target"]
+        dep = clean_media_target(t)
+        if dep["method"] == "rclone":
+            if not dep["remote"]:
+                raise ApiError("Set the media host's rclone target under Media in show settings.")
+            return dep
+        if dep["method"] == "folder":
+            folder_dest(self, dep)
+        return validate_deploy(dep)
+
+    def pod_media_files(self, c):
+        """Audio files for published episodes, by file name."""
+        out = []
+        for e in self.pod_episodes(c):
+            f = e["audio"].get("file")
+            if f and (self.audio_dir(c) / f).is_file() and f not in out:
+                out.append(f)
+        return out
+
+    def pod_send_media(self, dry):
+        """Stage 1 of a publish with a separate media host: send the audio, then check that every
+        enclosure answers before the feed that points at it goes anywhere."""
+        with LOCK:
+            c = copy.deepcopy(self.cfg)
+            dep = self.media_target()
+        files = self.pod_media_files(c)
+        job_say("Stage 1 of 2: %d audio file(s) to the media host (%s)." % (len(files), dep["method"]))
+        root = self.meta / "staging"
+        root.mkdir(parents=True, exist_ok=True)
+        staged = Path(tempfile.mkdtemp(prefix="media-", dir=str(root)))
+        try:
+            for f in files:
+                src = self.audio_dir(c) / f
+                try:
+                    os.link(src, staged / f)
+                except OSError:
+                    shutil.copy2(src, staged / f)
+            sigs = file_sigs(staged, files)
+            if dep["method"] == "rclone":
+                deploy_rclone(dep, staged, dry)
+            else:
+                password = media_password(self, dep)
+                rec = MediaRecord(self)
+                send = changed_files(rec, dep, files, sigs)
+                if dep["method"] != "rsync" and len(send) < len(files):
+                    job_say("%d of them changed since the last upload to the media host; only those are sent." % len(send))
+                if dep["method"] == "rsync":
+                    deploy_rsync(dep, password, staged, dry)
+                elif dep["method"] == "sftp":
+                    deploy_sftp(rec, dep, password, files, staged, dry, send)
+                elif dep["method"] in ("ftp", "ftps"):
+                    deploy_ftp(rec, dep, password, files, staged, dry, send)
+                else:
+                    deploy_folder(rec, dep, files, staged, dry, send)
+            if not dry:
+                # The media host never deletes, so its record keeps every file ever sent there until
+                # "Remove unused audio from the media host" takes some away.
+                rec = MediaRecord(self)
+                all_sigs = load_published_sigs(rec, dep) or {}
+                all_sigs.update(sigs)
+                save_published(rec, dep, sorted(set(load_published(rec, dep) or []) | set(files)), all_sigs)
+        finally:
+            shutil.rmtree(staged, ignore_errors=True)
+        if dry:
+            job_say("Dry run: the media host was not checked over the network.")
+            return
+        job_say("Checking that every episode's audio answers at the media base URL...")
+        bad = []
+        for e in self.pod_episodes(c):
+            if not e["audio"].get("file"):
+                continue
+            url = self.enclosure_url(c, e)
+            st, hd, _, err = http_check(url)
+            if st != 200 or hd.get("content-length") not in (None, str(e["audio"]["bytes"])):
+                bad.append("%s (%s)" % (url, err or ("HTTP %d" % st if st != 200 else "wrong length")))
+        if bad:
+            for b in bad:
+                job_say("Not reachable: " + b)
+            raise ApiError("%d audio file(s) do not answer at the media base URL, so the feed was not sent. "
+                           "Check the media base URL and the media host." % len(bad))
+        job_say("Stage 2 of 2: the site, with the feed last.")
+
+    def pod_after_publish(self):
+        """After a successful publish: check what is live, ping Podcast Index when the feed
+        changed, and lock the feed URL the first time."""
+        with LOCK:
+            c = copy.deepcopy(self.cfg)
+        feed_url = self.feed_url(c)
+        local = self.root / self.feed_rel(c)
+        if not feed_url or not local.is_file():
+            return
+        show = c["podcast"]["show"]
+        verified = set(show["verified"])
+        job_say("Live check of %s" % feed_url)
+        warnings, newly, cloudflare = [], [], False
+        targets = [(e["title"], self.enclosure_url(c, e), e["audio"]["bytes"]) for e in self.pod_episodes(c)
+                   if e["audio"].get("file") and self.enclosure_url(c, e) not in verified]
+        art = self.art_url(c, show["image"])
+        for title, url, size in targets:
+            st, hd, _, err = http_check(url)
+            if "cf-ray" in hd or hd.get("server", "").lower() == "cloudflare":
+                cloudflare = True
+            if st != 200:
+                warnings.append("Audio for \"%s\" did not answer: %s (%s)." % (title, url, err or st))
+                continue
+            if hd.get("content-length") is not None and hd["content-length"] != str(size):
+                warnings.append("Audio for \"%s\" is %s bytes on the server; the feed says %d." % (title, hd["content-length"], size))
+                continue
+            if hd.get("accept-ranges", "").lower() != "bytes":
+                warnings.append("The server does not say it answers byte ranges for %s. Apple needs that for seeking." % url)
+            newly.append(url)
+        if art:
+            st, hd, _, err = http_check(art)
+            if st != 200:
+                warnings.append("The show art did not answer at %s (%s)." % (art, err or st))
+        st, hd, body, err = http_check(feed_url, "GET")
+        live = False
+        if st != 200:
+            warnings.append("The feed did not answer at %s (%s)." % (feed_url, err or st))
+        elif body != local.read_bytes():
+            warnings.append("The live feed differs from the one just built. A cache in front of the server may still "
+                            "hold the old one; it should catch up.")
+            live = True
+        else:
+            live = True
+            job_say("The live feed matches the one just built.")
+        if cloudflare and show["media_mode"] == "site":
+            warnings.append("The audio is served through Cloudflare's proxy. Cloudflare's CDN terms let it limit sites "
+                            "that serve a lot of audio this way; R2 or a DNS-only subdomain for audio avoids that. %s"
+                            % CLOUDFLARE_TERMS)
+        for w in warnings:
+            job_say("Warning: " + w)
+        if not warnings:
+            job_say("Live check passed: %d new audio file(s) answered with the right size." % len(newly))
+        feed_hash = hashlib.sha256(local.read_bytes()).hexdigest()
+        ping = None
+        if show["ping"] and live and not show["block"] and show["last_ping"].get("hash") != feed_hash:
+            ping = self.pod_ping(feed_url, feed_hash)
+        if show["websub"] and live and show["last_ping"].get("websub") != feed_hash:
+            self.pod_websub(feed_url)
+        with LOCK:
+            s = self.cfg["podcast"]["show"]
+            s["verified"] = (s["verified"] + newly)[-3000:]
+            if live:
+                s["live_seen"] = now_when().isoformat()
+            if ping is not None:
+                s["last_ping"] = ping
+            if show["websub"] and live:
+                s["last_ping"]["websub"] = feed_hash
+            if not s["feed_lock"]:
+                s["feed_lock"] = feed_url
+                s["guid"] = podcast_guid(feed_url)
+                s["locked_at"] = now_when().isoformat()
+                job_say("The feed URL is now locked to %s, and its podcast:guid is %s. Changes that would move it "
+                        "ask first." % (feed_url, s["guid"]))
+            self.save_cfg()
+
+    def pod_ping(self, feed_url, feed_hash):
+        """Tell Podcast Index the feed changed. Needs no key; a failure is only a warning."""
+        url = PODCAST_INDEX_PING + quote(feed_url, safe="")
+        req = urllib.request.Request(url, headers={"User-Agent": "%s (self-hosted podcast feed)" % APP})
+        ok, message = False, ""
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                text = r.read(4000).decode("utf-8", "replace")
+                ok = r.status == 200
+            try:
+                d = json.loads(text)
+                message = str(d.get("description") or text)[:200]
+                ok = ok and str(d.get("status")).lower() == "true"
+            except ValueError:
+                message = text[:200]
+        except urllib.error.HTTPError as e:
+            message = "HTTP %d" % e.code
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            message = str(getattr(e, "reason", e))
+        job_say(("Pinged Podcast Index: %s" if ok else "Warning: the Podcast Index ping failed: %s") % message)
+        return {"at": now_when().isoformat(), "ok": ok, "message": message, "hash": feed_hash}
+
+    def pod_websub(self, feed_url):
+        data = ("hub.mode=publish&hub.url=" + quote(feed_url, safe="")).encode("ascii")
+        req = urllib.request.Request(WEBSUB_HUB, data=data, headers={"User-Agent": "%s (self-hosted podcast feed)" % APP,
+                                                                       "Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                job_say("Notified the WebSub hub (HTTP %d)." % r.status)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            job_say("Warning: the WebSub hub did not take the notice: %s" % getattr(e, "reason", e))
+
+    # ---- feed URL lock
+    def pod_feed_moved(self, old_cfg):
+        """A message when a change would move a locked feed, else ""."""
+        lock = self.cfg["podcast"]["show"].get("feed_lock")
+        if not lock:
+            return ""
+        new = self.feed_url() if self.enabled("podcast") else ""
+        if new == lock:
+            return ""
+        if not new:
+            return ("The podcast feed at %s is locked: podcast apps and directories read it. This change takes it off "
+                    "the site, so they will stop getting new episodes. Continue?" % lock)
+        msg = ("The podcast feed moves from\n  %s\nto\n  %s\n\nPodcast apps and directories know the old address. "
+               % (lock, new))
+        if _host_of(lock) != _host_of(new):
+            msg += ("The old address is on another domain (%s), so that server has to keep serving the old feed or "
+                    "redirect it to the new one; this app cannot write there. " % _host_of(lock))
+        else:
+            msg += ("The old address keeps getting a copy of the feed that tells apps to switch (itunes:new-feed-url), "
+                    "on every build, until you remove it. ")
+        return msg + "Continue?"
+
+    def pod_accept_move(self):
+        show = self.cfg["podcast"]["show"]
+        new = self.feed_url() if self.enabled("podcast") else ""
+        old = show["feed_lock"]
+        if new and old and old != new and old not in show["legacy_feeds"]:
+            show["legacy_feeds"].append(old)
+        if new in show["legacy_feeds"]:
+            show["legacy_feeds"].remove(new)
+        if new:
+            show["feed_lock"] = new
+
+    def pod_move_files(self, old_cfg):
+        """Carry audio and transcripts along when the podcast's folder changes."""
+        if not self.enabled("podcast") or "podcast" not in old_cfg.get("modules", {}):
+            return
+        old_base = (old_cfg["modules"]["podcast"]["mount"] + "/") if old_cfg["modules"]["podcast"]["mount"] else ""
+        new_base = self.pod_base()
+        if old_base == new_base:
+            return
+        for sub in ("audio", "transcripts"):
+            src, dest = self.root / (old_base + sub), self.root / (new_base + sub)
+            if not src.is_dir() or src.is_symlink():
+                continue
+            dest.mkdir(parents=True, exist_ok=True)
+            for f in src.iterdir():
+                if f.is_file() and not f.is_symlink() and not (dest / f.name).exists():
+                    os.replace(f, dest / f.name)
+            try:
+                src.rmdir()
+            except OSError:
+                pass
+
+    # ---- rescan and unused audio
+    def pod_rescan(self):
+        r = {"episodes_added": 0}
+        d = self.pod_meta() / "episodes"
+        d.mkdir(parents=True, exist_ok=True)
+        eps = self.cfg["podcast"]["episodes"]
+        known = {e["slug"] for e in eps}
+        for f in sorted(md_files(d), key=lambda p: p.name.lower()):
+            slug = slugify(f.stem)
+            if not slug or slug in known:
+                continue
+            if slug != f.stem:
+                if self.episode_md(slug).exists():
+                    continue
+                rename_path(f, self.episode_md(slug))
+            eps.append({"slug": slug, "title": first_h1(read_text(self.episode_md(slug))) or title_from_name(f.stem),
+                        "status": "draft"})
+            known.add(slug)
+            r["episodes_added"] += 1
+        self.normalize_podcast()
+        r["unused_audio"] = len(self.unused_audio())
+        return r
+
+    def unused_audio(self):
+        folder = self.audio_dir()
+        if not folder.is_dir() or folder.is_symlink():
+            return []
+        used = {e["audio"].get("file") for e in self.cfg["podcast"]["episodes"]}
+        out = []
+        for f in sorted(folder.iterdir(), key=lambda p: p.name.lower()):
+            if f.is_file() and not f.is_symlink() and not f.name.startswith(".") and f.name not in used:
+                out.append({"file": f.name, "bytes": f.stat().st_size})
+        return out
+
+    def trash_unused(self, d):
+        names = d.get("files") if isinstance(d.get("files"), list) else []
+        unused = {x["file"] for x in self.unused_audio()}
+        n = 0
+        for name in names:
+            if name in unused:
+                self.to_trash(self.audio_dir() / name)
+                n += 1
+        return {"trashed": n, "unused": self.unused_audio()}
+
+    # ---- editor API: the show
+    def pod_state(self):
+        """The podcast part of the editor state: enough for the sidebar and the views."""
+        c = self.cfg
+        show = c["podcast"]["show"]
+        now = now_when()
+        eps = []
+        for e in c["podcast"]["episodes"]:
+            eps.append({"slug": e["slug"], "title": e["title"], "status": e["status"], "date": e["date"],
+                        "kind": e["kind"], "number": e["number"], "season": e["season"], "media": e["media"]["state"],
+                        "has_audio": bool(e["audio"].get("file")),
+                        "scheduled": e["status"] == "published" and parse_when(e["date"]) > now})
+        eps.sort(key=lambda e: (e["date"], e["title"].lower()), reverse=True)
+        fails = len(self.pod_check_fails())
+        return {"episodes": eps, "feed_url": self.feed_url(c), "check_fails": fails,
+                "checklist_done": len(show["checklist"]), "checklist_total": len(DIRECTORIES),
+                "media_mode": show["media_mode"], "upload_limit_mb": show["upload_limit_mb"],
+                "next_number": self.next_number()}
+
+    def get_show(self):
+        c = self.cfg
+        show = c["podcast"]["show"]
+        dep = clean_media_target(show["media_target"]) if show["media_target"] else {"method": "rsync"}
+        media_dep = dict(default_deploy())
+        media_dep.update(dep)
+        return {"show": show, "resolved": self.pod_show(c), "markdown": read_text(self.pod_intro_md()),
+                "categories": APPLE_CATEGORIES, "feed_url": self.feed_url(c), "feed_rel": self.feed_rel(c),
+                "guid": show["guid"] or podcast_guid(self.feed_url(c)), "check": self._pod_check,
+                "unused": self.unused_audio(), "directories": DIRECTORIES, "media_target": media_dep,
+                "media_password": bool(media_password(self, dep)) if show["media_target"] else False,
+                "audio_folder": str(self.audio_dir()), "legacy": [{"url": u, "rel": self.legacy_rel(c, u)}
+                                                                   for u in show["legacy_feeds"]],
+                "env_var": APP.upper() + "_MEDIA_PASSWORD"}
+
+    def save_show(self, d):
+        c = self.cfg
+        show = c["podcast"]["show"]
+        before = (json.dumps({k: show.get(k) for k in ("title", "author", "owner_name", "owner_email", "language",
+                                                        "categories", "explicit", "type", "image", "link", "copyright",
+                                                        "complete", "block", "locked", "funding", "websub")},
+                             sort_keys=True), read_text(self.pod_intro_md()))
+        new = dict(show)
+        for k, limit in (("title", 200), ("author", 200), ("owner_name", 200), ("owner_email", 200), ("language", 12),
+                         ("image", 400), ("link", 400), ("copyright", 400), ("media_url", 400)):
+            if k in d:
+                new[k] = re.sub(r"\s+", " ", str(d[k] or "")).strip()[:limit]
+        if new["owner_email"] and not _EMAIL_RE.match(new["owner_email"]):
+            raise ApiError("The owner email does not look like an email address.")
+        if new["language"] and not _LANG_RE.match(new["language"]):
+            raise ApiError("Language is a code such as en or en-US.")
+        for k in ("link", "media_url"):
+            if new[k] and not re.match(r"^https?://[^\s/]+", new[k], re.I):
+                raise ApiError("The %s must start with http:// or https://." % ("website link" if k == "link" else "media base URL"))
+        for k in PODCAST_SHOW_BOOLS:
+            if k in d:
+                new[k] = bool(d[k])
+        if d.get("type") in ("episodic", "serial"):
+            new["type"] = d["type"]
+        if d.get("format") in AUDIO_TYPES:
+            new["format"] = d["format"]
+        if d.get("media_mode") in ("site", "host"):
+            new["media_mode"] = d["media_mode"]
+        for k, lo, hi in (("kbps_mono", 64, 128), ("kbps_stereo", 128, 256), ("upload_limit_mb", 1, 1024 * 1024)):
+            if k in d:
+                new[k] = _clamp_int(d[k], lo, hi, new[k])
+        if "categories" in d:
+            for item in d["categories"] if isinstance(d["categories"], list) else []:
+                cat = str((item or {}).get("cat") or "") if isinstance(item, dict) else ""
+                if cat and cat not in APPLE_CATEGORY_MAP:
+                    raise ApiError("%s is not one of Apple's categories." % cat)
+            new["categories"] = clean_categories(d["categories"])
+        if "funding" in d:
+            for f in d["funding"] if isinstance(d["funding"], list) else []:
+                if isinstance(f, dict) and str(f.get("url") or "").strip() and not re.match(r"^https?://\S+$", str(f["url"]).strip()):
+                    raise ApiError("A funding link must be a full web address starting with https://.")
+            new["funding"] = clean_funding(d["funding"])
+        if isinstance(d.get("media_target"), dict):
+            t = clean_media_target(d["media_target"])
+            if t["method"] != "rclone":
+                validate_deploy(t, require=False)
+            new["media_target"] = t
+            if t["method"] != "rclone" and "media_password" in d:
+                store_media_password(self, t, str(d.get("media_password") or ""), bool(t.get("save_password")))
+        c["podcast"]["show"] = new
+        if "markdown" in d:
+            write_text(self.pod_intro_md(), str(d.get("markdown") or ""))
+        after = (json.dumps({k: new.get(k) for k in json.loads(before[0])}, sort_keys=True), read_text(self.pod_intro_md()))
+        if after != before:
+            new["saved"] = now_when().isoformat()
+        self.normalize_podcast()
+        self.save_cfg()
+        self.build()
+        return self.get_show()
+
+    # ---- editor API: episodes
+    def get_episode(self, slug):
+        e = self.get_episode_rec(slug)
+        md = read_text(self.episode_md(slug))
+        return {"episode": e, "markdown": md, "enclosure": self.enclosure_url(self.cfg, e),
+                "youtube": self.youtube_text(e, md), "src": ("/site/" + self.pod_base() + "audio/" + e["audio"]["file"])
+                if e["audio"].get("file") else "", "base": self.pod_base() + "episodes/"}
+
+    def youtube_text(self, e, md):
+        """Title, a plain-text description and chapter times, for pasting into YouTube Studio."""
+        base = (self.cfg["site"].get("url") or "").rstrip("/") + "/"
+        notes = html_to_text(Markdown(base).render(strip_title_h1(md, e["title"])))
+        lines = [e["title"], ""]
+        if e["summary"]:
+            lines += [e["summary"], ""]
+        if notes:
+            lines += [notes, ""]
+        if e["chapters"]:
+            lines += ["Chapters"] + ["%s %s" % (clock(ch["start"]), ch["title"]) for ch in e["chapters"]] + [""]
+        if self.feed_url():
+            lines += ["Podcast feed: " + self.feed_url()]
+        return "\n".join(lines).strip() + "\n"
+
+    def save_episode(self, d):
+        title = re.sub(r"\s+", " ", str(d.get("title") or "")).strip()[:200]
+        if not title:
+            raise ApiError("Give the episode a title.")
+        eps = self.cfg["podcast"]["episodes"]
+        orig = str(d.get("orig_slug") or "")
+        ep = self.find_episode(orig) if orig else None
+        if orig and not ep:
+            raise ApiError("That episode does not exist.", 404)
+        if d.get("publish") and not (ep and ep["audio"].get("file")):
+            raise ApiError("Add the audio before publishing. Save a draft, upload the recording, then publish.")
+        chapters = clean_chapters(d.get("chapters")) if "chapters" in d else (ep["chapters"] if ep else [])
+        if chapters and chapters[0]["start"] != 0:
+            raise ApiError("The first chapter has to start at 0:00.")
+        wanted = slugify(str(d.get("new_slug") or "")) or slugify(title) or "episode"
+        taken = {e["slug"] for e in eps if e is not ep}
+        slug, n = wanted, 2
+        while slug in taken:
+            slug = "%s-%d" % (wanted, n)
+            n += 1
+        if ep is None:
+            ep = {"slug": slug, "status": "draft", "guid": "urn:uuid:%s" % uuid.uuid4(), "audio": {}, "media": {},
+                  "transcript": {}, "chapters": []}
+            if "number" not in d:
+                d["number"] = self.next_number()
+            eps.append(ep)
+        elif ep["slug"] != slug:
+            old = self.episode_md(ep["slug"])
+            if old.exists():
+                os.replace(old, self.episode_md(slug))
+            ep["slug"] = slug
+
+        def val(k):
+            # A field left out of the request keeps its saved value.
+            return d[k] if k in d else ep.get(k)
+
+        ep.update(title=title, number=_pos_int(val("number")), season=_pos_int(val("season")),
+                  kind=val("kind") if val("kind") in EPISODE_KINDS else "full", date=clean_when(val("date")),
+                  summary=str(val("summary") or "").strip()[:400],
+                  explicit=val("explicit") if val("explicit") in ("yes", "no") else "",
+                  art=str(val("art") or "").strip()[:400], chapters=chapters)
+        if "duration" in d and not ep["audio"].get("probed"):
+            t = parse_clock(d.get("duration"))
+            ep["duration"] = int(round(t)) if t is not None else 0
+        seo_fields(d, ep)
+        if d.get("publish"):
+            ep["status"] = "published"
+        if "markdown" in d or not self.episode_md(slug).exists():
+            write_text(self.episode_md(slug), str(d.get("markdown") or ""))
+        self.normalize_podcast()
+        self.save_cfg()
+        self.build()
+        return {"slug": slug, "episode": self.find_episode(slug), "state": self.state()}
+
+    def unpublish_episode(self, slug):
+        e = self.get_episode_rec(slug)
+        e["status"] = "draft"
+        self.save_cfg()
+        self.build()
+        return {"episode": e}
+
+    def delete_episode(self, slug):
+        e = self.get_episode_rec(slug)
+        self.cfg["podcast"]["episodes"].remove(e)
+        self.to_trash(self.episode_md(slug))
+        t = e.get("transcript") or {}
+        if t.get("file"):
+            self.to_trash(self.transcript_dir() / t["file"])
+        self.save_cfg()
+        self.build()
+        note = ""
+        if e["audio"].get("file"):
+            note = "Its audio, %s, is now under Unused audio in show settings." % e["audio"]["file"]
+        return {"ok": True, "note": note}
+
+    # ---- transcripts
+    def upload_transcript(self, slug, name, data):
+        e = self.get_episode_rec(slug)
+        ext = Path(str(name or "")).suffix.lower()
+        if ext not in TRANSCRIPT_TYPES:
+            raise ApiError("A transcript is a .vtt or .srt file.")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ApiError("The transcript must be UTF-8 text.")
+        cues = parse_transcript(text, ext)
+        stem = Path(e["audio"]["file"]).stem if e["audio"].get("file") else ("episode-%s" % slug)
+        fname = re.sub(r"[^a-z0-9-]+", "-", stem.lower()).strip("-") + ext
+        folder = self.transcript_dir()
+        old = (e.get("transcript") or {}).get("file")
+        if old and old != fname:
+            self.to_trash(folder / old)
+        write_text(folder / fname, text.replace("\r\n", "\n").lstrip("﻿"))
+        e["transcript"] = {"file": fname, "type": TRANSCRIPT_TYPES[ext], "cues": len(cues)}
+        self.save_cfg()
+        self.build()
+        return {"episode": e}
+
+    def delete_transcript(self, slug):
+        e = self.get_episode_rec(slug)
+        t = e.get("transcript") or {}
+        if t.get("file"):
+            self.to_trash(self.transcript_dir() / t["file"])
+        e["transcript"] = {}
+        self.save_cfg()
+        self.build()
+        return {"episode": e}
+
+    # ---- artwork
+    def art_check(self, d):
+        path = str(d.get("path") or "").strip()
+        if not path:
+            return {"info": None, "problems": [{"level": "fail", "text": "No image chosen."}]}
+        if re.match(r"^https?://", path, re.I):
+            return {"info": None, "problems": [{"level": "info", "text": "A web address cannot be checked here."}]}
+        p = self.local_file(path)
+        info = image_info(p) if p else None
+        probs = [{"level": lv, "text": t, "fix": f} for lv, t, f in art_problems(info, "This image")]
+        return {"info": info, "problems": probs, "can_fix": bool(p) and bool(shutil.which("ffmpeg"))}
+
+    def theme_bg(self):
+        m = re.search(r"--bg:\s*#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b", read_text(self.css_path()))
+        if not m:
+            return "0xffffff"
+        h = m.group(1)
+        return "0x" + ("".join(ch * 2 for ch in h) if len(h) == 3 else h)
+
+    def art_fix(self, d):
+        """Write a 3000 pixel square RGB JPG next to the original as a media job. The original is
+        never overwritten. target: show or episode, to point that record at the new file."""
+        if not shutil.which("ffmpeg"):
+            raise ApiError("Fix artwork needs ffmpeg. " + install_hint("ffmpeg"))
+        src = self.local_file(str(d.get("path") or ""))
+        if src is None:
+            raise ApiError("Choose an image in this site's folder first.")
+        stem = re.sub(r"[^A-Za-z0-9_-]+", "-", src.stem).strip("-") or "art"
+        stem = re.sub(r"-3000(-\d+)?$", "", stem)
+        folder = self.root / "assets"
+        folder.mkdir(exist_ok=True)
+        out, n = folder / (stem + "-3000.jpg"), 2
+        while out.exists():
+            out = folder / ("%s-3000-%d.jpg" % (stem, n))
+            n += 1
+        target, slug = d.get("target"), str(d.get("episode") or "")
+        bg = self.theme_bg()
+        site = self
+
+        def run():
+            log = []
+            tmp = out.with_name("." + out.name + ".part.jpg")
+            cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-nostats", "-y", "-f", "lavfi", "-i",
+                   "color=c=%s:s=3000x3000" % bg, "-i", str(src.resolve()), "-filter_complex",
+                   "[1:v]scale=3000:3000:force_original_aspect_ratio=increase,crop=3000:3000[fg];"
+                   "[0:v][fg]overlay=shortest=1:format=auto,format=yuvj444p",
+                   "-frames:v", "1", "-q:v", "3", "-f", "image2", str(tmp)]
+            try:
+                code, _ = run_ffmpeg(cmd, log)
+                if code != 0 or not tmp.is_file():
+                    raise ApiError("ffmpeg could not convert the image (exit code %d)." % code)
+                os.replace(tmp, out)
+            finally:
+                if tmp.exists():
+                    tmp.unlink()
+            rel = "assets/" + out.name
+            media_say("Wrote %s." % rel)
+            with LOCK:
+                w = CURRENT["site"] if CURRENT["site"] is not None and CURRENT["site"].root == site.root else site
+                if target == "show":
+                    w.cfg["podcast"]["show"]["image"] = rel
+                    w.cfg["podcast"]["show"]["saved"] = now_when().isoformat()
+                elif target == "episode" and w.find_episode(slug):
+                    w.find_episode(slug)["art"] = rel
+                w.save_cfg()
+                w.build()
+
+        media_queue("Fixing artwork: %s" % src.name, run)
+        return {"started": True, "path": "assets/" + out.name}
+
+    # ---- audio
+    def upload_limit(self):
+        return self.cfg["podcast"]["show"]["upload_limit_mb"] * 1024 * 1024
+
+    def queue_audio(self, slug, original, name):
+        """An upload has landed in incoming/: mark the episode and hand it to the media job."""
+        e = self.get_episode_rec(slug)
+        old = e["media"].get("original")
+        if old and old != original.name:
+            stale = self.incoming_dir() / old
+            if stale.is_file():
+                stale.unlink()
+        e["media"] = {"state": "queued", "message": "", "log": [], "original": original.name,
+                      "name": str(name or "")[:200]}
+        self.save_cfg()
+        site = self
+        media_queue("Processing audio for \"%s\"" % e["title"], lambda: site.pod_process(slug), episode=slug)
+        return {"started": True, "episode": e}
+
+    def retry_audio(self, slug):
+        e = self.get_episode_rec(slug)
+        orig = e["media"].get("original")
+        if not orig or not (self.incoming_dir() / orig).is_file():
+            raise ApiError("The original upload is gone. Upload the audio again.")
+        return self.queue_audio(slug, self.incoming_dir() / orig, e["media"].get("name"))
+
+    def pod_media_update(self, slug, **kw):
+        with LOCK:
+            w = CURRENT["site"] if CURRENT["site"] is not None and CURRENT["site"].root == self.root else self
+            e = w.find_episode(slug)
+            if e is None:
+                return None
+            e["media"].update({k: v for k, v in kw.items() if k in ("state", "message", "log", "original", "name")})
+            if "audio" in kw:
+                e["audio"] = kw["audio"]
+            if "duration" in kw:
+                e["duration"] = kw["duration"]
+            w.save_cfg()
+            if kw.get("build"):
+                w.build()
+            return e
+
+    def pod_process(self, slug):
+        """Probe, decide, encode when asked, measure and place one upload. Runs on the media job."""
+        with LOCK:
+            e = self.find_episode(slug)
+            if e is None:
+                raise ApiError("The episode was deleted before its audio was processed.")
+            ep = copy.deepcopy(e)
+            show = copy.deepcopy(self.cfg["podcast"]["show"])
+            c = copy.deepcopy(self.cfg)
+        original = self.incoming_dir() / ep["media"]["original"]
+        log = []
+        self.pod_media_update(slug, state="processing", message="", log=[])
+        out = None
+        encoding = False
+        try:
+            if not original.is_file():
+                raise ApiError("The uploaded file is gone. Upload the audio again.")
+            info = probe_audio(original)
+            msg = "Input: %s, %s%s%s" % (info["kind"] if info["kind"] != "other" else info["codec"] or "unknown",
+                                         fmt_duration(info["duration"]) or "length unknown",
+                                         ", %d kbps" % info["kbps"] if info["kbps"] else "",
+                                         ", %d channel(s)" % info["channels"] if info["channels"] else "")
+            media_say(msg)
+            log.append(msg)
+            has_ff = bool(shutil.which("ffmpeg"))
+            keepable = info["kind"] in ("mp3", "m4a")
+            if not has_ff and not keepable:
+                raise ApiError("This is %s audio. Without ffmpeg only MP3 and M4A can be used. %s"
+                               % (info["codec"] or "unknown", install_hint("ffmpeg")))
+            if not has_ff or (not show["normalize"] and keepable and not show["tags"]):
+                result, ext = original, info["kind"]
+                media_say("Keeping the file exactly as uploaded.")
+            elif not show["normalize"] and keepable:
+                encoding = True
+                ext = info["kind"]
+                out = original.with_name(original.name + ".out.part")
+                self.pod_encode(c, ep, show, original, out, ext, info, log, copy_audio=True)
+                result = out
+            else:
+                encoding = True
+                ext = show["format"]
+                out = original.with_name(original.name + ".out.part")
+                self.pod_encode(c, ep, show, original, out, ext, info, log, normalize=show["normalize"])
+                result = out
+            final = probe_audio(result) if shutil.which("ffprobe") else info
+            size = result.stat().st_size
+            digest = sha256_file(result)
+            with LOCK:
+                w = CURRENT["site"] if CURRENT["site"] is not None and CURRENT["site"].root == self.root else self
+                cur = w.find_episode(slug)
+                if cur is None:
+                    raise ApiError("The episode was deleted while its audio was processed.")
+                folder = w.audio_dir()
+                folder.mkdir(parents=True, exist_ok=True)
+                name = w.audio_name(cur, ext)
+                os.replace(result, folder / name)
+                audio = {"file": name, "bytes": size, "type": AUDIO_TYPES[ext], "kbps": final["kbps"] or info["kbps"],
+                         "channels": final["channels"] or info["channels"],
+                         "sample_rate": final["sample_rate"] or info["sample_rate"], "codec": final["codec"],
+                         "lufs": self._lufs, "sha256": digest, "probed": bool(final.get("probed"))}
+                dur = int(round(final["duration"] or info["duration"] or 0)) or cur.get("duration") or 0
+                done = "Placed %s/%s (%s%s)." % (w.pod_base() + "audio", name, fmt_size(size),
+                                                 ", %s" % fmt_duration(dur) if dur else "")
+                media_say(done)
+                log.append(done)
+                if result != original and original.exists():
+                    original.unlink()
+                cur["audio"], cur["duration"] = audio, dur
+                cur["media"] = {"state": "ready", "message": "" if final.get("probed") else
+                                "Length unknown without ffprobe: type it in.", "log": log[-80:], "original": "", "name": ""}
+                w.save_cfg()
+                w.build()
+        except ApiError as err:
+            if out is not None and out.exists():
+                out.unlink()
+            fallback = ""
+            if encoding and original.is_file() and sniff_audio(original):
+                fallback = self.pod_fallback(slug, original, log)
+            log.append("Stopped: %s" % err)
+            self.pod_media_update(slug, state="failed", message=str(err) + fallback, log=log[-80:], build=True)
+            raise
+        finally:
+            self._lufs = None
+
+    def pod_fallback(self, slug, original, log):
+        """ffmpeg failed on an MP3 or M4A: use the upload as it is so the episode has audio, and
+        keep the original for Retry processing."""
+        kind = sniff_audio(original)
+        with LOCK:
+            w = CURRENT["site"] if CURRENT["site"] is not None and CURRENT["site"].root == self.root else self
+            cur = w.find_episode(slug)
+            if cur is None or cur["audio"].get("file"):
+                return ""
+            folder = w.audio_dir()
+            folder.mkdir(parents=True, exist_ok=True)
+            name = w.audio_name(cur, kind)
+            try:
+                os.link(original, folder / name)
+            except OSError:
+                shutil.copy2(original, folder / name)
+            cur["audio"] = {"file": name, "bytes": (folder / name).stat().st_size, "type": AUDIO_TYPES[kind], "kbps": 0,
+                            "channels": 0, "sample_rate": 0, "codec": "mp3" if kind == "mp3" else "aac", "lufs": None,
+                            "sha256": sha256_file(folder / name), "probed": False}
+            w.save_cfg()
+        log.append("Using the upload as it is for now: %s." % name)
+        return " The upload is used as it is for now."
+
+    def audio_name(self, ep, ext):
+        """ep012-the-flood.mp3. A name that is taken gets -r2, -r3, so a replaced recording never
+        reuses the address of the old one."""
+        stem = ("ep%03d-%s" % (ep["number"], ep["slug"])) if ep.get("number") else ep["slug"]
+        stem = re.sub(r"[^a-z0-9-]+", "-", stem.lower()).strip("-")[:90] or "episode"
+        folder = self.audio_dir()
+        used = {e["audio"].get("file") for e in self.cfg["podcast"]["episodes"]}
+        name, n = "%s.%s" % (stem, ext), 2
+        while (folder / name).exists() or name in used:
+            name = "%s-r%d.%s" % (stem, n, ext)
+            n += 1
+        return name
+
+    _lufs = None
+
+    def pod_encode(self, c, ep, show, src, out, ext, info, log, normalize=False, copy_audio=False):
+        """Build and run the ffmpeg command: loudness in two passes when normalizing, the show's
+        format and bit rate, and tags, cover art and chapters when Write tags is on."""
+        self._lufs = None
+        base = ["ffmpeg", "-hide_banner", "-nostdin", "-nostats"]
+        target = "I=-16:TP=-1.5:LRA=11"
+        af = []
+        if normalize:
+            media_say("Measuring loudness (pass 1 of 2)...")
+            code, lines = run_ffmpeg(base + ["-i", str(src.resolve()), "-map", "0:a:0", "-af",
+                                             "loudnorm=%s:print_format=json" % target, "-f", "null", "-"], log)
+            stats = loudnorm_json(lines)
+            if code != 0 or not stats:
+                raise ApiError("ffmpeg could not measure the loudness (exit code %d)." % code)
+            af = ["-af", "loudnorm=%s:measured_I=%s:measured_TP=%s:measured_LRA=%s:measured_thresh=%s:offset=%s:"
+                         "linear=true:print_format=json" % (target, stats["input_i"], stats["input_tp"],
+                                                            stats["input_lra"], stats["input_thresh"],
+                                                            stats["target_offset"])]
+            media_say("Measured %s LUFS; normalizing to -16 (pass 2 of 2)..." % stats["input_i"])
+        inputs = ["-i", str(src.resolve())]
+        maps = ["-map", "0:a:0"]
+        extra = []
+        meta_file = None
+        if show["tags"]:
+            pc = self.pod_show(c)
+            tags = {"title": ep["title"], "artist": pc["author"], "album": pc["title"], "genre": "Podcast",
+                    "date": ep["date"][:4], "comment": ep["summary"]}
+            if ep.get("number"):
+                tags["track"] = str(ep["number"])
+            extra += ["-map_metadata", "-1"]
+            for k, v in tags.items():
+                if v:
+                    extra += ["-metadata", "%s=%s" % (k, v)]
+            art = self.local_file(ep.get("art")) or self.local_file(show["image"])
+            info_art = image_info(art) if art else None
+            if art and info_art and info_art["format"] in ("png", "jpeg"):
+                inputs += ["-i", str(art.resolve())]
+                maps += ["-map", "1:v:0"]
+                extra += ["-c:v", "mjpeg", "-q:v", "3", "-vf", "scale=1400:1400:force_original_aspect_ratio=decrease",
+                          "-disposition:v:0", "attached_pic", "-metadata:s:v", "title=Album cover",
+                          "-metadata:s:v", "comment=Cover (front)"]
+            if ep["chapters"]:
+                dur = info["duration"] or 0
+                rows = [";FFMETADATA1"]
+                for i, ch in enumerate(ep["chapters"]):
+                    end = ep["chapters"][i + 1]["start"] if i + 1 < len(ep["chapters"]) else max(dur, ch["start"] + 1)
+                    title = re.sub(r"([=;#\\\n])", r"\\\1", ch["title"])
+                    rows += ["[CHAPTER]", "TIMEBASE=1/1000", "START=%d" % int(ch["start"] * 1000),
+                             "END=%d" % int(end * 1000), "title=%s" % title]
+                meta_file = src.with_name(src.name + ".chapters.part")
+                meta_file.write_text("\n".join(rows) + "\n", encoding="utf-8")
+                idx = (len(inputs) // 2)
+                inputs += ["-f", "ffmetadata", "-i", str(meta_file.resolve())]
+                extra += ["-map_chapters", str(idx)]
+        if copy_audio:
+            codec = ["-c:a", "copy"]
+        else:
+            mono = show["mono"] or info["channels"] == 1
+            kbps = show["kbps_mono"] if mono else show["kbps_stereo"]
+            codec = ["-ar", "44100", "-ac", "1" if mono else "2", "-b:a", "%dk" % kbps]
+            codec = (["-c:a", "libmp3lame"] if ext == "mp3" else ["-c:a", "aac"]) + codec
+        fmt = ["-id3v2_version", "3", "-write_id3v1", "0", "-f", "mp3"] if ext == "mp3" else ["-movflags", "+faststart", "-f", "mp4"]
+        cmd = base + ["-y"] + inputs + maps + af + codec + extra + fmt + [str(out.resolve())]
+        try:
+            code, lines = run_ffmpeg(cmd, log)
+        finally:
+            if meta_file is not None and meta_file.exists():
+                meta_file.unlink()
+        if code != 0 or not out.is_file():
+            raise ApiError("ffmpeg could not encode the audio (exit code %d). The log has its reasons." % code)
+        if normalize:
+            st = loudnorm_json(lines)
+            try:
+                self._lufs = round(float(st["output_i"]), 1) if st else None
+            except (KeyError, TypeError, ValueError):
+                self._lufs = None
+
+    def clear_incoming(self):
+        """At startup: drop half-finished uploads and originals no episode is waiting to retry."""
+        d = self.incoming_dir()
+        if not d.is_dir():
+            return
+        keep = {e["media"].get("original") for e in self.cfg["podcast"]["episodes"]}
+        for f in d.iterdir():
+            if f.is_file() and (f.name.endswith(".part") or f.name not in keep):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+
+    # ---- small routes
+    def pod_tools(self):
+        v = tool_versions()
+        return {"tools": v, "hint_ffmpeg": install_hint("ffmpeg"), "hint_rclone": install_hint("rclone")}
+
+    def ping_now(self):
+        url = self.feed_url()
+        if not url:
+            raise ApiError("Set the site URL first, so the feed has an address.")
+        local = self.root / self.feed_rel()
+        h = hashlib.sha256(local.read_bytes()).hexdigest() if local.is_file() else ""
+        r = self.pod_ping(url, h)
+        self.cfg["podcast"]["show"]["last_ping"] = r
+        self.save_cfg()
+        return {"ping": r}
+
+    def save_checklist(self, d):
+        show = self.cfg["podcast"]["show"]
+        for k, v in (d.get("checklist") if isinstance(d.get("checklist"), dict) else {}).items():
+            if k not in DIRECTORY_IDS:
+                continue
+            if v and not show["checklist"].get(k):
+                show["checklist"][k] = today()
+            elif not v:
+                show["checklist"].pop(k, None)
+        for k, v in (d.get("links") if isinstance(d.get("links"), dict) else {}).items():
+            if k not in DIRECTORY_IDS:
+                continue
+            v = str(v or "").strip()
+            if v and not re.match(r"^https?://\S+$", v):
+                raise ApiError("A listing address must be a full web address starting with https://.")
+            if v:
+                show["links"][k] = v[:400]
+            else:
+                show["links"].pop(k, None)
+        self.normalize_podcast()
+        self.save_cfg()
+        self.build()
+        return {"show": self.cfg["podcast"]["show"]}
+
+    def start_media_job(self, kind, d):
+        """Test the media host, or remove audio from it that no episode uses any more. Runs as a
+        publish-style job so it shares the publish log."""
+        with JOB_LOCK:
+            if JOB["running"]:
+                raise ApiError("A publish is already running.")
+        if isinstance(d.get("media_target"), dict):
+            self.save_show({"media_target": d["media_target"], "media_password": d.get("media_password", "")})
+        dep = self.media_target()
+        password = str(d.get("media_password") or "") or (media_password(self, dep) if dep["method"] != "rclone" else "")
+        site = self
+        unused = []
+        if kind == "clean":
+            sent = load_published(MediaRecord(self), dep) or []
+            used = {e["audio"].get("file") for e in self.cfg["podcast"]["episodes"]}
+            unused = [f for f in sent if f not in used and safe_rel(f)]
+            if not unused:
+                return {"started": False, "message": "Nothing to remove: every file sent to the media host is in use."}
+            if not d.get("confirm"):
+                return {"needs_confirm": True, "message": "Remove these %d file(s) from the media host?\n\n%s"
+                        % (len(unused), "\n".join(unused[:40]) + ("\n..." if len(unused) > 40 else ""))}
+        what = "Testing the media host" if kind == "test" else "Removing unused audio from the media host"
+        with JOB_LOCK:
+            JOB.update(running=True, ok=None, what=what, lines=[], proc=None, cancel=False,
+                       started=datetime.datetime.now().isoformat(" ", "seconds"))
+        job_say("%s (%s) at %s" % (what, dep["method"], JOB["started"]))
+
+        def work():
+            ok = False
+            try:
+                if kind == "test":
+                    site.media_test(dep, password)
+                else:
+                    site.media_clean(dep, password, unused)
+                job_say("Done.")
+                ok = True
+            except ApiError as e:
+                job_say("Stopped: %s" % e)
+            except Exception as e:  # noqa: BLE001
+                job_say("Stopped: %s: %s" % (type(e).__name__, e))
+                traceback.print_exc()
+            with JOB_LOCK:
+                JOB.update(running=False, ok=ok, proc=None)
+
+        threading.Thread(target=work, daemon=True, name="media-host").start()
+        return {"started": True}
+
+    def media_test(self, dep, password):
+        if dep["method"] != "rclone":
+            test_deploy(self, dep, password)
+            return
+        if not shutil.which("rclone"):
+            raise ApiError("rclone is not installed on this machine. " + install_hint("rclone"))
+        code, out, err = run_quiet(["rclone", "listremotes"], 30)
+        name = dep["remote"].split(":", 1)[0] + ":"
+        job_say("$ rclone listremotes")
+        for line in out.splitlines():
+            job_say(line)
+        if code != 0 or name not in out.split():
+            raise ApiError("rclone has no remote called %s. Set it up once with: rclone config" % name)
+        if run_stream(["rclone", "lsf", "--max-depth", "1", "--", dep["remote"]]) != 0:
+            raise ApiError("rclone could not list %s. The log above says why." % dep["remote"])
+
+    def media_clean(self, dep, password, unused):
+        """Delete audio from the media host that an earlier publish sent there and no episode uses."""
+        method = dep["method"]
+        if method == "rclone":
+            if not shutil.which("rclone"):
+                raise ApiError("rclone is not installed on this machine. " + install_hint("rclone"))
+            for f in unused:
+                if run_stream(["rclone", "deletefile", "--", dep["remote"].rstrip("/") + "/" + f]) != 0:
+                    raise ApiError("rclone could not delete %s." % f)
+        elif method == "rsync":
+            # rsync from an empty folder with --delete, limited by include rules to exactly these
+            # files: everything else on the server is excluded, and excluded files are never deleted.
+            empty = Path(tempfile.mkdtemp(prefix="empty-", dir=str(self.meta)))
+            try:
+                ssh = ["ssh"] + ssh_opts(dep, password)
+                cmd = ["rsync", "-r", "--delete", "--itemize-changes", "--timeout=120"]
+                cmd += ["--include=/" + f for f in unused] + ["--exclude=*"]
+                cmd += ["-e", " ".join(shlex.quote(x) for x in ssh), "--", str(empty) + "/",
+                        "%s:%s/" % (remote_target(dep), server_path(dep).rstrip("/"))]
+                cmd, env = with_sshpass(cmd, password)
+                if run_stream(cmd, env=env) != 0:
+                    raise ApiError("rsync exited with an error. The log above says why.")
+            finally:
+                shutil.rmtree(empty, ignore_errors=True)
+        else:
+            empty = Path(tempfile.mkdtemp(prefix="empty-", dir=str(self.meta)))
+            keep = [f for f in (load_published(MediaRecord(self), dep) or []) if f not in unused]
+            mdep = dict(dep, mirror=True)
+            try:
+                # Mirror mode removes what an earlier publish sent and this one does not list. The list
+                # given is every file still in use, and nothing is sent, so only the unused files go.
+                if method == "sftp":
+                    deploy_sftp(MediaRecord(self), mdep, password, keep, empty, False, [])
+                elif method in ("ftp", "ftps"):
+                    deploy_ftp(MediaRecord(self), mdep, password, keep, empty, False, [])
+                else:
+                    deploy_folder(MediaRecord(self), mdep, keep, empty, False, [])
+            finally:
+                shutil.rmtree(empty, ignore_errors=True)
+        rec = MediaRecord(self)
+        kept = [f for f in (load_published(rec, dep) or []) if f not in unused]
+        sigs = {k: v for k, v in (load_published_sigs(rec, dep) or {}).items() if k in kept}
+        save_published(rec, dep, kept, sigs)
+        job_say("Removed %d file(s) from the media host." % len(unused))
+
+    # ---- import from PodcastGen
+    def _import_podcastgen(self, src, scfg, report, settings):
+        if self.cfg["podcast"]["episodes"]:
+            raise ApiError("This site already has a podcast with episodes. A site holds one show, so import the "
+                           "PodcastGen site into a new SiteForge site instead.")
+        meta = src / ".podcastgen"
+        s = scfg.get("site") if isinstance(scfg.get("site"), dict) else {}
+        if settings:
+            self._copy_site_settings(s, ("title", "tagline", "author", "footer", "lang", "url", "description", "image",
+                                         "twitter", "noindex", "sitemap", "feeds", "post_nav", "layout", "podcast_layout"))
+            for k in ("secure", "frame", "text"):
+                if isinstance(s.get(k), dict):
+                    self.cfg["site"][k] = s[k]
+        self.enable_module("podcast")
+        pod = scfg.get("podcast") if isinstance(scfg.get("podcast"), dict) else {}
+        show = pod.get("show") if isinstance(pod.get("show"), dict) else {}
+        self.cfg["podcast"] = {"show": {k: v for k, v in show.items() if k in PODCAST_SHOW_DEFAULTS},
+                               "episodes": [dict(e) for e in (pod.get("episodes") or []) if isinstance(e, dict)]}
+        for e in self.cfg["podcast"]["episodes"]:
+            e["media"] = {}
+        write_text(self.pod_intro_md(), src_text(meta / "podcast" / "_index.md"))
+        n = 0
+        for e in self.cfg["podcast"]["episodes"]:
+            slug = slugify(str(e.get("slug") or ""))
+            if slug:
+                write_text(self.episode_md(slug), src_text(meta / "podcast" / "episodes" / (slug + ".md")))
+                n += 1
+        pages = 0
+        for p in scfg.get("pages") if isinstance(scfg.get("pages"), list) else []:
+            if not isinstance(p, dict) or not slugify(str(p.get("slug", ""))) or p.get("slug") == "index":
+                continue
+            new = self._new_page_slug(slugify(p["slug"]))
+            rec = {"slug": new, "title": str(p.get("title") or title_from_name(new)), "show_title": bool(p.get("show_title", True))}
+            seo_fields({k: p.get(k) for k in ("seo_title", "description", "image", "canonical", "noindex") if k in p}, rec)
+            self.cfg["pages"].append(rec)
+            write_text(self.page_md(new), src_text(meta / "pages" / (slugify(p["slug"]) + ".md")))
+            pages += 1
+        for n_ in scfg.get("nav") if isinstance(scfg.get("nav"), list) else []:
+            if isinstance(n_, dict) and n_.get("type") == "link" and str(n_.get("url") or "").strip():
+                self.cfg["nav"].append({"type": "link", "label": str(n_.get("label") or "Link")[:60],
+                                        "url": str(n_["url"])[:400], "visible": bool(n_.get("visible", True))})
+        self.normalize_podcast()
+        report["_podcastgen"] = {"src": src, "url": str(s.get("url") or "").rstrip("/")}
+        report["notes"].insert(0, "Imported the show, %d episode(s) with their GUIDs and %d extra page(s) from PodcastGen."
+                               % (n, pages))
+
+    def _finish_podcastgen(self, info, report):
+        """After the podcast's folder is settled: transcripts now, audio as a media job, and the
+        feed lock carried over (with the old address kept as a legacy feed when it moves)."""
+        src = info["src"]
+        tdir = src / "transcripts"
+        if tdir.is_dir() and not tdir.is_symlink():
+            dest = self.transcript_dir()
+            dest.mkdir(parents=True, exist_ok=True)
+            for f in tdir.iterdir():
+                if f.is_file() and not f.is_symlink() and f.suffix.lower() in TRANSCRIPT_TYPES:
+                    shutil.copy2(f, dest / f.name)
+        show = self.cfg["podcast"]["show"]
+        new = self.feed_url()
+        lock = show.get("feed_lock")
+        if lock and new and lock != new:
+            if lock not in show["legacy_feeds"]:
+                show["legacy_feeds"].append(lock)
+            show["feed_lock"] = new
+            report["notes"].append("The feed moves from %s to %s. The old address keeps a copy of the feed that tells "
+                                   "podcast apps to switch." % (lock, new))
+        adir = src / "audio"
+        files = [f for f in sorted(adir.iterdir()) if f.is_file() and not f.is_symlink() and not f.name.startswith(".")] \
+            if adir.is_dir() and not adir.is_symlink() else []
+        if files:
+            dest = self.audio_dir()
+            site = self
+
+            def run():
+                dest.mkdir(parents=True, exist_ok=True)
+                for i, f in enumerate(files, 1):
+                    target = dest / f.name
+                    if target.exists() and target.stat().st_size == f.stat().st_size:
+                        media_say("%d/%d %s is already here." % (i, len(files), f.name))
+                        continue
+                    try:
+                        os.link(f, target)
+                        how = "linked"
+                    except OSError:
+                        shutil.copy2(f, target)
+                        how = "copied"
+                    media_say("%d/%d %s %s (%s)" % (i, len(files), how, f.name, fmt_size(f.stat().st_size)))
+                with LOCK:
+                    w = CURRENT["site"] if CURRENT["site"] is not None and CURRENT["site"].root == site.root else site
+                    w.build()
+
+            media_queue("Bringing over %d audio file(s) from PodcastGen" % len(files), run)
+            report["notes"].append("%d audio file(s) are being brought over in the background; the episode audio panel "
+                                   "shows the progress." % len(files))
+
+
+class Site(ImportMixin, BlogMixin, WikiMixin, LibraryMixin, PodcastMixin, SiteBase):
+    pass
+
+
+# ----------------------------------------------------------------------------
+# Publishing to a server
+#
+# Transfers use tools already on your machine (rsync, ssh, sftp, git) or Python's own
+# ftplib. Nothing here implements SSH, so password logins for rsync and sftp need
+# sshpass; key logins need nothing extra and are the better option.
+#
+# Security rules this code keeps:
+#   * Settings are validated before any program runs. They live in config.json, which can
+#     arrive with a site folder someone else made, so they are treated as untrusted.
+#   * Secrets never appear on a command line or in the log. sshpass and git read them
+#     from the environment, which only this user can read.
+#   * Only regular files are published. Symlinks are skipped, so a link inside the site
+#     folder cannot leak the file it points at.
+#   * Files are copied to a private staging folder first, so saving in the editor during
+#     a publish cannot change what is being sent halfway through.
+#   * Deletions on the server only touch plain relative paths inside the target, and only
+#     files an earlier publish sent there (rsync mirror mode excepted, which asks first).
+# ----------------------------------------------------------------------------
+
+DEPLOY_METHODS = ("rsync", "sftp", "ftp", "ftps", "git", "folder")
+PASSWORD_ENV = APP.upper() + "_PASSWORD"
+PUBLISH_DOTFILES = (".htaccess", ".well-known")
+JOB = {"running": False, "ok": None, "what": "", "lines": [], "started": "", "proc": None, "cancel": False}
+JOB_LOCK = threading.Lock()
+
+_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+_HOST_RE = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})(?:\.[A-Za-z0-9-]{1,63})*\.?|\[[0-9A-Fa-f:.]+\]|[0-9A-Fa-f:.]+)$")
+_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
+_FTP_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._@+-]{0,127}$")
+_BRANCH_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]{0,99}$")
+_SHELL_META = set("$`;&|<>()*?[]{}'\"\\!#")
+_DANGEROUS_ROOTS = {"", "/", "~", ".", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt", "/proc",
+                    "/root", "/run", "/sbin", "/srv", "/sys", "/tmp", "/usr", "/var", "/var/www", "/var/lib"}
+
+
+def default_deploy():
+    return {
+        "method": "rsync",
+        "host": "",
+        "port": "",
+        "user": "",
+        "path": "",
+        "key": "",
+        "remote": "",
+        "branch": "main",
+        "mirror": False,
+        "include_sources": False,
+        "save_password": False,
+        "passive": True,
+        "insecure_tls": False,
+        "full_upload": False,
+    }
+
+
+def clean_deploy(d, current):
+    """Merge submitted settings over the stored ones. Shape only; validate_deploy checks meaning."""
+    out = dict(default_deploy())
+    if isinstance(current, dict):
+        out.update({k: v for k, v in current.items() if k in out})
+    if d.get("method") in DEPLOY_METHODS:
+        out["method"] = d["method"]
+    if out.get("method") not in DEPLOY_METHODS:
+        out["method"] = "rsync"
+    for k, limit in (("host", 253), ("user", 128), ("path", 400), ("key", 400), ("remote", 400), ("branch", 100)):
+        if k in d:
+            out[k] = str(d.get(k) or "").strip()[:limit]
+        out[k] = str(out.get(k) or "")
+    if "port" in d:
+        out["port"] = str(d.get("port") or "").strip()[:5]
+    out["port"] = str(out.get("port") or "")
+    for k in ("mirror", "include_sources", "save_password", "passive", "insecure_tls", "full_upload"):
+        if k in d:
+            out[k] = bool(d[k])
+        out[k] = bool(out.get(k))
+    return out
+
+
+def validate_deploy(dep, require=True):
+    """Refuse anything that could be read as a command line option, a shell fragment, or a
+    path outside the target. Raises ApiError with a message the user can act on.
+    require=False allows blank fields, for saving settings that are not finished yet."""
+    m = dep["method"]
+    for k in ("host", "user", "path", "key", "remote", "branch", "port"):
+        if _CTRL.search(dep.get(k) or ""):
+            raise ApiError("The %s contains a control character, which is not allowed." % k)
+    if dep.get("port"):
+        if not dep["port"].isdigit() or not 1 <= int(dep["port"]) <= 65535:
+            raise ApiError("The port must be a number from 1 to 65535, or blank for the default.")
+    if m in ("rsync", "sftp", "ftp", "ftps"):
+        if not dep.get("host") and require:
+            raise ApiError("Fill in the Host.")
+        if dep.get("host") and not _HOST_RE.match(dep["host"]):
+            raise ApiError("The host must be a plain hostname or IP address, such as vps.example.com.")
+        user = dep.get("user") or ""
+        if m in ("ftp", "ftps"):
+            if not user and require:
+                raise ApiError("FTP needs a User.")
+            if user and not _FTP_USER_RE.match(user):
+                raise ApiError("The user name contains characters that are not allowed.")
+        elif user and not _USER_RE.match(user):
+            raise ApiError("The user name may only contain letters, digits, dot, dash and underscore.")
+    if m in ("rsync", "sftp", "ftp", "ftps", "folder"):
+        path = dep.get("path") or ""
+        if not path and require:
+            raise ApiError("Fill in the Path.")
+        if path.startswith("-"):
+            raise ApiError("The path cannot start with a dash.")
+        if ".." in path.replace("\\", "/").split("/"):
+            raise ApiError("The path cannot contain '..'. Use the full path instead.")
+        if m != "folder" and (_SHELL_META & set(path) or " " in path):
+            raise ApiError("The server path may only contain letters, digits, and . _ - / ~ @ + characters.")
+    if m in ("rsync", "sftp", "git") and dep.get("key"):
+        if dep["key"].startswith("-") or not Path(dep["key"]).expanduser().is_file():
+            raise ApiError("The SSH key file %s does not exist." % dep["key"])
+    if m == "git":
+        remote = dep.get("remote") or ""
+        if not remote and require:
+            raise ApiError("Fill in the Git remote URL.")
+        if remote.startswith("-"):
+            raise ApiError("The git remote cannot start with a dash.")
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*::", remote):
+            raise ApiError("Git remote helpers of the form transport::address are not allowed here.")
+        bits = urlsplit(remote)
+        if bits.scheme and len(bits.scheme) > 1:
+            if bits.scheme not in ("https", "http", "ssh", "git", "file"):
+                raise ApiError("Use an https://, ssh:// or git@host:path remote.")
+            if bits.password:
+                raise ApiError("Do not put a password or token in the URL. Use the Password box instead.")
+            if bits.hostname and bits.hostname.startswith("-"):
+                raise ApiError("The host in the git remote cannot start with a dash.")
+        branch = dep.get("branch") or "main"
+        if not _BRANCH_RE.match(branch) or ".." in branch or branch.endswith((".lock", "/")):
+            raise ApiError("The branch name is not valid.")
+    return dep
+
+
+def mirror_path_is_dangerous(path):
+    p = path.strip().rstrip("/") or "/"
+    if p in _DANGEROUS_ROOTS:
+        return True
+    return bool(re.match(r"^(/home/[^/]+|/Users/[^/]+|~[^/]*)$", p))
+
+
+# ---- the job log
+
+def job_say(line):
+    with JOB_LOCK:
+        JOB["lines"].append(str(line).rstrip("\r\n"))
+        del JOB["lines"][:-800]
+
+
+def job_status(since=0):
+    try:
+        since = max(0, int(since))
+    except (TypeError, ValueError):
+        since = 0
+    with JOB_LOCK:
+        return {"running": JOB["running"], "ok": JOB["ok"], "what": JOB["what"],
+                "total": len(JOB["lines"]), "lines": JOB["lines"][since:]}
+
+
+def job_cancelled():
+    with JOB_LOCK:
+        return JOB["cancel"]
+
+
+def cancel_publish():
+    with JOB_LOCK:
+        if not JOB["running"]:
+            return {"ok": False}
+        JOB["cancel"] = True
+        proc = JOB["proc"]
+    job_say("Stopping at your request...")
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+    return {"ok": True}
+
+
+def run_stream(cmd, env=None, cwd=None):
+    """Run a command with no terminal attached, sending its output to the job log."""
+    job_say("$ " + " ".join(shlex.quote(c) for c in cmd))
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             env=env, cwd=cwd, text=True, bufsize=1, errors="replace")
+    except FileNotFoundError:
+        raise ApiError("%s is not installed on this machine." % cmd[0])
+    with JOB_LOCK:
+        JOB["proc"] = p
+    try:
+        for line in p.stdout:
+            job_say(line)
+        return p.wait()
+    finally:
+        with JOB_LOCK:
+            JOB["proc"] = None
+        if job_cancelled():
+            raise ApiError("Stopped before it finished. The server may hold a partial upload; publish again to complete it.")
+
+
+# ---- ssh helpers
+
+def ssh_opts(dep, password):
+    opts = ["-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=20",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]
+    opts += ["-o", "BatchMode=no"] if password else ["-o", "BatchMode=yes"]
+    if dep.get("key"):
+        opts += ["-i", str(Path(dep["key"]).expanduser()), "-o", "IdentitiesOnly=yes"]
+    if dep.get("port"):
+        opts += ["-o", "Port=" + dep["port"]]
+    return opts
+
+
+def with_sshpass(cmd, password):
+    """Put sshpass in front of a command. It reads the password from SSHPASS in the
+    environment, which other users cannot read, instead of from the command line."""
+    env = dict(os.environ)
+    env.pop("SSHPASS", None)
+    if not password:
+        return cmd, env
+    if not shutil.which("sshpass"):
+        raise ApiError(
+            "Password logins for this method need the sshpass program, which is not installed. "
+            "Install it (openSUSE: sudo zypper install sshpass), or leave the password blank and use "
+            "an SSH key, which is the safer option anyway."
+        )
+    env["SSHPASS"] = password
+    return ["sshpass", "-e"] + cmd, env
+
+
+def remote_target(dep):
+    user = dep.get("user") or ""
+    return ("%s@%s" % (user, dep["host"])) if user else dep["host"]
+
+
+def server_path(dep):
+    """Path on the server. For sftp and ftp a leading ~/ means the login folder, which is
+    where relative paths start anyway."""
+    p = dep["path"].strip()
+    if dep["method"] in ("sftp", "ftp", "ftps"):
+        if p in ("~", "~/"):
+            return "."
+        if p.startswith("~/"):
+            return p[2:].rstrip("/") or "."
+    return p.rstrip("/") or "/"
+
+
+# ---- what gets published
+
+def local_files(root):
+    """Regular files to publish, relative to the site folder. Hidden files and folders are
+    skipped (that covers the markdown sources and .git), except .htaccess and .well-known.
+    Symlinks are skipped and reported, so a link cannot publish the file it points at."""
+    out, skipped = [], []
+    root = Path(root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        keep = []
+        for d in sorted(dirnames):
+            full = here / d
+            if full.is_symlink():
+                skipped.append(full.relative_to(root).as_posix() + "/")
+            elif not d.startswith(".") or d in PUBLISH_DOTFILES:
+                keep.append(d)
+        dirnames[:] = keep
+        for f in sorted(filenames):
+            full = here / f
+            rel = full.relative_to(root).as_posix()
+            if f.startswith(".") and f not in PUBLISH_DOTFILES:
+                continue
+            if full.is_symlink() or not full.is_file():
+                skipped.append(rel)
+                continue
+            out.append(rel)
+    return out, skipped
+
+
+def safe_rel(rel):
+    """True for a plain relative path with no way to climb out of the folder it is joined to."""
+    if not isinstance(rel, str) or not rel or _CTRL.search(rel) or "\\" in rel:
+        return False
+    if rel.startswith("/") or re.match(r"^[A-Za-z]:", rel):
+        return False
+    return all(part not in ("", ".", "..") for part in rel.split("/"))
+
+
+def stage(site, files):
+    """Put the files in a private folder inside the sources folder and publish from there, so
+    saving in the editor during an upload cannot change what is sent. Hard links cost no time
+    or space, and they are a true snapshot because every writer here replaces a file with a new
+    one instead of changing it in place. Across filesystems, or where links are not allowed, the
+    file is copied. A file that disappeared since the folder was read is left out.
+    Returns the folder and the files that made it in."""
+    base = site.meta / "staging"
+    base.mkdir(parents=True, exist_ok=True)
+    for old in base.iterdir():
+        # Only one publish runs at a time, so anything here is left over from a crash.
+        if old.is_dir() and not old.is_symlink():
+            shutil.rmtree(old, ignore_errors=True)
+    tmp = Path(tempfile.mkdtemp(prefix="publish-", dir=str(base)))
+    kept, copied = [], 0
+    for rel in files:
+        src = site.root / rel
+        dst = tmp / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if src.is_symlink():
+                continue
+            try:
+                os.link(src, dst)
+            except FileNotFoundError:
+                raise
+            except OSError:
+                shutil.copy2(src, dst, follow_symlinks=False)
+                copied += 1
+        except FileNotFoundError:
+            job_say("Skipped %s: it was removed while the publish was starting." % rel)
+            continue
+        kept.append(rel)
+    if copied:
+        job_say("Copied %d file(s) for the upload (hard links were not possible for them)." % copied)
+    return tmp, kept
+
+
+def target_key(dep):
+    return "|".join([dep["method"], dep.get("host", ""), dep.get("port", ""), dep.get("user", ""),
+                     dep.get("path", ""), dep.get("remote", "")])
+
+
+def load_published(site, dep):
+    """Files the last publish to this exact target sent, or None if there was none. Entries
+    that are not plain relative paths are dropped, since the record lives in an editable file."""
+    try:
+        d = json.loads((site.meta / "published.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or d.get("target") != target_key(dep):
+        return None
+    return [f for f in (d.get("files") or []) if safe_rel(f)]
+
+
+def load_published_sigs(site, dep):
+    """Size and modification time of every file the last publish to this exact target sent, or
+    None when there is no such record, so the first publish anywhere sends everything."""
+    try:
+        d = json.loads((site.meta / "published.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or d.get("target") != target_key(dep) or not isinstance(d.get("sigs"), dict):
+        return None
+    out = {}
+    for k, v in d["sigs"].items():
+        if safe_rel(k) and isinstance(v, list) and len(v) == 2 and all(isinstance(x, int) for x in v):
+            out[k] = v
+    return out
+
+
+def file_sigs(root, files):
+    out = {}
+    for rel in files:
+        try:
+            st = (Path(root) / rel).stat()
+        except OSError:
+            continue
+        out[rel] = [st.st_size, st.st_mtime_ns]
+    return out
+
+
+def changed_files(site, dep, files, sigs):
+    """Files to send: every file when that was asked for or on the first publish to a target,
+    otherwise those whose size or modification time differs from the last publish there."""
+    if dep.get("full_upload"):
+        return list(files)
+    before = load_published_sigs(site, dep)
+    if before is None:
+        return list(files)
+    return [f for f in files if before.get(f) != sigs.get(f)]
+
+
+def save_published(site, dep, files, sigs=None):
+    write_text(site.meta / "published.json",
+               json.dumps({"target": target_key(dep), "files": sorted(files), "sigs": sigs or {},
+                           "when": datetime.date.today().isoformat()}, indent=1))
+
+
+# ---- saved password
+
+def secret_path(site):
+    return site.meta / "secret.json"
+
+
+def secret_key(dep):
+    """A saved password is tied to the method, host, port and user it was saved for, so
+    pointing config.json somewhere else does not send it to a different server."""
+    return "|".join([dep["method"], dep.get("host", ""), dep.get("port", ""), dep.get("user", ""),
+                     dep.get("remote", "")])
+
+
+def load_password(site, dep):
+    try:
+        d = json.loads(secret_path(site).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(d, dict) or d.get("for") != secret_key(dep):
+        return ""
+    return str(d.get("password") or "")
+
+
+def store_password(site, dep, password, keep):
+    """Save or forget the password. A blank password never overwrites a saved one. The file
+    is created with owner-only permissions, so it is never readable by others, even briefly."""
+    p = secret_path(site)
+    if not keep:
+        if p.exists():
+            p.unlink()
+        return
+    if not password:
+        return
+    data = json.dumps({"for": secret_key(dep), "password": password}).encode("utf-8")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    os.replace(tmp, p)
+
+
+def resolve_password(site, dep, given):
+    """Password from the form, then the one saved for this target, then the environment."""
+    if given:
+        return given
+    return load_password(site, dep) or os.environ.get(PASSWORD_ENV, "")
+
+
+# ---- the methods
+
+def rsync_commands(dep, password, staged, dry, last=(), exclude=()):
+    """The rsync command lines for a publish: one run, or two when some files must go last.
+    Run 1 excludes those files and the excluded folders, and rsync never deletes an excluded
+    file on the receiver, so mirror mode leaves them alone. Run 2 sends only the held-back
+    files and never deletes anything."""
+    ssh = ["ssh"] + ssh_opts(dep, password)
+    # -r -t -z without -l or -p: no symlinks, no local permission bits; --chmod gives sane web
+    # permissions. The protect filter keeps server-side dotfiles (.htaccess, .well-known) safe
+    # from --delete.
+    base = ["rsync", "-rtz", "--human-readable", "--itemize-changes", "--timeout=120",
+            "--chmod=D755,F644", "--filter=P .*"]
+    if dry:
+        base.append("--dry-run")
+    tail = ["-e", " ".join(shlex.quote(x) for x in ssh), "--",
+            str(staged) + "/", "%s:%s/" % (remote_target(dep), server_path(dep).rstrip("/"))]
+    first = list(base)
+    if dep.get("mirror"):
+        first.append("--delete")
+    first += ["--exclude=/" + f for f in last] + ["--exclude=/" + e.strip("/") + "/" for e in exclude]
+    cmds = [first + tail]
+    if last:
+        inc = []
+        for f in last:
+            parts = f.split("/")
+            for i in range(1, len(parts)):
+                d = "--include=/" + "/".join(parts[:i]) + "/"
+                if d not in inc:
+                    inc.append(d)
+            inc.append("--include=/" + f)
+        cmds.append(base + inc + ["--exclude=*"] + tail)
+    return cmds
+
+
+def deploy_rsync(dep, password, staged, dry, last=(), exclude=()):
+    if not shutil.which("rsync"):
+        raise ApiError("rsync is not installed on this machine. Install it, or choose another method.")
+    for i, cmd in enumerate(rsync_commands(dep, password, staged, dry, last, exclude)):
+        if i:
+            job_say("Now the files that go last: %s" % ", ".join(last))
+        cmd, env = with_sshpass(cmd, password)
+        code = run_stream(cmd, env=env)
+        if code != 0:
+            raise ApiError("rsync exited with code %d. The log above says why." % code)
+
+
+def sftp_quote(s):
+    """Quote an argument for an sftp batch file. Control characters are refused, so a name
+    can never start a new batch command."""
+    if _CTRL.search(s):
+        raise ApiError("A file name contains a control character: %r" % s)
+    return '"%s"' % s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def deploy_sftp(site, dep, password, files, staged, dry, send=None):
+    send = files if send is None else send
+    if not shutil.which("sftp"):
+        raise ApiError("The sftp program (part of OpenSSH) is not installed. Install it, or choose another method.")
+    odd = [f for f in files if set(f) & set("*?[]\\\"")]
+    if odd:
+        raise ApiError("sftp treats * ? [ ] as wildcards, so these names cannot be uploaded safely with it: %s. "
+                       "Rename them or use rsync." % ", ".join(odd[:5]))
+    base = server_path(dep)
+    previous = load_published(site, dep) or []
+    stale = [f for f in previous if f not in files] if dep.get("mirror") else []
+    lines, made = [], set()
+    prefix = "/" if base.startswith("/") else ""
+    walked = []
+    for part in [p for p in base.split("/") if p and p != "."]:
+        walked.append(part)
+        lines.append("-mkdir " + sftp_quote(prefix + "/".join(walked)))
+    for f in send:
+        parts = f.split("/")[:-1]
+        for i in range(len(parts)):
+            sub = "/".join(parts[: i + 1])
+            if sub not in made:
+                made.add(sub)
+                lines.append("-mkdir " + sftp_quote(base + "/" + sub))
+    for f in send:
+        lines.append("put %s %s" % (sftp_quote(str(staged / f)), sftp_quote(base + "/" + f)))
+    for f in stale:
+        lines.append("-rm " + sftp_quote(base + "/" + f))
+    if dry:
+        job_say("Dry run. %d file(s) would be uploaded and %d removed." % (len(send), len(stale)))
+        for line in lines[:80]:
+            job_say("  " + line)
+        if len(lines) > 80:
+            job_say("  ... and %d more" % (len(lines) - 80))
+        return
+    fd, batch = tempfile.mkstemp(prefix="%s-sftp-" % APP.lower(), suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        cmd = ["sftp"] + ssh_opts(dep, password) + ["-b", batch, "--", remote_target(dep)]
+        cmd, env = with_sshpass(cmd, password)
+        code = run_stream(cmd, env=env)
+    finally:
+        os.unlink(batch)
+    if code != 0:
+        raise ApiError("sftp exited with code %d. The log above says why." % code)
+
+
+def ftp_close(ftp):
+    try:
+        ftp.quit()
+    except (OSError, EOFError, ftplib.Error):
+        ftp.close()
+
+
+def ftp_connect(dep, password):
+    """Log in over FTP, or FTPS with the certificate checked unless that was switched off.
+    FTP_TLS.login secures the control channel before the password is sent."""
+    tls = dep["method"] == "ftps"
+    if tls:
+        ctx = ssl.create_default_context()
+        if dep.get("insecure_tls"):
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            job_say("The server certificate is not being checked, because you asked for that.")
+        ftp = ftplib.FTP_TLS(context=ctx, timeout=30)
+    else:
+        job_say("WARNING: plain FTP sends your password and files unencrypted. Use FTPS or SFTP if you can.")
+        ftp = ftplib.FTP(timeout=30)
+    port = int(dep.get("port") or 21)
+    job_say("Connecting to %s:%d" % (dep["host"], port))
+    try:
+        ftp.connect(dep["host"], port)
+        ftp.login(dep.get("user") or "", password)
+        if tls:
+            ftp.prot_p()
+    except ssl.SSLError as e:
+        ftp.close()
+        raise ApiError("The server's TLS certificate was refused (%s). Fix the certificate, tick "
+                       "\"trust a self-signed certificate\", or use SFTP." % e)
+    except ftplib.error_perm as e:
+        ftp.close()
+        raise ApiError("The server refused the login: %s" % e)
+    except (OSError, EOFError) as e:
+        ftp.close()
+        raise ApiError("Could not connect: %s" % e)
+    ftp.set_pasv(bool(dep.get("passive", True)))
+    job_say("Logged in as %s" % dep.get("user"))
+    return ftp
+
+
+def ftp_enter(ftp, path, create):
+    """Change into path one folder at a time, creating folders when asked. Returns the full path."""
+    if path.startswith("/"):
+        ftp.cwd("/")
+    for part in [p for p in path.split("/") if p and p != "."]:
+        try:
+            ftp.cwd(part)
+        except ftplib.error_perm:
+            if not create:
+                raise
+            ftp.mkd(part)
+            ftp.cwd(part)
+    return ftp.pwd()
+
+
+def deploy_ftp(site, dep, password, files, staged, dry, send=None):
+    send = files if send is None else send
+    if not password:
+        raise ApiError("FTP needs a password.")
+    previous = load_published(site, dep) or []
+    stale = [f for f in previous if f not in files] if dep.get("mirror") else []
+    if dry:
+        job_say("Dry run. %d file(s) would be uploaded and %d removed." % (len(send), len(stale)))
+        return
+    ftp = ftp_connect(dep, password)
+    try:
+        home = ftp_enter(ftp, server_path(dep), create=True).rstrip("/")
+        made = set()
+        for i, f in enumerate(send, 1):
+            if job_cancelled():
+                raise ApiError("Stopped before it finished. Publish again to complete the upload.")
+            parts = f.split("/")[:-1]
+            for j in range(len(parts)):
+                sub = "/".join(parts[: j + 1])
+                if sub not in made:
+                    made.add(sub)
+                    try:
+                        ftp.mkd(home + "/" + sub)
+                    except ftplib.error_perm:
+                        pass
+            with open(staged / f, "rb") as fh:
+                ftp.storbinary("STOR " + home + "/" + f, fh)
+            if i % 10 == 0 or i == len(send):
+                job_say("Uploaded %d/%d" % (i, len(send)))
+        for f in stale:
+            try:
+                ftp.delete(home + "/" + f)
+                job_say("Removed " + f)
+            except ftplib.error_perm as e:
+                job_say("Could not remove %s (%s)" % (f, e))
+    finally:
+        ftp_close(ftp)
+
+
+def git_env(dep, password):
+    """Environment for git: no prompts, ordinary transports only, and credentials supplied by
+    a helper that reads them from the environment instead of the URL or the command line."""
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ALLOW_PROTOCOL"] = "https:http:ssh:git:file"
+    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=20"]
+    if dep.get("key"):
+        ssh += ["-i", str(Path(dep["key"]).expanduser()), "-o", "IdentitiesOnly=yes"]
+    env["GIT_SSH_COMMAND"] = " ".join(shlex.quote(x) for x in ssh)
+    env["PUBLISH_GIT_USER"] = dep.get("user") or "git"
+    env["PUBLISH_GIT_PASS"] = password or ""
+    return env
+
+
+def git_cmd(*args):
+    """git with this app's settings. The first empty credential.helper switches off any helper
+    in your git config, so the token is neither read from nor saved into a credential store."""
+    helper = ('!f() { test "$1" = get || return 0; echo "username=$PUBLISH_GIT_USER"; '
+              'echo "password=$PUBLISH_GIT_PASS"; }; f')
+    return ["git", "-c", "credential.helper=", "-c", "credential.helper=" + helper,
+            "-c", "protocol.ext.allow=never", "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60"] + list(args)
+
+
+def deploy_git(site, dep, password, dry, exclude=()):
+    if not shutil.which("git"):
+        raise ApiError("git is not installed on this machine.")
+    branch = dep.get("branch") or "main"
+    root = str(site.root)
+    env = git_env(dep, password)
+    who = (site.cfg.get("site") or {}).get("author") or APP
+    for k, v in (("GIT_AUTHOR_NAME", who), ("GIT_COMMITTER_NAME", who),
+                 ("GIT_AUTHOR_EMAIL", APP.lower() + "@localhost"), ("GIT_COMMITTER_EMAIL", APP.lower() + "@localhost")):
+        env.setdefault(k, v)
+    if not (site.root / ".git").exists():
+        if run_stream(git_cmd("init", "-q", "-b", branch), cwd=root, env=env) != 0:
+            raise ApiError("git init failed.")
+    ignore = site.root / ".gitignore"
+    current = read_text(ignore)
+    if dep.get("include_sources"):
+        wanted = [META_DIR + "/secret.json", META_DIR + "/secret.json.tmp", META_DIR + "/published.json",
+                  META_DIR + "/media-secret.json", META_DIR + "/staging/", META_DIR + "/podcast/incoming/"]
+    else:
+        wanted = [META_DIR + "/"]
+    wanted += ["/" + e.strip("/") + "/" for e in exclude]
+    add = [w for w in wanted if w not in current.split("\n")]
+    if add:
+        write_text(ignore, (current.rstrip("\n") + "\n" if current.strip() else "") + "\n".join(add) + "\n")
+    run_stream(git_cmd("rm", "-r", "-q", "--cached", "--ignore-unmatch", META_DIR + "/secret.json",
+                       META_DIR + "/media-secret.json"), cwd=root, env=env)
+    for e in exclude:
+        # Ignoring a folder does not untrack files already committed, so take them out of the index.
+        run_stream(git_cmd("rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", e.strip("/")), cwd=root, env=env)
+    if run_stream(git_cmd("add", "-A"), cwd=root, env=env) != 0:
+        raise ApiError("git add failed.")
+    if dry:
+        run_stream(git_cmd("status", "--short"), cwd=root, env=env)
+        job_say("Dry run. Nothing was committed or pushed.")
+        return
+    if run_stream(git_cmd("diff", "--cached", "--quiet"), cwd=root, env=env) != 0:
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        if run_stream(git_cmd("commit", "-q", "-m", "Publish " + stamp), cwd=root, env=env) != 0:
+            raise ApiError("git could not commit. The log above says why.")
+    else:
+        job_say("No changes to commit. Pushing the current commit anyway.")
+    code = run_stream(git_cmd("push", "--", dep["remote"], "HEAD:refs/heads/" + branch), cwd=root, env=env)
+    if code != 0:
+        raise ApiError("git push exited with code %d. The log above says why." % code)
+
+
+def folder_dest(site, dep):
+    dest = Path(dep["path"]).expanduser().resolve()
+    root = site.root.resolve()
+    if dest == root or root in dest.parents or dest in root.parents:
+        raise ApiError("The destination cannot be the site folder, inside it, or a folder that contains it.")
+    return dest
+
+
+def deploy_folder(site, dep, files, staged, dry, send=None):
+    send = files if send is None else send
+    dest = folder_dest(site, dep)
+    previous = load_published(site, dep) or []
+    stale = [f for f in previous if f not in files] if dep.get("mirror") else []
+    if dry:
+        job_say("Dry run. %d file(s) would be copied to %s and %d removed." % (len(send), dest, len(stale)))
+        return
+    dest.mkdir(parents=True, exist_ok=True)
+    for i, f in enumerate(send, 1):
+        if job_cancelled():
+            raise ApiError("Stopped before it finished.")
+        target = dest / f
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.is_symlink():
+            target.unlink()
+        shutil.copy2(staged / f, target, follow_symlinks=False)
+        if i % 25 == 0 or i == len(send):
+            job_say("Copied %d/%d" % (i, len(send)))
+    for f in stale:
+        p = dest / f
+        try:
+            inside = dest in p.resolve().parents
+        except OSError:
+            inside = False
+        if inside and (p.is_file() or p.is_symlink()):
+            p.unlink()
+            job_say("Removed " + f)
+
+
+def run_deploy(site, dep, password, dry):
+    """Send the site. A site object may offer publish_plan(dep, dry), a dict with any of: last
+    (files sent after everything else, such as a podcast feed that must not point at audio that
+    is not up yet), exclude (folders left out and left alone on the server), before (run after
+    staging, ahead of the transfer) and after (run once a real publish succeeded)."""
+    method = dep["method"]
+    plan_of = getattr(site, "publish_plan", None)
+    plan = (plan_of(dep, dry) if plan_of else None) or {}
+    exclude = tuple(plan.get("exclude") or ())
+    if method == "git":
+        if plan.get("before"):
+            plan["before"]()
+        deploy_git(site, dep, password, dry, exclude)
+        if plan.get("after") and not dry:
+            plan["after"]()
+        return
+    files, skipped = local_files(site.root)
+    for s in skipped:
+        job_say("Skipped %s (a symlink or special file, which is never published)" % s)
+    if exclude:
+        kept = [f for f in files if not f.startswith(exclude)]
+        if len(kept) < len(files):
+            job_say("%d file(s) under %s are left out here; they go to their own host." % (len(files) - len(kept),
+                                                                                          ", ".join(exclude)))
+        files = kept
+    last = [f for f in (plan.get("last") or ()) if f in files]
+    files = [f for f in files if f not in last] + last
+    job_say("%d file(s) to publish from %s" % (len(files), site.root))
+    staged, files = stage(site, files)
+    try:
+        if plan.get("before"):
+            plan["before"]()
+        sigs = file_sigs(staged, files)
+        send = files
+        if method in ("sftp", "ftp", "ftps", "folder"):
+            send = changed_files(site, dep, files, sigs)
+            if len(send) < len(files):
+                job_say("%d of them changed since the last publish to this target; only those are sent. "
+                        "Tick \"Upload every file\" to send them all." % len(send))
+        if method == "rsync":
+            deploy_rsync(dep, password, staged, dry, last, exclude)
+        elif method == "sftp":
+            deploy_sftp(site, dep, password, files, staged, dry, send)
+        elif method in ("ftp", "ftps"):
+            deploy_ftp(site, dep, password, files, staged, dry, send)
+        elif method == "folder":
+            deploy_folder(site, dep, files, staged, dry, send)
+        else:
+            raise ApiError("Unknown publish method.")
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
+    if not dry:
+        save_published(site, dep, files, sigs)
+        if plan.get("after"):
+            plan["after"]()
+
+
+def remote_dir_test(path):
+    """A shell test for a folder on the server. A leading ~/ stays outside the quotes, so the
+    remote shell expands it to the login folder instead of looking for a folder named ~."""
+    if path in ("~", "~/"):
+        return 'test -d "$HOME"'
+    if path.startswith("~/"):
+        return 'test -d "$HOME"/' + shlex.quote(path[2:])
+    return "test -d " + shlex.quote(path)
+
+
+def test_deploy(site, dep, password):
+    """A reachability check that changes nothing on the server."""
+    method = dep["method"]
+    if method in ("rsync", "sftp"):
+        if not shutil.which("ssh"):
+            raise ApiError("The ssh program is not installed, so the connection cannot be tested here.")
+        path = server_path(dep)
+        cmd = ["ssh"] + ssh_opts(dep, password) + [
+            "--", remote_target(dep), remote_dir_test(path) + " && echo FOUND || echo MISSING"]
+        cmd, env = with_sshpass(cmd, password)
+        code = run_stream(cmd, env=env)
+        if code != 0:
+            raise ApiError("Could not log in (ssh exited %d). The log above says why." % code)
+        job_say("Logged in. MISSING above means the path does not exist yet; the first publish creates it.")
+    elif method in ("ftp", "ftps"):
+        if not password:
+            raise ApiError("FTP needs a password.")
+        ftp = ftp_connect(dep, password)
+        try:
+            ftp_enter(ftp, server_path(dep), create=False)
+            job_say("Path %s exists." % dep["path"])
+        except ftplib.error_perm:
+            job_say("Path %s does not exist yet. The first publish creates it." % dep["path"])
+        finally:
+            ftp_close(ftp)
+    elif method == "git":
+        if run_stream(git_cmd("ls-remote", "--heads", "--", dep["remote"]), env=git_env(dep, password)) != 0:
+            raise ApiError("git could not reach that remote. The log above says why.")
+        job_say("Remote reachable.")
+    elif method == "folder":
+        dest = Path(dep["path"]).expanduser()
+        job_say("%s: %s" % (dest, "exists" if dest.is_dir() else "does not exist yet, it will be created"))
+        parent = dest if dest.is_dir() else dest.parent
+        if not os.access(str(parent), os.W_OK):
+            raise ApiError("No permission to write to %s" % parent)
+        job_say("Writable.")
+    else:
+        raise ApiError("Unknown publish method.")
+
+
+def start_publish(site, d, dry=False, test=False):
+    """Validate, build, then transfer on a background thread so the editor stays responsive."""
+    d = d if isinstance(d, dict) else {}
+    with JOB_LOCK:
+        if JOB["running"]:
+            raise ApiError("A publish is already running.")
+    blocker = getattr(site, "publish_blocker", None)
+    reason = blocker() if blocker else ""
+    if reason:
+        raise ApiError(reason)
+    dep = validate_deploy(clean_deploy(d, site.cfg.get("deploy")))
+    if dep["method"] == "folder":
+        folder_dest(site, dep)
+    if dep["method"] == "rsync" and dep.get("mirror") and not dry and not test:
+        if mirror_path_is_dangerous(server_path(dep)):
+            raise ApiError("Refusing to mirror into %s: removing files there could wipe far more than the "
+                           "site. Point Path at the site's own folder." % dep["path"])
+        if load_published(site, dep) is None and not d.get("confirm_mirror"):
+            return {"needs_confirm": True, "message": (
+                "This is the first publish to %s:%s with \"remove files\" turned on.\n\n"
+                "Anything already in that folder on the server that is not part of this site will be "
+                "deleted. Hidden files such as .htaccess and .well-known are kept.\n\n"
+                "Run a dry run first if you are not sure. Continue?" % (dep["host"], dep["path"]))}
+    site.cfg["deploy"] = dep
+    site.save_cfg()
+    given = str(d.get("password") or "")
+    password = resolve_password(site, dep, given)
+    if "save_password" in d:
+        store_password(site, dep, given, dep.get("save_password"))
+    if not test:
+        site.build()
+    # A site can hold the publish back when its own checks fail (the podcast feed check does).
+    # A dry run still goes ahead, and "anyway" overrides it.
+    check = getattr(site, "publish_check", None)
+    problem = check() if (check and not test) else ""
+    if problem and not dry and not d.get("anyway"):
+        raise ApiError(problem)
+    what = "Testing the connection" if test else ("Dry run" if dry else "Publishing")
+    with JOB_LOCK:
+        JOB.update(running=True, ok=None, what=what, lines=[], proc=None, cancel=False,
+                   started=datetime.datetime.now().isoformat(" ", "seconds"))
+    job_say("%s (%s) at %s" % (what, dep["method"], JOB["started"]))
+    if problem:
+        job_say("Warning: " + problem)
+
+    def work():
+        ok = False
+        try:
+            if test:
+                test_deploy(site, dep, password)
+            else:
+                run_deploy(site, dep, password, dry)
+            job_say("Done.")
+            ok = True
+        except ApiError as e:
+            job_say("Stopped: %s" % e)
+        except Exception as e:  # noqa: BLE001  (report anything unexpected instead of dying silently)
+            job_say("Stopped: %s: %s" % (type(e).__name__, e))
+            traceback.print_exc()
+        with JOB_LOCK:
+            JOB.update(running=False, ok=ok, proc=None)
+
+    threading.Thread(target=work, daemon=True, name="publish").start()
+    return {"started": True}
+
+
+def deploy_info(site):
+    dep = clean_deploy({}, site.cfg.get("deploy"))
+    with JOB_LOCK:
+        running = JOB["running"]
+    return {
+        "deploy": dep,
+        "has_password": bool(load_password(site, dep)),
+        "env_var": PASSWORD_ENV,
+        "secret_path": str(secret_path(site)),
+        "running": running,
+        "tools": {t: bool(shutil.which(t)) for t in ("rsync", "ssh", "sftp", "sshpass", "git")},
+    }
+
+
+def save_deploy(site, d):
+    d = d if isinstance(d, dict) else {}
+    dep = validate_deploy(clean_deploy(d, site.cfg.get("deploy")), require=False)
+    site.cfg["deploy"] = dep
+    site.save_cfg()
+    if "save_password" in d:
+        store_password(site, dep, str(d.get("password") or ""), dep.get("save_password"))
+    return {"ok": True, "has_password": bool(load_password(site, dep))}
+
+
+# ----------------------------------------------------------------------------
+# Opening sites, remembering the last one
+# ----------------------------------------------------------------------------
+
+PENDING = {"folder": None}
+
+
+def remember_folder(path):
+    try:
+        write_text(CONFIG_HOME / "last.json", json.dumps({"folder": str(path)}))
+    except OSError:
+        pass
+
+
+def last_folder():
+    try:
+        return json.loads((CONFIG_HOME / "last.json").read_text(encoding="utf-8")).get("folder")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def open_site(path, confirm=False, setup=None):
+    """Open a site. A folder without one asks for confirmation if it holds other files, then for
+    the first-run setup (homepage type, modules, optional import) before anything is written."""
+    path = str(path or "").strip()
+    if not path:
+        raise ApiError("Enter a folder path.")
+    root = Path(path).expanduser().resolve()
+    if root.exists() and not root.is_dir():
+        raise ApiError("That path is a file, not a folder.")
+    if (root / META_DIR / "config.json").exists():
+        site = Site(root)
+        site.load()
+    else:
+        if root.exists() and not confirm and any(not n.name.startswith(".") for n in root.iterdir()):
+            return {"needs_confirm": True, "message": (
+                "This folder already has files that %s did not create.\n\n%s will add its own files here "
+                "and overwrite index.html and any page it generates with the same name. Other files are left alone.\n\n"
+                "Use this folder anyway?" % (APP, APP))}
+        if not isinstance(setup, dict):
+            PENDING["folder"] = str(root)
+            return {"needs_setup": True, "folder": str(root)}
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise ApiError("Could not create that folder: %s" % e)
+        site = Site(root)
+        site.create(setup)
+        if str(setup.get("import") or "").strip():
+            site.import_site({"path": setup["import"], "settings": True, "home": setup.get("home"),
+                              "root_mount": setup.get("root_mount")})
+    CURRENT["site"] = site
+    PENDING["folder"] = None
+    remember_folder(root)
+    return {"state": site.state()}
+
+
+def app_state():
+    site = CURRENT["site"]
+    if site is None:
+        return {"folder": None, "pending": PENDING["folder"], "suggest": str(Path.home() / "my-site"),
+                "last": last_folder(), "themes": [{"id": k, "label": v[0], "group": v[1]} for k, v in THEMES.items()],
+                "app": APP, "only": ONLY_MODULE}
+    return site.state()
+
+
+def pick_folder():
+    site = CURRENT["site"]
+    start = str(site.root.parent) if site else str(Path.home())
+    cmds = []
+    if shutil.which("kdialog"):
+        cmds.append(["kdialog", "--getexistingdirectory", start])
+    if shutil.which("zenity"):
+        cmds.append(["zenity", "--file-selection", "--directory", "--filename=" + start.rstrip("/") + "/"])
+    if sys.platform == "darwin":
+        cmds.append(["osascript", "-e", "POSIX path of (choose folder)"])
+    cmds.append([sys.executable, "-c",
+                 "import tkinter as t, tkinter.filedialog as f; r=t.Tk(); r.withdraw(); print(f.askdirectory())"])
+    for cmd in cmds:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if r.returncode == 0:
+            return {"path": r.stdout.strip() or None, "available": True}
+        if r.returncode == 1 and cmd[0] != sys.executable:
+            return {"path": None, "available": True}
+    return {"path": None, "available": False}
+
+
+# ----------------------------------------------------------------------------
+# API
+# ----------------------------------------------------------------------------
+
+def need(site, mid):
+    if not site.enabled(mid):
+        raise ApiError("The %s is switched off. Turn it on in Site structure first." % site.module_label(mid), 409)
+
+
+def api(method, route, query, h):
+    q = parse_qs(query)
+    parts = [unquote(x) for x in route.strip("/").split("/")]
+    n = len(parts)
+
+    if parts == ["state"] and method == "GET":
+        return app_state()
+    if parts == ["open"] and method == "POST":
+        d = h.read_json()
+        return open_site(d.get("path", ""), bool(d.get("confirm")), d.get("setup"))
+    if parts == ["detect-import"] and method == "POST":
+        kind, src, cfg = detect_import(h.read_json().get("path"))
+        title = (cfg.get("site") or {}).get("title") if isinstance(cfg.get("site"), dict) else ""
+        return {"kind": kind, "title": title or src.name,
+                "home": {"sitegen": "page", "wikigen": "wiki", "storygen": "library", "podcastgen": "podcast"}[kind]}
+
+    w = CURRENT["site"]
+    if w is None:
+        raise ApiError("Open a site folder first.", 409)
+
+    # site structure
+    if parts == ["structure"] and method == "PUT":
+        return w.save_structure(h.read_json())
+    if n == 3 and parts[0] == "modules" and parts[2] == "remove" and method == "POST":
+        return w.remove_module_content(parts[1])
+    if parts == ["import"] and method == "POST":
+        return w.import_site(h.read_json())
+
+    # pages and menu
+    if parts == ["pages"] and method == "POST":
+        return w.add_page(h.read_json())
+    if n == 2 and parts[0] == "pages":
+        if method == "GET":
+            return w.get_page(parts[1])
+        if method == "PUT":
+            return w.save_page(parts[1], h.read_json())
+        if method == "DELETE":
+            return w.delete_page(parts[1])
+    if parts == ["nav"] and method == "PUT":
+        return w.save_nav(h.read_json().get("nav"))
+
+    # blog
+    if parts[0] in ("posts", "blog-intro"):
+        need(w, "blog")
+    if parts == ["blog-intro"]:
+        if method == "GET":
+            return w.get_blog_intro()
+        if method == "PUT":
+            return w.save_blog_intro(h.read_json())
+    if parts == ["posts"] and method == "POST":
+        return w.save_post(h.read_json())
+    if n == 2 and parts[0] == "posts":
+        if method == "GET":
+            return w.get_post(parts[1])
+        if method == "DELETE":
+            return w.delete_post(parts[1])
+    if n == 3 and parts[0] == "posts" and parts[2] == "unpublish" and method == "POST":
+        return w.unpublish_post(parts[1])
+
+    # wiki
+    if parts[0] in ("wiki-home", "sections", "articles"):
+        need(w, "wiki")
+    if parts == ["wiki-home"]:
+        if method == "GET":
+            return w.get_wiki_home()
+        if method == "PUT":
+            return w.save_wiki_home(h.read_json())
+    if parts == ["sections"] and method == "POST":
+        return w.add_section(h.read_json().get("title", ""))
+    if n == 2 and parts[0] == "sections":
+        if method == "GET":
+            return w.get_section(parts[1])
+        if method == "PUT":
+            return w.save_section(parts[1], h.read_json())
+        if method == "DELETE":
+            return w.delete_section(parts[1])
+    if n == 3 and parts[0] == "sections" and method == "POST":
+        if parts[2] == "move":
+            return w.move_section(parts[1], h.read_json().get("dir", 1))
+        if parts[2] == "order":
+            return w.order_articles(parts[1], h.read_json().get("articles", []))
+    if parts == ["articles"] and method == "POST":
+        return w.save_article(h.read_json())
+    if n == 3 and parts[0] == "articles":
+        if method == "GET":
+            return w.get_article(parts[1], parts[2])
+        if method == "DELETE":
+            return w.delete_article(parts[1], parts[2])
+
+    # library
+    if parts[0] in ("lib-home", "stories", "chapters"):
+        need(w, "library")
+    if parts == ["lib-home"]:
+        if method == "GET":
+            return w.get_lib_home()
+        if method == "PUT":
+            return w.save_lib_home(h.read_json())
+    if parts == ["stories"] and method == "POST":
+        return w.add_story(h.read_json())
+    if n == 2 and parts[0] == "stories":
+        if method == "GET":
+            return w.get_story(parts[1])
+        if method == "PUT":
+            return w.save_story(parts[1], h.read_json())
+        if method == "DELETE":
+            return w.delete_story(parts[1])
+    if n == 3 and parts[0] == "stories" and method == "POST":
+        if parts[2] == "move":
+            return w.move_story(parts[1], h.read_json().get("dir", 1))
+        if parts[2] == "order":
+            return w.order_chapters(parts[1], h.read_json().get("chapters", []))
+    if parts == ["chapters"] and method == "POST":
+        return w.save_chapter(h.read_json())
+    if n == 3 and parts[0] == "chapters":
+        if method == "GET":
+            return w.get_chapter(parts[1], parts[2])
+        if method == "DELETE":
+            return w.delete_chapter(parts[1], parts[2])
+
+    # podcast (the audio upload streams in Handler.receive_audio, outside the lock)
+    if parts[0] == "podcast":
+        need(w, "podcast")
+        if parts == ["podcast", "show"]:
+            if method == "GET":
+                return w.get_show()
+            if method == "PUT":
+                return w.save_show(h.read_json())
+        if parts == ["podcast", "episodes"] and method == "POST":
+            return w.save_episode(h.read_json())
+        if n == 3 and parts[1] == "episodes":
+            if method == "GET":
+                return w.get_episode(parts[2])
+            if method == "DELETE":
+                return w.delete_episode(parts[2])
+        if n == 4 and parts[1] == "episodes":
+            if parts[3] == "unpublish" and method == "POST":
+                return w.unpublish_episode(parts[2])
+            if parts[3] == "process" and method == "POST":
+                return w.retry_audio(parts[2])
+            if parts[3] == "transcript" and method == "DELETE":
+                return w.delete_transcript(parts[2])
+        if parts == ["podcast", "transcript"] and method == "POST":
+            return w.upload_transcript(q.get("episode", [""])[0], q.get("name", [""])[0], h.read_body(MAX_TRANSCRIPT))
+        if parts == ["podcast", "art-check"] and method == "POST":
+            return w.art_check(h.read_json())
+        if parts == ["podcast", "art-fix"] and method == "POST":
+            return w.art_fix(h.read_json())
+        if parts == ["podcast", "check"] and method == "GET":
+            return {"check": w._pod_check}
+        if parts == ["podcast", "unused"] and method == "GET":
+            return {"unused": w.unused_audio()}
+        if parts == ["podcast", "unused", "trash"] and method == "POST":
+            return w.trash_unused(h.read_json())
+        if parts == ["podcast", "tools"] and method == "GET":
+            return w.pod_tools()
+        if parts == ["podcast", "ping"] and method == "POST":
+            return w.ping_now()
+        if parts == ["podcast", "checklist"] and method == "PUT":
+            return w.save_checklist(h.read_json())
+        if n == 3 and parts[1] == "media" and parts[2] in ("test", "clean") and method == "POST":
+            return w.start_media_job(parts[2], h.read_json())
+    if n == 3 and parts[0] == "jobs" and parts[1] in ("publish", "media"):
+        if parts[2] == "status" and method == "GET":
+            since = q.get("since", ["0"])[0]
+            return media_status(since) if parts[1] == "media" else job_status(since)
+        if parts[2] == "cancel" and method == "POST":
+            return media_cancel() if parts[1] == "media" else cancel_publish()
+
+    # everything else
+    if parts == ["css"]:
+        if method == "GET":
+            return w.get_css()
+        if method == "PUT":
+            return w.save_css(h.read_json().get("css", ""))
+    if parts == ["settings"] and method == "PUT":
+        return w.save_settings(h.read_json())
+    if parts == ["preview"] and method == "POST":
+        return w.preview(h.read_json())
+    if parts == ["preview-targets"] and method == "GET":
+        return w.preview_targets()
+    if parts == ["upload"] and method == "POST":
+        return w.upload(q.get("name", ["image"])[0], h.read_body(MAX_UPLOAD))
+    if parts == ["upload-font"] and method == "POST":
+        return save_font_file(w.root, q.get("name", ["font"])[0], h.read_body(MAX_FONT + 1))
+    if parts == ["rescan"] and method == "POST":
+        return w.api_rescan()
+    if parts == ["build"] and method == "POST":
+        w.build()
+        return {"ok": True}
+    if parts == ["deploy"]:
+        if method == "GET":
+            return deploy_info(w)
+        if method == "PUT":
+            return save_deploy(w, h.read_json())
+    if parts == ["publish"] and method == "POST":
+        d = h.read_json()
+        return start_publish(w, d, dry=bool(d.get("dry")), test=bool(d.get("test")))
+    if parts == ["publish", "status"] and method == "GET":
+        return job_status(q.get("since", ["0"])[0])
+    if parts == ["publish", "cancel"] and method == "POST":
+        return cancel_publish()
+    raise ApiError("Unknown request.", 404)
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = APP
+    head_only = False
+
+    def log_message(self, *args):
+        pass
+
+    # ---- helpers
+    def read_body(self, limit):
+        try:
+            n = max(0, int(self.headers.get("Content-Length") or 0))
+        except ValueError:
+            raise ApiError("Bad Content-Length header.")
+        if n > limit:
+            raise ApiError("That file is too large.", 413)
+        return self.rfile.read(n) if n else b""
+
+    def receive_audio(self, query):
+        """The one request handled outside the global lock. The body streams to disk in 1 MiB
+        pieces, so a 2 GB recording never sits in memory and the editor stays usable while it
+        arrives. The token and Host checks have already run in dispatch()."""
+        q = parse_qs(query)
+        slug, name = q.get("episode", [""])[0], q.get("name", ["audio"])[0]
+        with LOCK:
+            w = CURRENT["site"]
+            if w is None:
+                raise ApiError("Open a site folder first.", 409)
+            need(w, "podcast")
+            w.get_episode_rec(slug)
+            limit, folder = w.upload_limit(), w.incoming_dir()
+        try:
+            n = int(self.headers.get("Content-Length") or "")
+        except ValueError:
+            raise ApiError("The upload needs a Content-Length header.", 411)
+        if n <= 0:
+            raise ApiError("That file is empty.")
+        if n > limit:
+            raise ApiError("That file is %s and the upload limit is %s. Raise it under Audio in show settings."
+                           % (fmt_size(n), fmt_size(limit)), 413)
+        folder.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(str(folder)).free
+        if free < 2 * n:
+            raise ApiError("Not enough free disk space: %s free, and processing needs about twice the file size (%s)."
+                           % (fmt_size(free), fmt_size(2 * n)), 507)
+        part = folder / ("%s.part" % secrets.token_hex(8))
+        ext = Path(name).suffix.lower()
+        orig = part.with_name(part.stem + ".orig" + (ext if re.match(r"^\.[a-z0-9]{1,6}$", ext) else ""))
+        left = n
+        try:
+            with open(part, "wb") as f:
+                while left > 0:
+                    chunk = self.rfile.read(min(1 << 20, left))
+                    if not chunk:
+                        raise ApiError("The upload stopped before the whole file arrived.")
+                    f.write(chunk)
+                    left -= len(chunk)
+            os.replace(part, orig)
+        finally:
+            if part.exists():
+                part.unlink()
+        with LOCK:
+            w2 = CURRENT["site"]
+            if w2 is None or w2.root != w.root or not w2.find_episode(slug):
+                orig.unlink()
+                raise ApiError("The site or the episode was closed during the upload.", 409)
+            return w2.queue_audio(slug, orig, name)
+
+    def read_json(self):
+        raw = self.read_body(8 * 1024 * 1024)
+        try:
+            d = json.loads(raw.decode("utf-8")) if raw else {}
+        except ValueError:
+            raise ApiError("Bad request body.")
+        if not isinstance(d, dict):
+            raise ApiError("Bad request body.")
+        return d
+
+    def send_bytes(self, status, ctype, data, extra=None):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if not self.head_only:
+            self.wfile.write(data)
+
+    def send_file(self, path, ctype, extra=None):
+        """Stream a file in chunks, answering a single byte range when one is asked for, so an
+        audio or video file can be scrubbed in the preview without loading it into memory."""
+        size = path.stat().st_size
+        start, end, status = 0, size - 1, 200
+        m = re.fullmatch(r"bytes=(\d*)-(\d*)", (self.headers.get("Range") or "").strip())
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                start = int(m.group(1))
+                end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+            else:
+                start, end = max(0, size - int(m.group(2))), size - 1
+                if int(m.group(2)) == 0:
+                    start = size
+            if start >= size or start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % size)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            status = 206
+        length = max(0, end - start + 1)
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.send_header("Accept-Ranges", "bytes")
+        if status == 206:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.head_only:
+            return
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                left = length
+                while left > 0:
+                    chunk = fh.read(min(65536, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the browser stopped reading, which it does whenever a player seeks
+
+    def send_json(self, obj, status=200):
+        self.send_bytes(status, "application/json; charset=utf-8", json.dumps(obj).encode("utf-8"))
+
+    def send_text(self, status, text):
+        self.send_bytes(status, "text/plain; charset=utf-8", text.encode("utf-8"))
+
+    def host_ok(self):
+        port = SERVER["port"]
+        return self.headers.get("Host", "") in ("127.0.0.1:%d" % port, "localhost:%d" % port)
+
+    def search_src(self, w):
+        """CSP source for the wiki's search.js on this host, or 'none' when the site has none."""
+        if not w.enabled("wiki") or w.cfg["site"].get("search") != "builtin":
+            return "'none'"
+        return "http://%s/site/%ssearch.js" % (self.headers.get("Host", ""), w.mbase("wiki"))
+
+    def send_site(self, rel):
+        w = CURRENT["site"]
+        if w is None:
+            return self.send_text(404, "No site is open.")
+        rel = unquote(rel)
+        if "\x00" in rel:
+            return self.send_text(404, "Not found")
+        target = (w.root / rel).resolve()
+        try:
+            parts = target.relative_to(w.root).parts
+        except ValueError:
+            return self.send_text(403, "Forbidden")
+        if any(p.startswith(".") for p in parts):
+            return self.send_text(404, "Not found")
+        if target.is_dir():
+            target = target / "index.html"
+        if not target.is_file():
+            return self.send_text(404, "Not found. Save the page first so it gets generated.")
+        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        if ctype.startswith("text/") or ctype.endswith("xml") or ctype.endswith("javascript"):
+            ctype += "; charset=utf-8"
+        # Built pages share an origin with the editor, so the only script they may run is the wiki's
+        # generated search.js, named by its exact address. Inline script and any other script file,
+        # such as one inside an uploaded SVG or a stray .js in the site folder, are refused.
+        self.send_file(target, ctype, {
+            "Content-Security-Policy": "script-src %s; object-src 'none'; base-uri 'self'" % self.search_src(w),
+            "X-Content-Type-Options": "nosniff",
+        })
+
+    # ---- routing
+    def dispatch(self, method):
+        try:
+            parts = urlsplit(self.path)
+            path = parts.path
+            if not self.host_ok():
+                return self.send_text(403, "Forbidden")
+            if method == "GET" and path == "/":
+                return self.send_bytes(200, "text/html; charset=utf-8",
+                                       UI_HTML.replace("__TOKEN__", TOKEN).replace("__APP__", APP).encode("utf-8"))
+            if method == "GET" and path.startswith("/site/"):
+                return self.send_site(path[len("/site/"):])
+            if path.startswith("/api/"):
+                if self.headers.get("X-Token") != TOKEN:
+                    return self.send_json({"error": "Not authorized."}, 401)
+                route = path[len("/api/"):]
+                if route == "podcast/audio" and method == "POST":
+                    return self.send_json(self.receive_audio(parts.query))
+                if route == "pick-folder" and method == "POST":
+                    return self.send_json(pick_folder())
+                if route == "quit" and method == "POST":
+                    self.send_json({"ok": True})
+                    threading.Thread(target=SERVER["httpd"].shutdown, daemon=True).start()
+                    return
+                with LOCK:
+                    result = api(method, route, parts.query, self)
+                return self.send_json(result)
+            return self.send_text(404, "Not found")
+        except ApiError as e:
+            self.send_json({"error": str(e)}, e.status)
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            self.send_json({"error": "Unexpected error: %s" % e}, 500)
+
+    def do_GET(self):
+        self.dispatch("GET")
+
+    def do_HEAD(self):
+        """HEAD answers for the editor page and built files only; the API has nothing to offer it."""
+        path = urlsplit(self.path).path
+        if path != "/" and not path.startswith("/site/"):
+            return self.send_text(405, "Method not allowed")
+        self.head_only = True
+        self.dispatch("GET")
+
+    def do_POST(self):
+        self.dispatch("POST")
+
+    def do_PUT(self):
+        self.dispatch("PUT")
+
+    def do_DELETE(self):
+        self.dispatch("DELETE")
+
+
+# ----------------------------------------------------------------------------
+# Editor UI (served to your browser; the editor uses JavaScript)
+# ----------------------------------------------------------------------------
+
+UI_HTML = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__APP__</title>
+<style>
+:root {
+  color-scheme: light;
+  --ink: #18202e; --ink2: #242e42; --paper: #eef1f6; --panel: #ffffff; --panel2: #f7f9fc; --field: #ffffff;
+  --line: #d3d9e3; --text: #1c2432; --muted: #5b6678; --accent: #2c5fe6;
+  --primary: #2c5fe6; --primary-d: #2249b8;
+  --btn-bg: #ffffff; --btn-hover: #f7f9fc; --btn-line-hover: #aab3c2;
+  --side: #e5e9f0; --side-hover: #d9dfe9; --side-active: #ffffff;
+  --right: #dde2ea; --right-bar: #eef1f6;
+  --danger: #b3261e; --amber: #8a5a00; --amber-bg: #fff8e6; --amber-line: #e2c98f; --ok: #1c7a45;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --ink: #0b0f19; --ink2: #1a2233; --paper: #0f1420; --panel: #161c2a; --panel2: #1b2233; --field: #0f1522;
+  --line: #2c3548; --text: #e2e8f4; --muted: #98a3b8; --accent: #7ea2ff;
+  --primary: #3d68e6; --primary-d: #5079ee;
+  --btn-bg: #1f2740; --btn-hover: #263050; --btn-line-hover: #4a5878;
+  --side: #121826; --side-hover: #1d2536; --side-active: #1f2940;
+  --right: #0c111b; --right-bar: #131a28;
+  --danger: #ff8a80; --amber: #f0c060; --amber-bg: #2b2412; --amber-line: #5a4a1e; --ok: #5fd69a;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; margin: 0; }
+body { font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--text); background: var(--paper); }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { border: 1px solid var(--line); background: var(--btn-bg); padding: 5px 11px; border-radius: 6px; cursor: pointer; }
+button:hover { border-color: var(--btn-line-hover); background: var(--btn-hover); }
+button:disabled { opacity: 0.45; cursor: default; }
+button.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+button.primary:hover { background: var(--primary-d); border-color: var(--primary-d); }
+button.danger { color: var(--danger); }
+input[type=text], input[type=date], input[type=number], input[type=password], input:not([type]), select, textarea.small {
+  border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; background: var(--field); min-width: 0;
+}
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.grow { flex: 1; }
+.hint { color: var(--muted); font-size: 12px; }
+.mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+
+#workspace { display: flex; flex-direction: column; height: 100vh; }
+#top { background: var(--ink); border-bottom: 1px solid var(--ink2); color: #fff; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 12px; }
+#top button { padding: 4px 9px; background: transparent; border-color: #3b465e; color: #e8ecf5; }
+#top button:hover { background: var(--ink2); border-color: #5a6785; }
+#top .brand { font-weight: 700; margin-right: 6px; }
+#top .sep { width: 1px; height: 22px; background: #3b465e; margin: 0 4px; }
+#folder { color: #9aa6bf; font: 12px ui-monospace, Consolas, monospace; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#dirty { color: #ffd479; font-size: 12px; }
+
+#main { flex: 1; min-height: 0; display: grid; grid-template-columns: 250px minmax(0, 1fr) minmax(0, 1fr); }
+#side { background: var(--side); border-right: 1px solid var(--line); overflow: auto; padding: 8px; }
+#side h3 { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin: 16px 6px 4px; display: flex; justify-content: space-between; align-items: center; }
+#side h3 button { font-size: 11px; padding: 0 7px; text-transform: none; letter-spacing: 0; font-weight: 500; }
+.item { display: flex; justify-content: space-between; align-items: center; gap: 6px; width: 100%; text-align: left; border: 0; background: transparent; padding: 5px 8px; border-radius: 6px; }
+.item:hover { background: var(--side-hover); }
+.item.active { background: var(--side-active); box-shadow: inset 3px 0 0 var(--accent); }
+.item .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item.group { font-weight: 600; margin-top: 4px; }
+.item.child { padding-left: 22px; }
+.item.add { padding-left: 22px; color: var(--muted); font-size: 12px; }
+.chip { font-size: 11px; padding: 1px 7px; border-radius: 99px; border: 1px solid var(--line); white-space: nowrap; color: var(--muted); }
+.chip.draft { color: var(--amber); border-color: var(--amber-line); background: var(--amber-bg); }
+.chip.home { color: var(--accent); border-color: var(--accent); }
+.empty { color: var(--muted); padding: 4px 8px; font-size: 13px; }
+
+#left { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--panel); border-right: 1px solid var(--line); overflow: auto; }
+#left .fill { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.bar.sub { background: var(--panel2); }
+.bar.warn { background: var(--amber-bg); color: var(--amber); border-color: var(--amber-line); font-size: 13px; }
+.bar label { display: inline-flex; align-items: center; gap: 6px; }
+.bar label.wide { flex: 1; min-width: 220px; }
+.bar label.wide input { flex: 1; }
+.title-input { flex: 1; min-width: 140px; font-size: 16px; font-weight: 600; border: 1px solid transparent !important; padding: 5px 8px; }
+.title-input:hover, .title-input:focus { border-color: var(--line) !important; }
+.md-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+.md-tools button { padding: 2px 8px; font-size: 13px; }
+.code { flex: 1; width: 100%; min-height: 240px; border: 0; resize: none; padding: 14px; background: var(--panel); color: var(--text);
+  font: 14px/20px ui-monospace, "SF Mono", Consolas, "DejaVu Sans Mono", monospace; tab-size: 2; }
+.slug-wrap { display: inline-flex; align-items: center; gap: 2px; color: var(--muted); }
+.slug-wrap input { width: 160px; }
+.pad { padding: 14px; display: flex; flex-direction: column; gap: 12px; max-width: 640px; }
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field input, .field select, .field textarea { width: 100%; }
+.field textarea, textarea.small { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; background: var(--field); resize: vertical; font: inherit; }
+.two { display: flex; gap: 10px; flex-wrap: wrap; }
+.two > * { flex: 1 1 12rem; }
+fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+legend { font-weight: 600; padding: 0 4px; }
+details.box { border-bottom: 1px solid var(--line); }
+details.box > summary { cursor: pointer; padding: 8px 10px; font-weight: 600; background: var(--panel2); list-style: none; }
+details.box > summary::-webkit-details-marker { display: none; }
+details.box > summary::before { content: "\25B8 "; color: var(--muted); }
+details.box[open] > summary::before { content: "\25BE "; }
+details.box .pad { max-width: none; }
+.row { display: flex; align-items: center; gap: 6px; padding: 5px 10px; border-top: 1px solid var(--line); }
+.row .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .n { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 1.5em; text-align: right; }
+.row button { padding: 1px 8px; }
+.row input[type=text], .row input:not([type]) { flex: 1; }
+.words { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.tagpick { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.tagpick button { padding: 1px 9px; font-size: 12px; border-radius: 99px; }
+.tagpick button.on { background: var(--primary); border-color: var(--primary); color: #fff; }
+.mod-card { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+.mod-card h4 { margin: 0; display: flex; align-items: center; gap: 8px; }
+.log { flex: 1; min-height: 160px; margin: 0; padding: 10px 12px; overflow: auto; white-space: pre-wrap;
+  background: var(--field); border-top: 1px solid var(--line); font: 12px/1.5 ui-monospace, Consolas, monospace; }
+
+#right { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--right); }
+#right .bar { background: var(--right-bar); }
+#right a { color: var(--accent); }
+#pv-wrap { flex: 1; position: relative; overflow: hidden; }
+#preview { position: absolute; top: 0; left: 0; border: 0; background: #fff; transform-origin: 0 0; }
+#pv-size button { padding: 2px 8px; font-size: 12px; }
+#pv-size button.on { background: var(--primary); border-color: var(--primary); color: #fff; }
+.chip.bad { color: var(--danger); border-color: var(--danger); }
+.drop { border: 2px dashed var(--line); border-radius: 8px; padding: 14px; text-align: center; color: var(--muted); }
+.drop.over { border-color: var(--accent); background: var(--panel2); }
+.artcheck { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }
+.artcheck:empty { display: none; }
+.artcheck img { width: 72px; height: 72px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); }
+ul.checks { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; flex: 1 1 100%; }
+ul.checks li { padding: 4px 8px; border-radius: 6px; border-left: 3px solid var(--line); background: var(--panel2); font-size: 13px; }
+ul.checks li.fail { border-left-color: var(--danger); }
+ul.checks li.warn { border-left-color: var(--amber); }
+ul.checks li.ok { border-left-color: var(--ok); }
+.warnline { color: var(--amber); }
+.chrow { display: flex; gap: 6px; align-items: center; margin-bottom: 4px; }
+.chrow input { flex: 1; min-width: 0; }
+.chrow .ch-start { flex: 0 0 6.5em; }
+.chrow button { padding: 1px 8px; }
+.podpad { max-width: 760px; }
+.mdbox { border: 1px solid var(--line); border-radius: 6px; display: flex; flex-direction: column; overflow: hidden; }
+.mdbox .code { min-height: 170px; resize: vertical; }
+.btnlink { display: inline-flex; align-items: center; justify-content: center; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px; color: var(--accent); text-decoration: none; background: var(--btn-bg); }
+.mod-card.grey { opacity: 0.55; }
+.sub-fields { display: flex; flex-direction: column; gap: 8px; padding-left: 12px; border-left: 2px solid var(--line); }
+#e-player { width: 100%; }
+#e-progress progress { width: 60%; }
+#toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--ink); color: #fff; padding: 8px 16px; border-radius: 8px; opacity: 0; pointer-events: none; transition: opacity 0.15s; max-width: 80vw; white-space: pre-line; z-index: 50; }
+#toast.show { opacity: 1; }
+#toast.bad { background: #b3261e; }
+
+.card-screen { max-width: 640px; margin: 8vh auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 26px 28px; }
+.card-screen h1 { margin: 0 0 6px; font-size: 22px; }
+.card-screen p { color: var(--muted); margin: 0 0 16px; }
+.card-screen .row2 { display: flex; gap: 8px; margin-bottom: 12px; }
+.card-screen .row2 input { flex: 1; }
+.choices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 6px 0 14px; }
+.choice { display: flex; gap: 8px; align-items: flex-start; border: 1px solid var(--line); border-radius: 8px; padding: 10px; cursor: pointer; }
+.choice:has(input:checked) { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.choice b { display: block; }
+.choice span { color: var(--muted); font-size: 12px; }
+</style>
+<script>
+(function () {
+  var t = null;
+  try { t = localStorage.getItem("siteforge-theme"); } catch (e) { t = null; }
+  if (t !== "dark" && t !== "light") t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+  document.documentElement.setAttribute("data-theme", t);
+})();
+</script>
+</head>
+<body>
+
+<div id="welcome" class="card-screen" hidden>
+  <h1>__APP__</h1>
+  <p>Choose the folder for your site. A new or empty folder starts a new site. A folder that already holds a __APP__ site opens as you left it.</p>
+  <div class="row2">
+    <input id="w-path" aria-label="Site folder path" placeholder="/home/you/my-site">
+    <button id="w-browse">Browse</button>
+  </div>
+  <button id="w-open" class="primary">Open</button>
+</div>
+
+<div id="setup" class="card-screen" hidden>
+  <h1>New site</h1>
+  <p id="u-folder" class="mono"></p>
+  <label class="field">Site title <input id="u-title"></label>
+  <div id="u-structure">
+  <p style="margin:12px 0 4px;color:var(--text)"><b>What should the homepage be?</b></p>
+  <div class="choices">
+    <label class="choice"><input type="radio" name="u-home" value="page" checked><div><b>A page</b><span>A normal page you write, like a landing or about page.</span></div></label>
+    <label class="choice"><input type="radio" name="u-home" value="blog"><div><b>A blog feed</b><span>Your newest posts, with tags and an RSS feed.</span></div></label>
+    <label class="choice"><input type="radio" name="u-home" value="wiki"><div><b>A wiki</b><span>Sections of articles with a sidebar and search.</span></div></label>
+    <label class="choice"><input type="radio" name="u-home" value="library"><div><b>A book list</b><span>Short stories and serials, with chapters.</span></div></label>
+    <label class="choice"><input type="radio" name="u-home" value="podcast"><div><b>A podcast</b><span>A show page, episodes with a player, and the feed podcast apps read.</span></div></label>
+  </div>
+  <p style="margin:0 0 4px;color:var(--text)"><b>Also switch on</b> <span class="hint">(you can change all of this later in Site structure)</span></p>
+  <div style="display:flex;gap:14px;margin-bottom:12px">
+    <label><input type="checkbox" class="u-mod" value="blog"> Blog</label>
+    <label><input type="checkbox" class="u-mod" value="wiki"> Wiki</label>
+    <label><input type="checkbox" class="u-mod" value="library"> Library</label>
+    <label><input type="checkbox" class="u-mod" value="podcast"> Podcast</label>
+  </div>
+  </div>
+  <label class="field">Theme <select id="u-theme"></select></label>
+  <details style="margin:12px 0" id="u-importbox"><summary>Import an existing SiteGen, WikiGen, StoryGen or PodcastGen site</summary>
+    <div class="pad" style="padding:10px 0 0">
+      <div class="row2" style="margin:0"><input id="u-import" placeholder="The folder with .sitegen, .wikigen, .storygen or .podcastgen in it"><button id="u-import-browse">Browse</button><button id="u-detect">Check</button></div>
+      <span class="hint" id="u-detected"></span>
+      <label id="u-rootrow" hidden><input type="checkbox" id="u-root" checked> Serve it from the site root, so its existing URLs keep working</label>
+    </div>
+  </details>
+  <div style="display:flex;gap:8px"><button id="u-create" class="primary">Create site</button><button id="u-cancel">Back</button></div>
+</div>
+
+<div id="workspace" hidden>
+  <div id="top">
+    <span class="brand">__APP__</span>
+    <button data-act="new-page">Page</button>
+    <button data-act="new-post" data-mod="blog">Post</button>
+    <button data-act="new-article" data-mod="wiki">Article</button>
+    <button data-act="new-story" data-mod="library">Story</button>
+    <button data-act="new-chapter" data-mod="library">Chapter</button>
+    <button data-act="new-episode" data-mod="podcast">Episode</button>
+    <span class="sep"></span>
+    <button data-act="structure">Site structure</button>
+    <button data-act="menu">Menu</button>
+    <button data-act="css">Layout and CSS</button>
+    <button data-act="settings">Settings</button>
+    <button data-act="rescan" id="b-rescan" title="Pick up .md files added outside the editor">Rescan files</button>
+    <button data-act="publish">Publish</button>
+    <span class="grow"></span>
+    <span id="dirty" hidden>Unsaved changes</span>
+    <span id="folder" title=""></span>
+    <button data-act="theme" id="b-theme">Dark mode</button>
+    <button data-act="switch">Switch folder</button>
+    <button data-act="quit">Quit</button>
+  </div>
+  <div id="main">
+    <aside id="side" aria-label="Site contents"></aside>
+    <section id="left" aria-label="Editor"></section>
+    <section id="right" aria-label="Preview">
+      <div class="bar"><span class="hint">Live preview</span><span id="pv-size" role="group" aria-label="Preview width"><button data-pv="desktop">Desktop</button> <button data-pv="mobile">Mobile</button> <button data-pv="fit">Fit</button></span><span class="grow"></span><a id="open-built" href="/site/index.html" target="_blank" rel="noopener">Open built site</a></div>
+      <div id="pv-wrap"><iframe id="preview" title="Site preview" sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"></iframe></div>
+    </section>
+  </div>
+</div>
+<div id="toast" role="status"></div>
+<script>
+const TOKEN = "__TOKEN__";
+const $ = (s, r) => (r || document).querySelector(s);
+const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
+const enc = encodeURIComponent;
+
+let S = null;
+let view = { type: "none" };
+let dirty = false;
+let timer = null;
+let slugTouched = false;
+
+/* ---------- basics ---------- */
+async function api(method, path, body) {
+  const opt = { method, headers: { "X-Token": TOKEN } };
+  if (body !== undefined) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+  const r = await fetch("/api/" + path, opt);
+  let data = {};
+  try { data = await r.json(); } catch (e) { data = { error: "Unexpected response from the server." }; }
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+function toast(msg, kind) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "show " + (kind || "");
+  clearTimeout(toast.t);
+  toast.t = setTimeout(() => { t.className = ""; }, kind === "bad" ? 5000 : 3200);
+}
+
+function setDirty(v) { dirty = v; $("#dirty").hidden = !v; }
+function markDirty() { setDirty(true); countWords(); schedulePreview(); }
+async function guard() { return !dirty || window.confirm("You have unsaved changes. Discard them?"); }
+function slugify(s) {
+  return s.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
+}
+function fmt(n) { return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
+function on(mid) { return !!(S && S.modules[mid] && S.modules[mid].enabled); }
+function label(mid) { return (S.modules[mid] && S.modules[mid].label) || S.names[mid]; }
+function el(tag, props, kids) {
+  const e = document.createElement(tag);
+  Object.entries(props || {}).forEach(([k, v]) => { if (k === "text") e.textContent = v; else if (k === "on") Object.entries(v).forEach(([ev, f]) => e.addEventListener(ev, f)); else e.setAttribute(k, v); });
+  (kids || []).forEach((k) => e.appendChild(k));
+  return e;
+}
+function opts(select, items, value) {
+  select.innerHTML = "";
+  items.forEach(([v, t]) => select.appendChild(el("option", { value: v, text: t })));
+  if (value !== undefined) select.value = value;
+}
+function story(slug) { return S.library.stories.find((s) => s.slug === slug); }
+function section(slug) { return S.wiki.sections.find((s) => s.slug === slug); }
+function post(slug) { return S.posts.find((p) => p.slug === slug); }
+function page(slug) { return S.pages.find((p) => p.slug === slug); }
+
+/* ---------- markdown toolbar ---------- */
+const MD_TOOLS = `
+<div class="md-tools">
+  <button data-md="bold" title="Bold"><b>B</b></button>
+  <button data-md="italic" title="Italic"><i>I</i></button>
+  <button data-md="heading">Heading</button>
+  <button data-md="link">Link</button>
+  <button data-md="wiki" data-need="wiki" title="Link to a wiki article by its title">Wiki link</button>
+  <button data-md="image" title="Upload an image and insert it at the cursor. You can also paste or drag images into the text.">Upload image</button>
+  <button data-md="code">Code</button>
+  <button data-md="block">Code block</button>
+  <button data-md="list">List</button>
+  <button data-md="steps">Steps</button>
+  <button data-md="quote">Quote</button>
+  <button data-md="callout">Callout</button>
+  <button data-md="break" title="Scene break">Scene break</button>
+  <button data-md="table">Table</button>
+  <span class="grow"></span>
+  <span class="words" id="wc"></span>
+  <input type="file" id="img-file" accept="image/*" hidden>
+</div>`;
+
+const SEO_BLOCK = `
+<details class="box" id="seo">
+  <summary>SEO and social sharing</summary>
+  <div class="pad">
+    <label class="field">Title tag override <input id="seo-title" maxlength="120" placeholder="Defaults to the title, followed by the site name"></label>
+    <label class="field">Meta description <textarea id="seo-desc" rows="2" maxlength="320" placeholder="Shown in search results and social cards"></textarea><span class="hint" id="seo-count"></span></label>
+    <label class="field">Social image <input id="seo-image" placeholder="assets/cover.jpg or a full URL. Defaults to the site image."></label>
+    <label class="field">Canonical URL <input id="seo-canonical" placeholder="Leave blank unless this is also published at another URL"></label>
+    <label><input type="checkbox" id="seo-noindex"> Ask search engines not to index this</label>
+  </div>
+</details>`;
+
+function setSeo(rec) {
+  $("#seo-title").value = rec.seo_title || "";
+  $("#seo-desc").value = rec.description || "";
+  $("#seo-image").value = rec.image || "";
+  $("#seo-canonical").value = rec.canonical || "";
+  $("#seo-noindex").checked = !!rec.noindex;
+  const count = () => { const n = $("#seo-desc").value.trim().length; $("#seo-count").textContent = n ? n + " characters" + (n > 160 ? ", may be shortened in search results" : "") : ""; };
+  ["#seo-title", "#seo-desc", "#seo-image", "#seo-canonical"].forEach((id) => $(id).addEventListener("input", () => { count(); markDirty(); }));
+  $("#seo-noindex").addEventListener("change", markDirty);
+  count();
+}
+function seoVals() {
+  return { seo_title: $("#seo-title").value, description: $("#seo-desc").value, image: $("#seo-image").value,
+    canonical: $("#seo-canonical").value, noindex: $("#seo-noindex").checked };
+}
+
+function countWords() {
+  const w = $("#wc"), ta = $("#md");
+  if (!w || !ta) return;
+  const n = (ta.value.replace(/[#*_>`\[\]()~|-]/g, " ").match(/\S+/g) || []).length;
+  w.textContent = fmt(n) + " words";
+}
+
+function applyMd(ta, kind) {
+  const s = ta.selectionStart, e = ta.selectionEnd, sel = ta.value.slice(s, e);
+  const wrap = (a, b, ph) => { const t = sel || ph; ta.setRangeText(a + t + b, s, e, "end"); ta.setSelectionRange(s + a.length, s + a.length + t.length); };
+  const prefix = (p) => { const ls = ta.value.lastIndexOf("\n", s - 1) + 1; ta.setRangeText(p, ls, ls, "preserve"); ta.setSelectionRange(s + p.length, e + p.length); };
+  const block = (text) => {
+    const before = ta.value.slice(0, s);
+    const lead = before && !before.endsWith("\n\n") ? (before.endsWith("\n") ? "\n" : "\n\n") : "";
+    ta.setRangeText(lead + text + "\n", s, e, "end");
+  };
+  if (kind === "bold") wrap("**", "**", "bold text");
+  else if (kind === "italic") wrap("*", "*", "italic text");
+  else if (kind === "code") wrap("`", "`", "code");
+  else if (kind === "link") wrap("[", "](https://)", "link text");
+  else if (kind === "wiki") wrap("[[", "]]", "Article title");
+  else if (kind === "heading") prefix("## ");
+  else if (kind === "list") prefix("- ");
+  else if (kind === "quote") prefix("> ");
+  else if (kind === "steps") block(sel ? sel.split("\n").map((l, i) => (i + 1) + ". " + l).join("\n") : "1. First step\n2. Second step\n3. Third step");
+  else if (kind === "block") block("```bash\n" + (sel || "command here") + "\n```");
+  else if (kind === "callout") block("> [!NOTE]\n> " + (sel || "Something the reader should notice.").split("\n").join("\n> "));
+  else if (kind === "break") block("* * *\n");
+  else if (kind === "table") block("| Column | Column |\n|---|---|\n| Cell | Cell |");
+  ta.dispatchEvent(new Event("input"));
+  ta.focus();
+}
+
+async function uploadImage(file) {
+  const r = await fetch("/api/upload?name=" + enc(file.name), { method: "POST", headers: { "X-Token": TOKEN }, body: file });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || "Upload failed");
+  return d.path;
+}
+
+function bindEditor() {
+  const ta = $("#md");
+  ta.addEventListener("input", markDirty);
+  $$(".md-tools button").forEach((b) => {
+    if (b.dataset.need && !on(b.dataset.need)) b.hidden = true;
+    b.addEventListener("click", () => { if (b.dataset.md === "image") pickImages(ta); else applyMd(ta, b.dataset.md); });
+  });
+  wireImages(ta);
+  countWords();
+}
+
+function importInto(titleSel, slugSel) {
+  const inp = el("input", { type: "file", accept: ".md,.markdown,.txt,text/markdown,text/plain", hidden: "" });
+  document.body.appendChild(inp);
+  inp.addEventListener("change", () => {
+    const f = inp.files[0];
+    inp.remove();
+    if (!f) return;
+    const ta = $("#md");
+    if (ta.value.trim() && !window.confirm("Replace the text in the editor with " + f.name + "?")) return;
+    const rd = new FileReader();
+    rd.onload = () => {
+      const text = String(rd.result).replace(/\r\n?/g, "\n");
+      ta.value = text;
+      if (!$(titleSel).value.trim()) {
+        const first = text.split("\n").find((l) => l.trim()) || "";
+        const m = first.match(/^\s*#\s+(.+?)\s*#*\s*$/);
+        const t = m ? m[1] : f.name.replace(/\.[^.]+$/, "").replace(/[-_]+/g, " ");
+        $(titleSel).value = t.charAt(0).toUpperCase() + t.slice(1);
+        if (!slugTouched) $(slugSel).value = slugify($(titleSel).value);
+      }
+      markDirty();
+      toast("Imported " + f.name + ". Save to keep it.");
+    };
+    rd.readAsText(f);
+  });
+  inp.click();
+}
+
+/* ---------- preview ---------- */
+let pvMode = "desktop";
+try { pvMode = localStorage.getItem("siteforge-preview") || "desktop"; } catch (e) { /* ignore */ }
+
+function fitPreview() {
+  const wrap = $("#pv-wrap"), f = $("#preview");
+  const W = wrap.clientWidth, H = wrap.clientHeight;
+  if (!W || !H) return;
+  const target = pvMode === "desktop" ? 1280 : pvMode === "mobile" ? 390 : W;
+  const s = Math.min(1, W / target);
+  f.style.width = target + "px";
+  f.style.height = (H / s) + "px";
+  f.style.transform = "translateX(" + Math.max(0, (W - target * s) / 2) + "px) scale(" + s + ")";
+  $$("#pv-size button").forEach((b) => b.classList.toggle("on", b.dataset.pv === pvMode));
+}
+$$("#pv-size button").forEach((b) => b.addEventListener("click", () => {
+  pvMode = b.dataset.pv;
+  try { localStorage.setItem("siteforge-preview", pvMode); } catch (e) { /* ignore */ }
+  fitPreview();
+}));
+new ResizeObserver(fitPreview).observe($("#pv-wrap"));
+
+function schedulePreview() { clearTimeout(timer); timer = setTimeout(renderPreview, 260); }
+
+function previewPayload() {
+  const md = () => $("#md").value;
+  switch (view.type) {
+    case "page": return Object.assign({ view: "page", slug: view.slug, title: $("#g-title").value, show_title: $("#g-show").checked, markdown: md() }, seoVals());
+    case "landing": return { view: { blog: "blogintro", wiki: "wikihome", library: "libhome" }[view.mod], markdown: md() };
+    case "post": return Object.assign({ view: "post", orig_slug: view.slug, new_slug: $("#p-slug").value, title: $("#p-title").value,
+      date: $("#p-date").value, summary: $("#p-summary").value, tags: $("#p-tags").value, markdown: md() }, seoVals());
+    case "section": return { view: "section", slug: view.slug, title: $("#s-title").value, description: $("#s-desc").value, markdown: md() };
+    case "article": return { view: "article", section: $("#a-sec").value, orig_section: view.sec || "", orig_slug: view.slug || "",
+      new_slug: $("#a-slug").value, title: $("#a-title").value, description: $("#a-desc").value, markdown: md() };
+    case "story": return storyPayload();
+    case "chapter": return { view: "chapter", story: $("#c-story").value, orig_story: view.story || "", orig_slug: view.slug || "",
+      new_slug: $("#c-slug").value, title: $("#c-title").value, date: $("#c-date").value, note: $("#c-note").value, markdown: md() };
+    case "css": return { view: "css", target: $("#css-target").value, css: themeCss($("#css").value), layouts: layoutVals() };
+    case "settings": return { view: "settings", target: "home", site: readSettings() };
+    case "menu": return { view: "menu", target: "home", nav: S.nav };
+    case "episode": return Object.assign({ view: "episode" }, epPayload());
+    case "show": return { view: "podcasthome", markdown: md(), show: readShow() };
+    case "dirs": return { view: "dirs", target: "podcast:" };
+  }
+  return null;
+}
+
+async function renderPreview() {
+  const p = previewPayload();
+  if (!p) return;
+  try {
+    const r = await api("POST", "preview", p);
+    const f = $("#preview");
+    let y = 0;
+    try { y = f.contentWindow.scrollY || 0; } catch (e) { y = 0; }
+    f.onload = () => { try { f.contentWindow.scrollTo(0, y); } catch (e) { /* ignore */ } };
+    f.srcdoc = r.html;
+    const m = $("#missing");
+    if (m) {
+      m.hidden = !r.missing.length;
+      m.textContent = r.missing.length ? "Wiki links with no matching article: " + r.missing.join(", ") : "";
+    }
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+/* ---------- sidebar ---------- */
+function renderTop() {
+  $("#folder").textContent = S.folder;
+  $("#folder").title = S.folder;
+  $$("#top [data-mod]").forEach((b) => { b.hidden = !on(b.dataset.mod); });
+  $("#b-rescan").hidden = !(on("wiki") || on("library") || on("podcast"));
+  $$('#top [data-act="structure"]').forEach((b) => { b.hidden = !!S.only; });
+}
+
+function renderSide() {
+  const side = $("#side");
+  side.innerHTML = "";
+  const item = (text, cls, active, fn, chip) => {
+    const b = el("button", { class: "item " + cls + (active ? " active" : "") }, [el("span", { class: "t", text })]);
+    if (chip) b.appendChild(el("span", { class: "chip " + (chip[1] || ""), text: chip[0] }));
+    b.addEventListener("click", fn);
+    side.appendChild(b);
+  };
+  const head = (text, btn, fn) => {
+    const h = el("h3", {}, [el("span", { text })]);
+    if (btn) h.appendChild(el("button", { text: btn, on: { click: () => go(fn) } }));
+    side.appendChild(h);
+  };
+  const homeLabel = S.home === "page" ? "Home page" : (S.home === "podcast" ? "Home page (show settings)" : "Home page (" + label(S.home) + ")");
+  item(homeLabel, "", view.type === "page" && view.slug === "index" || (view.type === "landing" && view.mod === S.home) || (view.type === "show" && S.home === "podcast"), () => go(openHome), ["Home", "home"]);
+  head("Pages", "+ Page", newPage);
+  S.pages.filter((p) => p.slug !== "index").forEach((p) => item(p.title, "", view.type === "page" && view.slug === p.slug, () => go(() => openPage(p.slug))));
+  if (on("blog")) {
+    head(label("blog"), "+ Post", () => openPost(null));
+    if (S.home !== "blog") item("Feed page", "", view.type === "landing" && view.mod === "blog", () => go(() => openLanding("blog")));
+    S.posts.slice().sort((a, b) => (b.date + b.title).localeCompare(a.date + a.title)).forEach((p) =>
+      item(p.title, "", view.type === "post" && view.slug === p.slug, () => go(() => openPost(p.slug)), p.status === "draft" ? ["Draft", "draft"] : null));
+  }
+  if (on("wiki")) {
+    head(label("wiki"), "+ Section", newSection);
+    if (S.home !== "wiki") item(label("wiki") + " home", "", view.type === "landing" && view.mod === "wiki", () => go(() => openLanding("wiki")));
+    S.wiki.sections.forEach((s) => {
+      item(s.title, "group", view.type === "section" && view.slug === s.slug, () => go(() => openSection(s.slug)), [String(s.articles.length)]);
+      s.articles.forEach((a) => item(a.title, "child", view.type === "article" && view.sec === s.slug && view.slug === a.slug,
+        () => go(() => openArticle(s.slug, a.slug)), a.draft ? ["Draft", "draft"] : null));
+      item("+ Article", "add", false, () => go(() => openArticle(null, null, s.slug)));
+    });
+  }
+  if (on("library")) {
+    head(label("library"), "+ Story", newStory);
+    if (S.home !== "library") item(label("library") + " page", "", view.type === "landing" && view.mod === "library", () => go(() => openLanding("library")));
+    S.library.stories.forEach((s) => {
+      const chip = s.draft ? ["Draft", "draft"] : (s.kind === "single" ? ["Single"] : [String(s.chapters.length)]);
+      item(s.title, "group", view.type === "story" && view.slug === s.slug, () => go(() => openStory(s.slug)), chip);
+      s.chapters.forEach((ch) => item(ch.title, "child", view.type === "chapter" && view.story === s.slug && view.slug === ch.slug,
+        () => go(() => openChapter(s.slug, ch.slug)), ch.draft ? ["Draft", "draft"] : null));
+      if (s.kind !== "single") item("+ Chapter", "add", false, () => go(() => openChapter(null, null, s.slug)));
+    });
+  }
+  if (on("podcast")) {
+    head(label("podcast"), "+ Episode", () => openEpisode(null));
+    if (S.home !== "podcast") item("Show settings", "", view.type === "show", () => go(openShow), pod().check_fails ? ["!", "bad"] : null);
+    else if (pod().check_fails) item("Feed check", "", view.type === "show", () => go(openShow), ["!", "bad"]);
+    item("Directories", "", view.type === "dirs", () => go(openDirs), [pod().checklist_done + "/" + pod().checklist_total]);
+    pod().episodes.forEach((e) => {
+      let chip = null;
+      if (e.media === "queued" || e.media === "processing") chip = ["Processing"];
+      else if (e.media === "failed") chip = ["Failed", "bad"];
+      else if (e.status === "draft") chip = ["Draft", "draft"];
+      else if (e.scheduled) chip = ["Scheduled", "draft"];
+      else if (e.kind !== "full") chip = [e.kind === "trailer" ? "Trailer" : "Bonus"];
+      item((e.number ? "E" + e.number + " " : "") + e.title, "", view.type === "episode" && view.slug === e.slug, () => go(() => openEpisode(e.slug)), chip);
+    });
+  }
+  if (!on("blog") && !on("wiki") && !on("library") && !on("podcast")) {
+    side.appendChild(el("p", { class: "empty", text: "Add a blog, wiki, library or podcast in Site structure." }));
+  }
+}
+
+async function refresh() { S = await api("GET", "state"); renderTop(); renderSide(); }
+async function go(fn) {
+  if (!(await guard())) return;
+  setDirty(false);
+  try { await fn(); } catch (e) { toast(e.message, "bad"); }
+}
+function show(html) { $("#left").innerHTML = html.replace("MDTOOLS", MD_TOOLS).replace("SEOBLOCK", SEO_BLOCK); }
+function watch(ids) { ids.forEach((id) => { const e = $(id); if (e) e.addEventListener(e.type === "checkbox" || e.tagName === "SELECT" ? "change" : "input", markDirty); }); }
+
+/* ---------- home ---------- */
+async function openHome() {
+  if (S.home === "page") await openPage("index");
+  else if (S.home === "podcast") await openShow();
+  else await openLanding(S.home);
+}
+
+/* ---------- pages ---------- */
+const PAGE_TPL = `
+<div class="fill">
+  <div class="bar">
+    <input id="g-title" class="title-input" placeholder="Page title" aria-label="Page title">
+    <label><input type="checkbox" id="g-show"> Show title</label>
+    <button id="g-save" class="primary">Save</button>
+  </div>
+  <div class="bar sub" id="g-sub">
+    <label>Address <span class="slug-wrap"><input id="g-slug" aria-label="Page address">.html</span></label>
+    <span class="grow"></span>
+    <button id="g-delete" class="danger">Delete page</button>
+  </div>
+  <div class="bar warn" id="g-unused" hidden></div>
+  SEOBLOCK
+  <div class="bar warn" id="missing" hidden></div>
+  MDTOOLS
+  <textarea id="md" class="code" spellcheck="true" placeholder="Write the page in Markdown"></textarea>
+</div>`;
+
+async function newPage() {
+  const title = window.prompt("Page title. Type About or Privacy policy to start from a template.");
+  if (!title || !title.trim()) return;
+  const t = title.trim().toLowerCase();
+  const template = t === "about" ? "about" : (t.startsWith("privacy") ? "privacy" : "");
+  const r = await api("POST", "pages", { title: title.trim(), template });
+  await refresh();
+  await openPage(r.slug);
+}
+
+async function openPage(slug) {
+  const d = await api("GET", "pages/" + enc(slug));
+  view = { type: "page", slug };
+  show(PAGE_TPL);
+  $("#g-title").value = d.page.title;
+  $("#g-show").checked = !!d.page.show_title;
+  $("#g-slug").value = d.page.slug;
+  $("#md").value = d.markdown;
+  $("#g-sub").hidden = slug === "index";
+  if (slug === "index" && S.home !== "page") {
+    $("#g-unused").hidden = false;
+    $("#g-unused").textContent = "The homepage is currently the " + label(S.home) + ", so this page is not published. Change that in Site structure.";
+  }
+  setSeo(d.page);
+  watch(["#g-title", "#g-show", "#g-slug"]);
+  $("#g-save").addEventListener("click", savePage);
+  $("#g-delete").addEventListener("click", deletePage);
+  bindEditor();
+  renderSide();
+  renderPreview();
+}
+
+async function savePage() {
+  try {
+    const r = await api("PUT", "pages/" + enc(view.slug), Object.assign({ title: $("#g-title").value, show_title: $("#g-show").checked,
+      new_slug: $("#g-slug").value, markdown: $("#md").value }, seoVals()));
+    view.slug = r.slug;
+    $("#g-slug").value = r.slug;
+    setDirty(false);
+    await refresh();
+    toast("Saved");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+async function deletePage() {
+  if (!window.confirm("Delete this page? Its markdown is moved to the trash folder.")) return;
+  try { await api("DELETE", "pages/" + enc(view.slug)); setDirty(false); await refresh(); await openHome(); toast("Page deleted"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+/* ---------- module landing pages ---------- */
+const LANDING_TPL = `
+<div class="fill">
+  <div class="bar"><strong id="l-title"></strong><span class="hint" id="l-hint"></span><span class="grow"></span><button id="l-save" class="primary">Save</button></div>
+  <div class="bar warn" id="missing" hidden></div>
+  MDTOOLS
+  <textarea id="md" class="code" spellcheck="true"></textarea>
+</div>`;
+const LANDING_API = { blog: "blog-intro", wiki: "wiki-home", library: "lib-home" };
+
+async function openLanding(mod) {
+  const d = await api("GET", LANDING_API[mod]);
+  view = { type: "landing", mod };
+  show(LANDING_TPL);
+  $("#l-title").textContent = (S.home === mod ? "Home page: " : "") + label(mod) + (mod === "blog" ? " feed page" : mod === "wiki" ? " home" : " page");
+  $("#l-hint").textContent = { blog: "Optional introduction shown above the list of posts.",
+    wiki: "Shown above the section cards and recent changes.", library: "Optional introduction shown above your stories." }[mod];
+  $("#md").value = d.markdown;
+  $("#l-save").addEventListener("click", saveLanding);
+  bindEditor();
+  renderSide();
+  renderPreview();
+}
+
+async function saveLanding() {
+  try { await api("PUT", LANDING_API[view.mod], { markdown: $("#md").value }); setDirty(false); toast("Saved"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+/* ---------- blog posts ---------- */
+const POST_TPL = `
+<div class="fill">
+  <div class="bar">
+    <input id="p-title" class="title-input" placeholder="Post title" aria-label="Post title">
+    <span class="chip" id="p-status"></span>
+    <button id="p-save">Save draft</button>
+    <button id="p-publish" class="primary">Publish</button>
+    <button id="p-unpublish" hidden>Unpublish</button>
+  </div>
+  <div class="bar sub">
+    <label>Date <input type="date" id="p-date"></label>
+    <label>Address <span class="slug-wrap"><span id="p-base"></span><input id="p-slug" aria-label="Post address">.html</span></label>
+    <span class="grow"></span>
+    <button id="p-import">Import .md</button>
+    <button id="p-delete" class="danger">Delete</button>
+  </div>
+  <div class="bar sub"><label class="wide">Summary <input id="p-summary" maxlength="400" placeholder="Optional. Defaults to the first paragraph."></label></div>
+  <div class="bar sub"><label class="wide">Tags <input id="p-tags" placeholder="Life, Tech (separate with commas)"></label><span class="tagpick" id="p-tagpick"></span></div>
+  SEOBLOCK
+  <div class="bar warn" id="missing" hidden></div>
+  MDTOOLS
+  <textarea id="md" class="code" spellcheck="true" placeholder="Write the post in Markdown"></textarea>
+</div>`;
+
+function renderTagPick() {
+  const box = $("#p-tagpick");
+  if (!box) return;
+  const have = $("#p-tags").value.split(",").map((t) => t.trim().toLowerCase()).filter(Boolean);
+  box.innerHTML = "";
+  S.tags.forEach((t) => {
+    const b = el("button", { type: "button", text: t, class: have.includes(t.toLowerCase()) ? "on" : "" });
+    b.addEventListener("click", () => {
+      let list = $("#p-tags").value.split(",").map((x) => x.trim()).filter(Boolean);
+      if (list.some((x) => x.toLowerCase() === t.toLowerCase())) list = list.filter((x) => x.toLowerCase() !== t.toLowerCase());
+      else list.push(t);
+      $("#p-tags").value = list.join(", ");
+      renderTagPick();
+      markDirty();
+    });
+    box.appendChild(b);
+  });
+}
+
+async function openPost(slug) {
+  let p = { title: "", date: new Date().toLocaleDateString("en-CA"), summary: "", tags: [], status: "draft", slug: "" }, markdown = "";
+  if (slug) { const d = await api("GET", "posts/" + enc(slug)); p = d.post; markdown = d.markdown; }
+  view = { type: "post", slug: slug || "" };
+  show(POST_TPL);
+  $("#p-title").value = p.title;
+  $("#p-date").value = p.date;
+  $("#p-slug").value = p.slug;
+  $("#p-base").textContent = (S.modules.blog.mount || "blog") + "/posts/";
+  $("#p-summary").value = p.summary || "";
+  $("#p-tags").value = (p.tags || []).join(", ");
+  $("#md").value = markdown;
+  slugTouched = !!slug;
+  syncPost(p);
+  setSeo(p);
+  $("#p-title").addEventListener("input", () => { if (!slugTouched) $("#p-slug").value = slugify($("#p-title").value); markDirty(); });
+  $("#p-slug").addEventListener("input", () => { slugTouched = true; markDirty(); });
+  $("#p-tags").addEventListener("input", () => { renderTagPick(); markDirty(); });
+  watch(["#p-date", "#p-summary"]);
+  $("#p-save").addEventListener("click", () => savePost(false));
+  $("#p-publish").addEventListener("click", () => savePost(true));
+  $("#p-unpublish").addEventListener("click", unpublishPost);
+  $("#p-delete").addEventListener("click", deletePost);
+  $("#p-import").addEventListener("click", () => importInto("#p-title", "#p-slug"));
+  renderTagPick();
+  bindEditor();
+  renderSide();
+  renderPreview();
+  if (!slug) $("#p-title").focus();
+}
+
+function syncPost(p) {
+  const pub = p.status === "published";
+  $("#p-status").textContent = view.slug ? (pub ? "Published" : "Draft") : "New";
+  $("#p-status").className = "chip" + (pub ? "" : " draft");
+  $("#p-save").textContent = pub ? "Save" : "Save draft";
+  $("#p-publish").textContent = pub ? "Save and update" : "Publish";
+  $("#p-unpublish").hidden = !pub;
+  $("#p-delete").hidden = !view.slug;
+}
+
+async function savePost(publish) {
+  try {
+    const r = await api("POST", "posts", Object.assign({ orig_slug: view.slug, new_slug: $("#p-slug").value, title: $("#p-title").value,
+      date: $("#p-date").value, summary: $("#p-summary").value, tags: $("#p-tags").value, markdown: $("#md").value, publish }, seoVals()));
+    view.slug = r.slug;
+    $("#p-slug").value = r.slug;
+    slugTouched = true;
+    setDirty(false);
+    await refresh();
+    syncPost(r.post);
+    renderTagPick();
+    toast(publish ? "Published" : "Saved");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+async function unpublishPost() {
+  try { const r = await api("POST", "posts/" + enc(view.slug) + "/unpublish"); await refresh(); syncPost(r.post); toast("Moved back to drafts"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+async function deletePost() {
+  if (!window.confirm("Delete this post? Its markdown is moved to the trash folder.")) return;
+  try { await api("DELETE", "posts/" + enc(view.slug)); setDirty(false); await refresh(); await openHome(); toast("Post deleted"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+/* ---------- shared list reordering ---------- */
+function orderRows(box, items, labelOf, onMove, onEdit, extra) {
+  box.innerHTML = "";
+  if (!items.length) { box.appendChild(el("div", { class: "empty", text: "Nothing here yet." })); return; }
+  items.forEach((it, i) => {
+    const row = el("div", { class: "row" }, [el("span", { class: "n", text: String(i + 1) }), el("span", { class: "t", text: labelOf(it) })]);
+    if (extra) row.appendChild(el("span", { class: "words", text: extra(it) }));
+    const mk = (t, dis, fn) => { const b = el("button", { text: t }); b.disabled = dis; b.addEventListener("click", fn); row.appendChild(b); };
+    mk("Up", i === 0, () => onMove(i, i - 1));
+    mk("Down", i === items.length - 1, () => onMove(i, i + 1));
+    mk("Edit", false, () => onEdit(it));
+    box.appendChild(row);
+  });
+}
+function moved(list, i, j) { const l = list.slice(); l.splice(j, 0, l.splice(i, 1)[0]); return l; }
+
+/* ---------- wiki ---------- */
+const SEC_TPL = `
+<div class="fill">
+  <div class="bar"><input id="s-title" class="title-input" placeholder="Section name" aria-label="Section name"><button id="s-save" class="primary">Save</button></div>
+  <div class="bar sub">
+    <label>Address <span class="slug-wrap"><span id="s-base"></span><input id="s-slug" aria-label="Section address">/</span></label>
+    <span class="grow"></span>
+    <button id="s-up">Move up</button><button id="s-down">Move down</button>
+    <button id="s-delete" class="danger">Delete section</button>
+  </div>
+  <div class="bar sub"><label class="wide">Description <input id="s-desc" maxlength="320" placeholder="One line, shown under the section title and on the wiki home"></label></div>
+  <details class="box" open><summary>Articles, in sidebar order</summary><div id="s-arts"></div>
+    <div class="bar"><button id="s-new">New article here</button><button id="s-sort">Sort A to Z</button><span class="hint">Order changes save immediately.</span></div>
+  </details>
+  <div class="bar sub"><span class="hint">Introduction shown above the article list on the section page</span></div>
+  MDTOOLS
+  <textarea id="md" class="code" spellcheck="true" placeholder="Optional introduction in Markdown"></textarea>
+</div>`;
+
+const ART_TPL = `
+<div class="fill">
+  <div class="bar">
+    <input id="a-title" class="title-input" placeholder="Article title" aria-label="Article title">
+    <label title="Drafts are saved but left out of the built site"><input type="checkbox" id="a-draft"> Draft</label>
+    <button id="a-save" class="primary">Save</button>
+  </div>
+  <div class="bar sub">
+    <label>Section <select id="a-sec"></select></label>
+    <label>Address <span class="slug-wrap"><span id="a-base"></span><input id="a-slug" aria-label="Article address">.html</span></label>
+    <span class="grow"></span>
+    <button id="a-import">Import .md</button><button id="a-up">Move up</button><button id="a-down">Move down</button>
+    <button id="a-delete" class="danger">Delete</button>
+  </div>
+  <div class="bar sub"><label class="wide">Description <input id="a-desc" maxlength="320" placeholder="Optional one line for search results and section lists"></label></div>
+  <div class="bar warn" id="missing" hidden></div>
+  MDTOOLS
+  <textarea id="md" class="code" spellcheck="true" placeholder="Write the article in Markdown"></textarea>
+</div>`;
+
+function wikiBase() { return S.modules.wiki.mount ? S.modules.wiki.mount + "/" : ""; }
+
+async function newSection() {
+  const title = window.prompt("Section name, for example Fun stuff or Linux - Technical");
+  if (!title || !title.trim()) return;
+  const r = await api("POST", "sections", { title: title.trim() });
+  await refresh();
+  await openSection(r.slug);
+}
+
+async function openSection(slug) {
+  const d = await api("GET", "sections/" + enc(slug));
+  view = { type: "section", slug };
+  show(SEC_TPL);
+  $("#s-title").value = d.section.title;
+  $("#s-slug").value = d.section.slug;
+  $("#s-base").textContent = wikiBase();
+  $("#s-desc").value = d.section.description || "";
+  $("#md").value = d.markdown;
+  watch(["#s-title", "#s-slug", "#s-desc"]);
+  $("#s-save").addEventListener("click", saveSection);
+  $("#s-delete").addEventListener("click", deleteSection);
+  $("#s-up").addEventListener("click", () => moveSection(-1));
+  $("#s-down").addEventListener("click", () => moveSection(1));
+  $("#s-new").addEventListener("click", () => go(() => openArticle(null, null, view.slug)));
+  $("#s-sort").addEventListener("click", () => saveArtOrder(section(view.slug).articles.slice()
+    .sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: "base" })).map((a) => a.slug)));
+  sectionRows();
+  bindEditor();
+  renderSide();
+  renderPreview();
+}
+
+function sectionRows() {
+  const s = section(view.slug);
+  const i = S.wiki.sections.indexOf(s);
+  $("#s-up").disabled = i <= 0;
+  $("#s-down").disabled = i >= S.wiki.sections.length - 1;
+  orderRows($("#s-arts"), s.articles, (a) => a.title + (a.draft ? " (draft)" : ""),
+    (i2, j) => saveArtOrder(moved(s.articles.map((a) => a.slug), i2, j)), (a) => go(() => openArticle(s.slug, a.slug)));
+}
+
+async function saveArtOrder(list, sec) {
+  try {
+    await api("POST", "sections/" + enc(sec || view.slug) + "/order", { articles: list });
+    await refresh();
+    if (view.type === "section") sectionRows();
+    if (view.type === "article") syncArticle();
+    schedulePreview();
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+async function saveSection() {
+  try {
+    const r = await api("PUT", "sections/" + enc(view.slug), { title: $("#s-title").value, new_slug: $("#s-slug").value,
+      description: $("#s-desc").value, markdown: $("#md").value });
+    view.slug = r.slug;
+    $("#s-slug").value = r.slug;
+    setDirty(false);
+    await refresh();
+    sectionRows();
+    toast("Saved");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+async function moveSection(dir) {
+  try { await api("POST", "sections/" + enc(view.slug) + "/move", { dir }); await refresh(); sectionRows(); schedulePreview(); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+async function deleteSection() {
+  const s = section(view.slug);
+  if (!window.confirm("Delete the section \"" + s.title + "\"" + (s.articles.length ? " and its " + s.articles.length + " article(s)" : "") +
+    "?\n\nThe markdown files are moved to the trash folder, not destroyed.")) return;
+  try { await api("DELETE", "sections/" + enc(view.slug)); setDirty(false); await refresh(); await openHome(); toast("Section deleted"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+async function openArticle(secSlug, slug, forSec) {
+  if (!S.wiki.sections.length) { toast("Create a wiki section first. Articles live inside sections.", "bad"); await newSection(); return; }
+  let art = { title: "", description: "", draft: false, slug: "" }, markdown = "", where = forSec || secSlug;
+  if (slug) { const d = await api("GET", "articles/" + enc(secSlug) + "/" + enc(slug)); art = d.article; markdown = d.markdown; where = d.section; }
+  if (!where) where = (view.type === "section" && view.slug) || (view.type === "article" && view.sec) || S.wiki.sections[0].slug;
+  view = { type: "article", sec: slug ? where : "", slug: slug || "" };
+  show(ART_TPL);
+  opts($("#a-sec"), S.wiki.sections.map((s) => [s.slug, s.title]), where);
+  $("#a-base").textContent = wikiBase() + where + "/";
+  $("#a-title").value = art.title;
+  $("#a-slug").value = art.slug;
+  $("#a-desc").value = art.description || "";
+  $("#a-draft").checked = !!art.draft;
+  $("#md").value = markdown;
+  slugTouched = !!slug;
+  $("#a-title").addEventListener("input", () => { if (!slugTouched) $("#a-slug").value = slugify($("#a-title").value); markDirty(); });
+  $("#a-slug").addEventListener("input", () => { slugTouched = true; markDirty(); });
+  watch(["#a-desc", "#a-draft"]);
+  $("#a-sec").addEventListener("change", () => { $("#a-base").textContent = wikiBase() + $("#a-sec").value + "/"; markDirty(); });
+  $("#a-save").addEventListener("click", saveArticle);
+  $("#a-delete").addEventListener("click", deleteArticle);
+  $("#a-up").addEventListener("click", () => moveArticle(-1));
+  $("#a-down").addEventListener("click", () => moveArticle(1));
+  $("#a-import").addEventListener("click", () => importInto("#a-title", "#a-slug"));
+  syncArticle();
+  bindEditor();
+  renderSide();
+  renderPreview();
+  if (!slug) $("#a-title").focus();
+}
+
+function syncArticle() {
+  const saved = !!view.slug;
+  ["#a-delete", "#a-up", "#a-down"].forEach((id) => { $(id).hidden = !saved; });
+  if (!saved) return;
+  const s = section(view.sec);
+  const i = s ? s.articles.findIndex((a) => a.slug === view.slug) : -1;
+  $("#a-up").disabled = i <= 0;
+  $("#a-down").disabled = i < 0 || i >= s.articles.length - 1;
+}
+
+async function saveArticle() {
+  try {
+    const r = await api("POST", "articles", { section: $("#a-sec").value, orig_section: view.sec || "", orig_slug: view.slug || "",
+      new_slug: $("#a-slug").value, title: $("#a-title").value, description: $("#a-desc").value, draft: $("#a-draft").checked, markdown: $("#md").value });
+    view.sec = r.section; view.slug = r.slug;
+    $("#a-slug").value = r.slug;
+    slugTouched = true;
+    setDirty(false);
+    await refresh();
+    syncArticle();
+    toast(r.article.draft ? "Saved as draft" : "Saved");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+async function moveArticle(dir) {
+  const list = section(view.sec).articles.map((a) => a.slug);
+  const i = list.indexOf(view.slug);
+  if (i < 0 || i + dir < 0 || i + dir >= list.length) return;
+  await saveArtOrder(moved(list, i, i + dir), view.sec);
+}
+
+async function deleteArticle() {
+  if (!window.confirm("Delete this article? Its markdown is moved to the trash folder.")) return;
+  try { const s = view.sec; await api("DELETE", "articles/" + enc(s) + "/" + enc(view.slug)); setDirty(false); await refresh(); await openSection(s); toast("Article deleted"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+/* ---------- library ---------- */
+const STORY_TPL = `
+<div class="fill">
+  <div class="bar">
+    <input id="t-title" class="title-input" placeholder="Story title" aria-label="Story title">
+    <label title="Drafts are saved but left out of the built site"><input type="checkbox" id="t-draft"> Draft</label>
+    <button id="t-save" class="primary">Save</button>
+  </div>
+  <div class="bar sub">
+    <label>Address <span class="slug-wrap"><span id="t-base"></span><input id="t-slug" aria-label="Story address">/</span></label>
+    <label>Status <select id="t-status"></select></label>
+    <label>Form <select id="t-kind"><option value="chaptered">Chapters</option><option value="single">Single piece</option></select></label>
+    <span class="grow"></span>
+    <button id="t-up">Move up</button><button id="t-down">Move down</button>
+    <button id="t-delete" class="danger">Delete</button>
+  </div>
+  <details class="box" id="t-details">
+    <summary>Story details: blurb, cover, genres, author, series, dates</summary>
+    <div class="pad">
+      <div class="two"><label class="field">Subtitle <input id="t-subtitle"></label><label class="field">Author <input id="t-author" placeholder="Defaults to the name in Settings"></label></div>
+      <label class="field">Blurb <textarea id="t-blurb" rows="3" maxlength="600" placeholder="The pitch, shown on the library page and the story page"></textarea></label>
+      <div class="two">
+        <label class="field">Cover image <span style="display:flex;gap:6px"><input id="t-cover" placeholder="assets/cover.jpg"><button id="t-cover-pick" type="button">Upload</button></span></label>
+        <label class="field">Genres <input id="t-genres" placeholder="Horror, Novelette (separate with commas)"></label>
+      </div>
+      <label class="field">Content notes <input id="t-warnings" maxlength="400"></label>
+      <div class="two"><label class="field">Series <input id="t-series"></label><label class="field">Number in series <input id="t-series_no"></label></div>
+      <div class="two"><label class="field">Started <input type="date" id="t-started"></label><label class="field">Completed <input type="date" id="t-completed"></label></div>
+      <label class="field">Meta description <input id="t-description" maxlength="320" placeholder="Defaults to the blurb"></label>
+    </div>
+  </details>
+  <details class="box" open id="t-chapbox"><summary>Chapters, in reading order</summary><div id="t-chapters"></div>
+    <div class="bar"><button id="t-new">New chapter</button><span class="hint" id="t-total"></span></div>
+  </details>
+  <div class="bar sub"><span class="hint" id="t-md-hint"></span></div>
+  MDTOOLS
+  <textarea id="md" class="code" spellcheck="true"></textarea>
+</div>`;
+
+const CHAP_TPL = `
+<div class="fill">
+  <div class="bar">
+    <input id="c-title" class="title-input" placeholder="Chapter title" aria-label="Chapter title">
+    <label title="Drafts are saved but left out of the built site"><input type="checkbox" id="c-draft"> Draft</label>
+    <button id="c-save" class="primary">Save</button>
+  </div>
+  <div class="bar sub">
+    <label>Story <select id="c-story"></select></label>
+    <label>Date <input type="date" id="c-date"></label>
+    <label>Address <span class="slug-wrap"><span id="c-base"></span><input id="c-slug" aria-label="Chapter address">.html</span></label>
+    <span class="grow"></span>
+    <button id="c-import">Import file</button><button id="c-up">Move up</button><button id="c-down">Move down</button>
+    <button id="c-delete" class="danger">Delete</button>
+  </div>
+  <details class="box" id="c-notebox"><summary>Author's note, shown after the chapter</summary>
+    <div class="pad"><textarea id="c-note" class="small" rows="3" placeholder="Optional. Markdown works here too."></textarea></div>
+  </details>
+  MDTOOLS
+  <textarea id="md" class="code" spellcheck="true" placeholder="Write the chapter here. A blank line starts a new paragraph, and * * * makes a scene break."></textarea>
+</div>`;
+
+const STORY_FIELDS = ["subtitle", "author", "blurb", "cover", "genres", "warnings", "series", "series_no", "description"];
+function libBase() { return S.modules.library.mount ? S.modules.library.mount + "/" : ""; }
+
+async function newStory() {
+  const title = window.prompt("Story title");
+  if (!title || !title.trim()) return;
+  const kind = window.confirm("Is this a single piece, with no chapters?\n\nOK for a single short story, Cancel for something with chapters.") ? "single" : "chaptered";
+  const r = await api("POST", "stories", { title: title.trim(), kind });
+  await refresh();
+  await openStory(r.slug);
+}
+
+function storyPayload() {
+  const o = { view: "story", slug: view.slug, title: $("#t-title").value, status: $("#t-status").value, kind: $("#t-kind").value, markdown: $("#md").value };
+  STORY_FIELDS.forEach((k) => { o[k] = $("#t-" + k).value; });
+  return o;
+}
+
+async function openStory(slug) {
+  const d = await api("GET", "stories/" + enc(slug));
+  const s = d.story;
+  view = { type: "story", slug };
+  show(STORY_TPL);
+  opts($("#t-status"), S.statuses.map((x) => [x.id, x.label]), s.status);
+  $("#t-kind").value = s.kind;
+  $("#t-title").value = s.title;
+  $("#t-slug").value = s.slug;
+  $("#t-base").textContent = libBase();
+  $("#t-draft").checked = !!s.draft;
+  STORY_FIELDS.forEach((k) => { $("#t-" + k).value = k === "genres" ? (s.genres || []).join(", ") : (s[k] || ""); });
+  $("#t-started").value = s.started || "";
+  $("#t-completed").value = s.completed || "";
+  $("#md").value = d.markdown;
+  $$("#left input, #left textarea, #left select").forEach((i) => {
+    if (i.id !== "md" && i.type !== "file") i.addEventListener(i.type === "checkbox" || i.tagName === "SELECT" ? "change" : "input", markDirty);
+  });
+  $("#t-kind").addEventListener("change", syncStory);
+  $("#t-save").addEventListener("click", saveStory);
+  $("#t-delete").addEventListener("click", deleteStory);
+  $("#t-up").addEventListener("click", () => moveStory(-1));
+  $("#t-down").addEventListener("click", () => moveStory(1));
+  $("#t-new").addEventListener("click", () => go(() => openChapter(null, null, view.slug)));
+  $("#t-cover-pick").addEventListener("click", () => {
+    const inp = el("input", { type: "file", accept: "image/*", hidden: "" });
+    document.body.appendChild(inp);
+    inp.addEventListener("change", async () => {
+      const f = inp.files[0]; inp.remove();
+      if (f) { try { $("#t-cover").value = await uploadImage(f); markDirty(); toast("Cover uploaded"); } catch (e) { toast(e.message, "bad"); } }
+    });
+    inp.click();
+  });
+  if (!s.blurb && !s.cover) $("#t-details").open = true;
+  syncStory();
+  bindEditor();
+  renderSide();
+  renderPreview();
+}
+
+function syncStory() {
+  const single = $("#t-kind").value === "single";
+  $("#t-chapbox").hidden = single;
+  $("#t-md-hint").textContent = single ? "The story itself, shown on the story page under the blurb." : "Optional foreword, shown on the story page above the chapter list.";
+  $("#md").placeholder = single ? "Write the story here" : "Optional foreword";
+  const i = S.library.stories.findIndex((x) => x.slug === view.slug);
+  $("#t-up").disabled = i <= 0;
+  $("#t-down").disabled = i < 0 || i >= S.library.stories.length - 1;
+  const s = story(view.slug);
+  if (!s) return;
+  orderRows($("#t-chapters"), s.chapters, (ch) => ch.title + (ch.draft ? " (draft)" : ""),
+    (a, b) => saveChOrder(moved(s.chapters.map((ch) => ch.slug), a, b)), (ch) => go(() => openChapter(s.slug, ch.slug)),
+    (ch) => ch.words ? fmt(ch.words) : "");
+  const total = s.chapters.reduce((n, ch) => n + (ch.words || 0), 0);
+  $("#t-total").textContent = s.chapters.length ? fmt(total) + " words across " + s.chapters.length + " chapter(s)" : "";
+}
+
+async function saveChOrder(list, st) {
+  try {
+    await api("POST", "stories/" + enc(st || view.slug) + "/order", { chapters: list });
+    await refresh();
+    if (view.type === "story") syncStory();
+    if (view.type === "chapter") syncChapter();
+    schedulePreview();
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+async function saveStory() {
+  const body = storyPayload();
+  delete body.view;
+  Object.assign(body, { new_slug: $("#t-slug").value, draft: $("#t-draft").checked, started: $("#t-started").value, completed: $("#t-completed").value });
+  try {
+    const r = await api("PUT", "stories/" + enc(view.slug), body);
+    view.slug = r.slug;
+    $("#t-slug").value = r.slug;
+    setDirty(false);
+    await refresh();
+    syncStory();
+    toast("Saved");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+async function moveStory(dir) {
+  try { await api("POST", "stories/" + enc(view.slug) + "/move", { dir }); await refresh(); syncStory(); schedulePreview(); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+async function deleteStory() {
+  const s = story(view.slug);
+  if (!window.confirm("Delete \"" + s.title + "\"" + (s.chapters.length ? " and its " + s.chapters.length + " chapter(s)" : "") +
+    "?\n\nThe markdown files are moved to the trash folder, not destroyed.")) return;
+  try { await api("DELETE", "stories/" + enc(view.slug)); setDirty(false); await refresh(); await openHome(); toast("Story deleted"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+async function openChapter(storySlug, slug, forStory) {
+  const withCh = S.library.stories.filter((s) => s.kind !== "single");
+  if (!withCh.length) { toast("Create a story with chapters first.", "bad"); return; }
+  let ch = { title: "", slug: "", draft: false, note: "", date: "" }, markdown = "", where = forStory || storySlug;
+  if (slug) { const d = await api("GET", "chapters/" + enc(storySlug) + "/" + enc(slug)); ch = d.chapter; markdown = d.markdown; where = d.story; }
+  if (!where || !withCh.some((s) => s.slug === where)) {
+    where = (view.type === "story" && story(view.slug) && story(view.slug).kind !== "single" && view.slug) || (view.type === "chapter" && view.story) || withCh[0].slug;
+  }
+  view = { type: "chapter", story: slug ? where : "", slug: slug || "" };
+  show(CHAP_TPL);
+  opts($("#c-story"), withCh.map((s) => [s.slug, s.title]), where);
+  $("#c-base").textContent = libBase() + where + "/";
+  $("#c-title").value = ch.title;
+  $("#c-slug").value = ch.slug;
+  $("#c-date").value = ch.date || new Date().toLocaleDateString("en-CA");
+  $("#c-draft").checked = !!ch.draft;
+  $("#c-note").value = ch.note || "";
+  $("#md").value = markdown;
+  if (ch.note) $("#c-notebox").open = true;
+  slugTouched = !!slug;
+  $("#c-title").addEventListener("input", () => { if (!slugTouched) $("#c-slug").value = slugify($("#c-title").value); markDirty(); });
+  $("#c-slug").addEventListener("input", () => { slugTouched = true; markDirty(); });
+  watch(["#c-date", "#c-note", "#c-draft"]);
+  $("#c-story").addEventListener("change", () => { $("#c-base").textContent = libBase() + $("#c-story").value + "/"; markDirty(); });
+  $("#c-save").addEventListener("click", saveChapter);
+  $("#c-delete").addEventListener("click", deleteChapter);
+  $("#c-up").addEventListener("click", () => moveChapter(-1));
+  $("#c-down").addEventListener("click", () => moveChapter(1));
+  $("#c-import").addEventListener("click", () => importInto("#c-title", "#c-slug"));
+  syncChapter();
+  bindEditor();
+  renderSide();
+  renderPreview();
+  if (!slug) $("#c-title").focus();
+}
+
+function syncChapter() {
+  const saved = !!view.slug;
+  ["#c-delete", "#c-up", "#c-down"].forEach((id) => { $(id).hidden = !saved; });
+  if (!saved) return;
+  const s = story(view.story);
+  const i = s ? s.chapters.findIndex((c) => c.slug === view.slug) : -1;
+  $("#c-up").disabled = i <= 0;
+  $("#c-down").disabled = i < 0 || i >= s.chapters.length - 1;
+}
+
+async function saveChapter() {
+  try {
+    const r = await api("POST", "chapters", { story: $("#c-story").value, orig_story: view.story || "", orig_slug: view.slug || "",
+      new_slug: $("#c-slug").value, title: $("#c-title").value, date: $("#c-date").value, note: $("#c-note").value,
+      draft: $("#c-draft").checked, markdown: $("#md").value });
+    view.story = r.story; view.slug = r.slug;
+    $("#c-slug").value = r.slug;
+    slugTouched = true;
+    setDirty(false);
+    await refresh();
+    syncChapter();
+    toast(r.chapter.draft ? "Saved as draft" : "Saved, " + fmt(r.chapter.words) + " words");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+async function moveChapter(dir) {
+  const list = story(view.story).chapters.map((c) => c.slug);
+  const i = list.indexOf(view.slug);
+  if (i < 0 || i + dir < 0 || i + dir >= list.length) return;
+  await saveChOrder(moved(list, i, i + dir), view.story);
+}
+
+async function deleteChapter() {
+  if (!window.confirm("Delete this chapter? Its markdown is moved to the trash folder.")) return;
+  try { const s = view.story; await api("DELETE", "chapters/" + enc(s) + "/" + enc(view.slug)); setDirty(false); await refresh(); await openStory(s); toast("Chapter deleted"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+/* ---------- menu ---------- */
+const MENU_TPL = `
+<div class="fill">
+  <div class="bar"><strong>Menu</strong><span class="hint">Pages and modules appear here on their own. Untick one to hide it without deleting it.</span><span class="grow"></span><button id="m-save" class="primary">Save menu</button></div>
+  <div id="m-list"></div>
+  <div class="bar"><input id="m-label" placeholder="Link text"><input id="m-url" placeholder="https://example.com or about.html" style="flex:1"><button id="m-add">Add link</button></div>
+</div>`;
+let menuItems = [];
+
+function openMenu() {
+  view = { type: "menu" };
+  menuItems = JSON.parse(JSON.stringify(S.nav));
+  show(MENU_TPL);
+  $("#m-save").addEventListener("click", saveMenu);
+  $("#m-add").addEventListener("click", () => {
+    const url = $("#m-url").value.trim();
+    if (!url) { toast("Enter a link address.", "bad"); return; }
+    menuItems.push({ type: "link", label: $("#m-label").value.trim() || url, url, visible: true });
+    $("#m-label").value = ""; $("#m-url").value = "";
+    renderMenu(); markDirty();
+  });
+  renderMenu();
+  renderSide();
+  renderPreview();
+}
+
+function menuName(n) {
+  if (n.type === "page") { const p = page(n.slug); return p ? (p.slug === "index" ? "Home" : "Page: " + p.title) : n.slug; }
+  if (n.type === "module") return label(n.id) + (on(n.id) ? "" : " (switched off)");
+  return "Link: " + n.url;
+}
+
+function renderMenu() {
+  const box = $("#m-list");
+  box.innerHTML = "";
+  menuItems.forEach((n, i) => {
+    const vis = el("input", { type: "checkbox", title: "Show in the menu" });
+    vis.checked = n.visible !== false;
+    vis.addEventListener("change", () => { n.visible = vis.checked; markDirty(); });
+    const lbl = el("input", { placeholder: n.type === "link" ? "Link text" : "Label (optional)" });
+    lbl.value = n.label || "";
+    lbl.addEventListener("input", () => { n.label = lbl.value; markDirty(); });
+    const row = el("div", { class: "row" }, [vis, el("span", { class: "t", text: menuName(n) }), lbl]);
+    const mk = (t, dis, fn) => { const b = el("button", { text: t }); b.disabled = dis; b.addEventListener("click", fn); row.appendChild(b); };
+    mk("Up", i === 0, () => { menuItems = moved(menuItems, i, i - 1); renderMenu(); markDirty(); });
+    mk("Down", i === menuItems.length - 1, () => { menuItems = moved(menuItems, i, i + 1); renderMenu(); markDirty(); });
+    if (n.type === "link") mk("Remove", false, () => { menuItems.splice(i, 1); renderMenu(); markDirty(); });
+    box.appendChild(row);
+  });
+  S.nav = menuItems;
+}
+
+async function saveMenu() {
+  try { const r = await api("PUT", "nav", { nav: menuItems }); menuItems = r.nav; setDirty(false); await refresh(); renderMenu(); toast("Menu saved"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+/* ---------- text size settings ---------- */
+const TEXT_TPL = `
+<style>#tx-box{margin:18px 0 0;padding:10px 14px 14px;border:1px solid rgba(127,127,127,.4);border-radius:8px}#tx-box legend{font-weight:600;padding:0 4px}#tx-box .field{display:block;margin:10px 0}</style>
+<fieldset id="tx-box"><legend>Text size</legend>
+  <p class="hint">These work with every theme and layout. Use them when a theme's font reads small, or to make the whole site easier to read.</p>
+  <label class="field">Text size <span style="display:flex;align-items:center;gap:10px;margin-top:4px"><input type="range" id="tx-scale-r" min="70" max="200" step="5" style="flex:1"><input type="number" id="tx-scale" min="70" max="200" step="5" style="max-width:90px"> %</span><span class="hint">Grows or shrinks every piece of text by the same amount. 100% is the theme's own size.</span></label>
+  <label class="field">Smallest text <select id="tx-min">MINOPTS</select><span class="hint">Nothing on the site is drawn smaller than this, including small print like dates, captions, menu notes and badges. Bigger text is left alone.</span></label>
+  <p><button type="button" id="tx-reset">Back to 100% with no minimum</button></p>
+</fieldset>`;
+
+function textFieldset() {
+  const sizes = [0, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 22, 24];
+  return TEXT_TPL.replace("MINOPTS", sizes.map((n) => '<option value="' + n + '">' + (n ? n + " px" : "No minimum") + "</option>").join(""));
+}
+
+function textFill(t) {
+  t = t || {};
+  const sc = parseInt(t.scale, 10) || 100;
+  document.getElementById("tx-scale").value = sc;
+  document.getElementById("tx-scale-r").value = sc;
+  const sel = document.getElementById("tx-min");
+  const want = String(parseInt(t.min, 10) || 0);
+  if (![...sel.options].some((o) => o.value === want)) sel.appendChild(new Option(want + " px", want));
+  sel.value = want;
+}
+
+function textRead() {
+  const n = document.getElementById("tx-scale");
+  if (!n) return undefined;
+  return { scale: Math.max(70, Math.min(200, parseInt(n.value, 10) || 100)), min: parseInt(document.getElementById("tx-min").value, 10) || 0 };
+}
+
+function textWire(onChange) {
+  if (!document.getElementById("tx-box")) return;
+  textFill(S.site.text);
+  const n = document.getElementById("tx-scale"), r = document.getElementById("tx-scale-r");
+  r.addEventListener("input", () => { n.value = r.value; onChange(); });
+  n.addEventListener("input", () => { r.value = n.value; onChange(); });
+  document.getElementById("tx-min").addEventListener("change", onChange);
+  document.getElementById("tx-reset").addEventListener("click", () => { textFill({ scale: 100, min: 0 }); onChange(); });
+}
+
+/* ---------- framed layout settings ---------- */
+const FR_TEXT = ["top_bar", "notice", "left_image", "right_image", "nav_title", "nav_note"];
+const FRAME_TPL = `
+<fieldset id="fr-box"><legend>Framed layout</legend>
+  <details id="fr-more"><summary>Settings for the Framed layout</summary>
+  <p class="hint">These apply when the layout is Framed, which you pick under Layout and CSS. It has the same page structure as Secure portal, with the colors and fonts from your theme. Leave a box empty to hide that part of the page.</p>
+  <label class="field">Bar across the top <input id="fr-top_bar" maxlength="200" placeholder="An announcement, a motto, or leave empty"></label>
+  <label><input type="checkbox" id="fr-bottom_bar"> Repeat the bar at the bottom of the page</label>
+  <label class="field">Notice box <textarea id="fr-notice" rows="4"></textarea><span class="hint">Shown above the page. Each line here is its own line, and the first one is bold. Blank lines are skipped.</span></label>
+  <label class="field">Image left of the title <input id="fr-left_image" maxlength="400" placeholder="assets/logo.png or a full URL"></label>
+  <label class="field">Image right of the title <input id="fr-right_image" maxlength="400" placeholder="assets/badge.png or a full URL"><span class="hint">Shown up to 160 by 96 pixels. Hidden on phones.</span></label>
+  <label class="field">Menu heading <input id="fr-nav_title" maxlength="60"></label>
+  <label class="field">Note under the menu <textarea id="fr-nav_note" rows="2"></textarea></label>
+  <label class="field">Frame width in pixels <input type="number" id="fr-width" min="640" max="1600" step="10" style="max-width:120px"></label>
+  <p><button type="button" id="fr-reset">Reset these settings</button></p>
+  </details>
+</fieldset>`;
+
+function frameFieldset() { return FRAME_TPL; }
+
+function frameFill(f) {
+  f = f || {};
+  const g = (k) => document.getElementById("fr-" + k);
+  FR_TEXT.forEach((k) => { if (g(k)) g(k).value = f[k] == null ? "" : f[k]; });
+  if (g("bottom_bar")) g("bottom_bar").checked = !!f.bottom_bar;
+  if (g("width")) g("width").value = f.width || 960;
+}
+
+function frameRead() {
+  const g = (k) => document.getElementById("fr-" + k);
+  if (!g("top_bar")) return undefined;
+  const o = {};
+  FR_TEXT.forEach((k) => { o[k] = g(k).value; });
+  o.bottom_bar = g("bottom_bar").checked;
+  o.width = parseInt(g("width").value, 10) || 960;
+  return o;
+}
+
+function frameWire(onChange) {
+  const box = document.getElementById("fr-box");
+  if (!box) return;
+  frameFill(S.site.frame || S.frame_defaults);
+  document.getElementById("fr-more").open = S.site.layout === "frame";
+  box.querySelectorAll("input, textarea").forEach((i) => i.addEventListener(i.type === "checkbox" ? "change" : "input", onChange));
+  document.getElementById("fr-reset").addEventListener("click", () => {
+    if (!window.confirm("Put every Framed setting back to its default? Save settings afterwards to keep it.")) return;
+    frameFill(S.frame_defaults);
+    onChange();
+  });
+}
+
+/* ---------- portal layout settings ---------- */
+const PT_COLORS = [["banner_bg", "Banner background"], ["banner_line", "Banner edges"], ["banner_text", "Banner text"],
+  ["warn_text", "Warning text"], ["heading", "Headings and bullets"], ["highlight", "Highlights"],
+  ["visited", "Visited links"], ["term", "Code text"], ["frame", "Frame lines"]];
+const PT_TEXT = ["banner", "warning", "seal_text", "seal_caption", "nav_title", "nav_note", "construction", "webring",
+  "counter_label", "counter", "counter_note", "badges"];
+const PT_BOOL = ["banner_bottom", "warning_big", "blink", "chrome", "flag", "seal"];
+const PORTAL_TPL = `
+<style>#pt-box,#fr-box{margin:18px 0 0;padding:10px 14px 14px;border:1px solid rgba(127,127,127,.4);border-radius:8px}#pt-box legend,#fr-box legend{font-weight:600;padding:0 4px}#pt-box summary,#fr-box summary{cursor:pointer;margin:2px 0 4px}#pt-box details>label:not(.field),#fr-box details>label:not(.field){display:block;margin:6px 0}#pt-box textarea,#fr-box textarea{display:block;width:100%;box-sizing:border-box;padding:6px 8px;border-radius:6px;font:inherit}#pt-box .field,#fr-box .field{display:block;margin:10px 0}</style>
+<fieldset id="pt-box"><legend>Secure portal layout</legend>
+  <details id="pt-more"><summary>Settings for the Secure portal layout</summary>
+  <p class="hint">These apply when the layout is Secure portal, which you pick under Layout and CSS. Leave a box empty to hide that part of the page.</p>
+  <label class="field">Classification banner <input id="pt-banner" maxlength="200"></label>
+  <label><input type="checkbox" id="pt-banner_bottom"> Repeat the banner at the bottom of the page</label>
+  <label class="field">Warning box <textarea id="pt-warning" rows="6" wrap="off" spellcheck="false" style="font-family:ui-monospace,monospace"></textarea><span class="hint">Each line here is its own line on the page. Blank lines are skipped.</span></label>
+  <label><input type="checkbox" id="pt-warning_big"> Make the first warning line larger</label>
+  <label><input type="checkbox" id="pt-blink"> Blink the first warning line</label>
+  <label><input type="checkbox" id="pt-chrome"> Chrome gradient on the site title</label>
+  <label><input type="checkbox" id="pt-flag"> Waving flag left of the title</label>
+  <label><input type="checkbox" id="pt-seal"> Seal right of the title</label>
+  <label class="field">Seal text <textarea id="pt-seal_text" rows="3" placeholder="SEAL OF&#10;&#9733;&#10;O.S.M.O."></textarea><span class="hint">Up to three short lines. A line of one or two characters is drawn large. Empty uses SEAL OF, a star and the site's initials.</span></label>
+  <label class="field">Seal caption <input id="pt-seal_caption" maxlength="60"></label>
+  <label class="field">Menu heading <input id="pt-nav_title" maxlength="60"></label>
+  <label class="field">Note under the menu <textarea id="pt-nav_note" rows="2"></textarea></label>
+  <label class="field">Under construction strip <input id="pt-construction" maxlength="200"></label>
+  <label class="field">Webring name <input id="pt-webring" maxlength="120"><span class="hint">Its Prev, Random, List Sites and Next links all point to #.</span></label>
+  <label class="field">Hit counter label <input id="pt-counter_label" maxlength="80"></label>
+  <label class="field">Hit counter digits <input id="pt-counter" maxlength="12" style="max-width:160px"></label>
+  <label class="field">Text after the counter <input id="pt-counter_note" maxlength="120"></label>
+  <label class="field">Badges <textarea id="pt-badges" rows="4"></textarea><span class="hint">One 88x31 badge per line, up to 12.</span></label>
+  <label class="field">Frame width in pixels <input type="number" id="pt-width" min="640" max="1600" step="10" style="max-width:120px"></label>
+  <div class="field"><span>Colors</span><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:6px 14px;margin-top:4px">PTCOLORS</div>
+  <span class="hint">The page, panel, text, link and font colors come from the theme. The Secure portal theme is the one this layout was made with.</span></div>
+  <p><button type="button" id="pt-reset">Reset these settings</button></p>
+  </details>
+</fieldset>`;
+
+function portalFieldset() {
+  return PORTAL_TPL.replace("PTCOLORS", PT_COLORS.map(([k, l]) =>
+    '<label style="display:flex;align-items:center;gap:8px"><input type="color" id="pt-' + k + '" style="width:44px;height:28px;padding:0"> ' + l + "</label>").join(""));
+}
+
+function portalFill(p) {
+  p = p || {};
+  const g = (k) => document.getElementById("pt-" + k);
+  PT_TEXT.forEach((k) => { if (g(k)) g(k).value = p[k] == null ? "" : p[k]; });
+  PT_BOOL.forEach((k) => { if (g(k)) g(k).checked = !!p[k]; });
+  PT_COLORS.forEach(([k]) => { if (g(k)) g(k).value = /^#[0-9a-f]{6}$/i.test(p[k] || "") ? p[k] : "#000000"; });
+  if (g("width")) g("width").value = p.width || 860;
+}
+
+function portalRead() {
+  const g = (k) => document.getElementById("pt-" + k);
+  if (!g("banner")) return undefined;
+  const o = {};
+  PT_TEXT.forEach((k) => { o[k] = g(k).value; });
+  PT_BOOL.forEach((k) => { o[k] = g(k).checked; });
+  PT_COLORS.forEach(([k]) => { o[k] = g(k).value; });
+  o.width = parseInt(g("width").value, 10) || 860;
+  return o;
+}
+
+function portalWire(onChange) {
+  const box = document.getElementById("pt-box");
+  if (!box) return;
+  portalFill(S.site.secure || S.secure_defaults);
+  document.getElementById("pt-more").open = S.site.layout === "secure";
+  box.querySelectorAll("input, textarea").forEach((i) => i.addEventListener(i.type === "checkbox" ? "change" : "input", onChange));
+  document.getElementById("pt-reset").addEventListener("click", () => {
+    if (!window.confirm("Put every Secure portal setting back to its default? Save settings afterwards to keep it.")) return;
+    portalFill(S.secure_defaults);
+    onChange();
+  });
+}
+
+/* ---------- theme preview: show the picked theme before it is applied ---------- */
+let themePick = false;
+
+function themeCss(css) {
+  const sel = document.getElementById("theme");
+  if (!themePick || !sel) return css;
+  const t = S.themes.find((x) => x.id === sel.value);
+  if (!t) return css;
+  const re = /:root\s*\{[^}]*\}/;
+  return re.test(css) ? css.replace(re, () => t.block) : t.block + "\n\n" + css;
+}
+
+function themeCurrent(css) {
+  const m = /:root\s*\{\s*\/\*\s*Theme:\s*(.+?)\s*\(([^)]+)\)/.exec(css || "");
+  if (!m) return "";
+  const t = S.themes.find((x) => x.label === m[1] && x.group === m[2]);
+  return t ? t.id : "";
+}
+
+function themeWire() {
+  const sel = document.getElementById("theme");
+  themePick = false;
+  const cur = themeCurrent(document.getElementById("css").value);
+  if (cur) sel.value = cur;
+  const note = document.createElement("span");
+  note.className = "hint";
+  note.id = "theme-note";
+  document.getElementById("apply-theme").after(note);
+  sel.addEventListener("change", () => {
+    themePick = sel.value !== themeCurrent(document.getElementById("css").value);
+    const t = S.themes.find((x) => x.id === sel.value);
+    note.textContent = themePick && t ? "Previewing " + t.label + ". Apply theme to keep it." : "";
+    renderPreview();
+  });
+}
+
+function themeApplied() {
+  themePick = false;
+  const note = document.getElementById("theme-note");
+  if (note) note.textContent = "";
+}
+
+/* ---------- css ---------- */
+const CSS_TPL = `
+<div class="fill">
+  <div class="bar" id="layout-bar"><strong>Layout</strong><span id="layout-picks" style="display:inline-flex;flex-wrap:wrap;gap:8px 14px"></span><button id="apply-layout">Use these layouts</button></div>
+  <div class="bar sub"><span class="hint" id="layout-desc"></span></div>
+  <div class="bar"><label>Theme <select id="theme"></select></label><button id="apply-theme">Apply theme</button><span class="grow"></span><button id="css-save" class="primary">Save CSS</button></div>
+  <div class="bar sub"><label>Preview <select id="css-target"></select></label><span class="grow"></span><button id="jump-global">Go to theme</button><button id="jump-pages">Go to your rules</button></div>
+  <textarea id="css" class="code" spellcheck="false" wrap="off"></textarea>
+</div>`;
+
+function themeSelect(select, value) {
+  select.innerHTML = "";
+  const groups = {};
+  S.themes.forEach((t) => {
+    if (!groups[t.group]) { groups[t.group] = el("optgroup", { label: t.group + " themes" }); select.appendChild(groups[t.group]); }
+    groups[t.group].appendChild(el("option", { value: t.id, text: t.label }));
+  });
+  if (value) select.value = value;
+}
+
+async function openCss() {
+  const d = await api("GET", "css");
+  const t = await api("GET", "preview-targets");
+  view = { type: "css" };
+  show(CSS_TPL);
+  themeSelect($("#theme"));
+  opts($("#css-target"), t.targets.map((x) => [x.id, x.label]));
+  $("#css").value = d.css;
+  $("#css").addEventListener("input", markDirty);
+  themeWire();
+  $("#css-target").addEventListener("change", renderPreview);
+  $("#css-save").addEventListener("click", async () => {
+    try { await api("PUT", "css", { css: $("#css").value }); setDirty(false); toast("Saved"); } catch (e) { toast(e.message, "bad"); }
+  });
+  $("#apply-theme").addEventListener("click", () => {
+    const th = S.themes.find((x) => x.id === $("#theme").value);
+    if (!window.confirm("Replace the theme variables at the top of your CSS with \"" + th.label + "\"?\n\nEdits inside that top :root block are overwritten. Everything else stays.")) return;
+    const ta = $("#css"), re = /:root\s*\{[^}]*\}/;
+    ta.value = re.test(ta.value) ? ta.value.replace(re, () => th.block) : th.block + "\n\n" + ta.value;
+    themeApplied();
+    markDirty();
+  });
+  const jump = (marker) => {
+    const ta = $("#css"), i = ta.value.indexOf(marker);
+    if (i < 0) { toast("That marker is not in your CSS any more.", "bad"); return; }
+    ta.focus(); ta.setSelectionRange(i, i);
+    ta.scrollTop = Math.max(0, (ta.value.slice(0, i).split("\n").length - 2) * (parseFloat(getComputedStyle(ta).lineHeight) || 20));
+  };
+  $("#jump-global").addEventListener("click", () => jump("GLOBAL THEME"));
+  $("#jump-pages").addEventListener("click", () => jump("PAGE SPECIFIC RULES"));
+  layoutPicker();
+  renderSide();
+  renderPreview();
+}
+
+const LAYOUT_AXES = [["site", "layout", "Site", null], ["blog", "blog_layout", "Blog", "blog"],
+  ["wiki", "wiki_layout", "Wiki", "wiki"], ["library", "lib_layout", "Stories", "library"], ["podcast", "podcast_layout", "Podcast", "podcast"]];
+
+function layoutVals() {
+  const out = {};
+  LAYOUT_AXES.forEach(([axis, key]) => { const sel = $("#lay-" + axis); if (sel) out[key] = sel.value; });
+  return out;
+}
+
+function layoutPicker() {
+  const box = $("#layout-picks");
+  const describe = (axis) => {
+    const sel = $("#lay-" + axis);
+    const l = S.layouts[axis].find((x) => x.id === sel.value);
+    const pending = LAYOUT_AXES.some(([a, key]) => $("#lay-" + a) && $("#lay-" + a).value !== S.site[key]);
+    $("#layout-desc").textContent = (l ? l.label + ": " + l.desc : "") + (pending ? " (Previewing, not saved yet.)" : "");
+  };
+  LAYOUT_AXES.forEach(([axis, key, label, mod]) => {
+    if (mod && !(S.modules[mod] && S.modules[mod].enabled)) return;
+    const name = mod ? (S.modules[mod].label || label) : label;
+    const sel = el("select", { id: "lay-" + axis });
+    S.layouts[axis].forEach((l) => sel.appendChild(el("option", { value: l.id, text: l.label })));
+    sel.value = S.site[key];
+    sel.addEventListener("change", () => {
+      describe(axis);
+      const tg = $("#css-target");
+      if (mod && !tg.value.startsWith(mod + ":")) {
+        const all = [...tg.options].map((o) => o.value).filter((v) => v.startsWith(mod + ":"));
+        const pick = (mod === "wiki" && all.find((v) => v.includes("/"))) || all[0];
+        if (pick) tg.value = pick;
+      }
+      renderPreview();
+    });
+    sel.addEventListener("focus", () => describe(axis));
+    const lab = el("label", {});
+    lab.append(name + " ", sel);
+    box.appendChild(lab);
+  });
+  describe("site");
+  $("#apply-layout").addEventListener("click", async () => {
+    try {
+      await api("PUT", "settings", layoutVals());
+      await refresh();
+      describe("site");
+      toast("Layouts saved");
+    } catch (e) { toast(e.message, "bad"); }
+  });
+}
+
+/* ---------- images in the editor: upload and insert at the cursor ---------- */
+let imgAt = null;
+
+function isImageFile(f) { return /^image\//.test(f.type || "") || /\.(png|jpe?g|gif|webp|svg|avif)$/i.test(f.name || ""); }
+
+function imageAlt(name) {
+  const t = String(name || "").replace(/\.[^.]+$/, "").replace(/[-_]+/g, " ").replace(/[\[\]\\\r\n]/g, "").trim();
+  return t || "image";
+}
+
+async function postFile(route, file) {
+  const r = await fetch("/api/" + route + "?name=" + encodeURIComponent(file.name || "file"), { method: "POST", headers: { "X-Token": TOKEN }, body: file });
+  let d = {};
+  try { d = await r.json(); } catch (e) { /* not json */ }
+  if (!r.ok) throw new Error(d.error || "Upload failed");
+  return d;
+}
+
+// Inside a line of text the image goes inline, right at the cursor. On an empty line, or at the
+// start or end of a line, it becomes its own paragraph so it is not glued to the text around it.
+function imageSnippet(v, s, e, imgs) {
+  const before = v.slice(0, s), after = v.slice(e);
+  const lb = before.slice(before.lastIndexOf("\n") + 1), la = after.split("\n")[0];
+  if (lb.trim() && la.trim()) return imgs.join(" ");
+  let pre = "", post = "";
+  if (lb.trim()) pre = "\n\n";
+  else if (before.trim() && !/\n[ \t]*\n[ \t]*$/.test(before)) pre = "\n";
+  if (la.trim()) post = "\n\n";
+  else if (after.trim() && !/^[ \t]*\n[ \t]*\n/.test(after)) post = "\n";
+  return pre + imgs.join("\n\n") + post;
+}
+
+function pickImages(ta) {
+  imgAt = [ta.selectionStart, ta.selectionEnd];
+  $("#img-file").click();
+}
+
+async function insertImages(ta, files) {
+  const at = imgAt || [ta.selectionStart, ta.selectionEnd];
+  imgAt = null;
+  const list = [...files].filter(isImageFile);
+  if (!list.length) { toast("Only image files can be inserted (png, jpg, gif, webp, svg, avif).", "bad"); return; }
+  const out = [];
+  for (const f of list) {
+    try { const d = await postFile("upload", f); out.push("![" + imageAlt(f.name) + "](" + d.path + ")"); }
+    catch (e) { toast(f.name + ": " + e.message, "bad"); }
+  }
+  if (!out.length) return;
+  const len = ta.value.length, s = Math.min(at[0], len), e = Math.min(at[1], len);
+  ta.focus();
+  ta.setRangeText(imageSnippet(ta.value, s, e, out), s, e, "end");
+  ta.dispatchEvent(new Event("input"));
+  toast(out.length === 1 ? "Image uploaded and inserted at the cursor" : out.length + " images uploaded and inserted at the cursor");
+}
+
+function wireImages(ta) {
+  const pick = $("#img-file");
+  if (!pick) return;
+  pick.multiple = true;
+  pick.addEventListener("change", () => {
+    const fs = [...pick.files];
+    pick.value = "";
+    if (fs.length) insertImages(ta, fs); else imgAt = null;
+  });
+  ta.addEventListener("paste", (ev) => {
+    const cd = ev.clipboardData;
+    if (!cd || [...cd.types].includes("text/plain")) return;
+    const fs = [...cd.files].filter(isImageFile);
+    if (!fs.length) return;
+    ev.preventDefault();
+    imgAt = null;
+    insertImages(ta, fs);
+  });
+  ta.addEventListener("dragover", (ev) => {
+    if (ev.dataTransfer && [...ev.dataTransfer.types].includes("Files")) { ev.preventDefault(); ev.dataTransfer.dropEffect = "copy"; }
+  });
+  ta.addEventListener("drop", (ev) => {
+    const fs = [...((ev.dataTransfer && ev.dataTransfer.files) || [])];
+    if (!fs.length) return;
+    ev.preventDefault();
+    imgAt = null;
+    insertImages(ta, fs);
+  });
+}
+
+/* ---------- logo and fonts settings ---------- */
+const BR_PLACES = [["left", "Left of the site title"], ["right", "Right of the site title"], ["above", "Above the site title"],
+  ["replace", "In place of the site title"], ["banner", "Banner across the top of the header"], ["none", "Not in the header"]];
+const BR_ROLES = [["font_body", "Body text"], ["font_heading", "Headings and site title"], ["font_ui", "Menus, dates and small text"], ["font_mono", "Code"]];
+const BR_WEIGHTS = [["100", "100 Thin"], ["200", "200 Extra light"], ["300", "300 Light"], ["400", "400 Regular"], ["500", "500 Medium"],
+  ["600", "600 Semibold"], ["700", "700 Bold"], ["800", "800 Extra bold"], ["900", "900 Black"], ["100 900", "Variable, 100 to 900"]];
+const BR_DEFAULTS = { logo: "", logo_alt: "", logo_place: "left", logo_height: 48, logo_footer: false, footer_height: 32, favicon: false,
+  fonts: [], font_body: "", font_heading: "", font_ui: "", font_mono: "" };
+let brFonts = [];
+const BRAND_TPL = `
+<style>#br-box{margin:18px 0 0;padding:10px 14px 14px;border:1px solid rgba(127,127,127,.4);border-radius:8px}#br-box legend{font-weight:600;padding:0 4px}#br-box>label:not(.field){display:block;margin:6px 0}#br-box .field{display:block;margin:10px 0}#br-box .br-row{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0;padding:6px 0;border-bottom:1px solid rgba(127,127,127,.25)}#br-box .br-row>*{width:auto;flex:0 0 auto;margin:0}#br-box .br-row input[type=text]{flex:1 1 180px;min-width:0}#br-box .field>.hint{display:block}#br-box .br-file{font-size:12px;opacity:.75;flex:1 1 100%;word-break:break-all}#br-thumb{margin-top:8px;padding:8px;display:inline-block;border:1px dashed rgba(127,127,127,.5);border-radius:6px;background:repeating-conic-gradient(rgba(127,127,127,.18) 0 25%,transparent 0 50%) 0 0/16px 16px}#br-thumb img{display:block;max-height:72px;max-width:260px}#br-roles{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:6px 14px}#br-roles .field{margin:4px 0}</style>
+<fieldset id="br-box"><legend>Logo and fonts</legend>
+  <div class="field"><span>Logo</span>
+    <div style="display:flex;gap:6px;align-items:center"><input id="br-logo" style="flex:1" maxlength="400" placeholder="assets/logo.png or a full URL"><button type="button" id="br-logo-up">Upload logo</button><button type="button" id="br-logo-clear">Remove</button></div>
+    <input type="file" id="br-logo-file" accept="image/*" hidden>
+    <div id="br-thumb" hidden><img alt="Logo preview"></div>
+  </div>
+  <label class="field">Where it goes in the header <select id="br-logo_place"></select></label>
+  <label class="field">Height in the header, in pixels <input type="number" id="br-logo_height" min="16" max="400" step="2" style="max-width:120px"><span class="hint">For the banner this is the tallest it gets; it shrinks to fit narrow screens.</span></label>
+  <label class="field">Alt text <input id="br-logo_alt" maxlength="120" placeholder="Empty uses the site title"><span class="hint">Read out by screen readers when the logo stands in for the title, is the banner, or sits in the footer. Next to the title it is decoration.</span></label>
+  <label><input type="checkbox" id="br-logo_footer"> Also show it in the footer</label>
+  <label class="field">Height in the footer, in pixels <input type="number" id="br-footer_height" min="12" max="200" step="2" style="max-width:120px"></label>
+  <label><input type="checkbox" id="br-favicon"> Use it as the browser tab icon (favicon)</label>
+  <div class="field"><span>Fonts</span>
+    <div id="br-fonts"></div>
+    <p style="margin:6px 0"><button type="button" id="br-font-up">Upload font</button></p>
+    <span class="hint">woff2, woff, ttf or otf, saved to assets/fonts. Upload one file per weight or style (Regular, Bold, Italic) and give them the same family name; the browser picks the right file. Removing a font from this list leaves its file in assets/fonts.</span>
+    <input type="file" id="br-font-file" accept=".woff2,.woff,.ttf,.otf" multiple hidden>
+  </div>
+  <div id="br-roles"></div>
+  <span class="hint">Theme font keeps what the theme sets. A pick here overrides the theme, so it stays when you change themes.</span>
+</fieldset>`;
+
+function brandFieldset() { return BRAND_TPL; }
+
+function brEl(tag, props, text) {
+  const e = document.createElement(tag);
+  Object.entries(props || {}).forEach(([k, v]) => e.setAttribute(k, v));
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+function brSrc(p) { return /^([a-z][a-z0-9+.-]*:|\/\/)/i.test(p) ? p : "/site/" + p.replace(/^\.?\//, ""); }
+
+function brThumb() {
+  const v = document.getElementById("br-logo").value.trim(), box = document.getElementById("br-thumb");
+  box.hidden = !v;
+  if (v) box.querySelector("img").src = brSrc(v);
+}
+
+function brFamilies() { return [...new Set(brFonts.map((f) => f.family).filter(Boolean))]; }
+
+function brRoles(keep) {
+  const box = document.getElementById("br-roles"), fams = brFamilies();
+  box.innerHTML = "";
+  BR_ROLES.forEach(([k, l]) => {
+    const sel = brEl("select", { id: "br-" + k });
+    sel.appendChild(new Option("Theme font", ""));
+    fams.forEach((f) => sel.appendChild(new Option(f, f)));
+    sel.value = fams.includes(keep[k]) ? keep[k] : "";
+    sel.addEventListener("change", brChanged);
+    const lab = brEl("label", { class: "field" });
+    lab.append(l + " ", sel);
+    box.appendChild(lab);
+  });
+}
+
+function brRoleVals() {
+  const o = {};
+  BR_ROLES.forEach(([k]) => { const s = document.getElementById("br-" + k); o[k] = s ? s.value : ""; });
+  return o;
+}
+
+let brOnChange = () => {};
+function brChanged() { brOnChange(); }
+
+function brFontRows() {
+  const box = document.getElementById("br-fonts");
+  box.innerHTML = "";
+  if (!brFonts.length) { box.appendChild(brEl("p", { class: "hint", style: "margin:4px 0" }, "No fonts uploaded.")); return; }
+  brFonts.forEach((f, i) => {
+    const fam = brEl("input", { type: "text", maxlength: "60", value: f.family, "aria-label": "Font family name" });
+    const wt = brEl("select", { "aria-label": "Weight" });
+    BR_WEIGHTS.forEach(([v, l]) => wt.appendChild(new Option(l, v)));
+    wt.value = f.weight;
+    const st = brEl("select", { "aria-label": "Style" });
+    st.appendChild(new Option("Normal", "normal"));
+    st.appendChild(new Option("Italic", "italic"));
+    st.value = f.style;
+    const rm = brEl("button", { type: "button" }, "Remove");
+    fam.addEventListener("change", () => {
+      const before = brRoleVals(), old = f.family;
+      f.family = fam.value.replace(/[^A-Za-z0-9 _.-]+/g, "").replace(/\s+/g, " ").trim().slice(0, 60) || old;
+      fam.value = f.family;
+      if (!brFonts.some((x) => x.family === old)) BR_ROLES.forEach(([k]) => { if (before[k] === old) before[k] = f.family; });
+      brRoles(before);
+      brChanged();
+    });
+    wt.addEventListener("change", () => { f.weight = wt.value; brChanged(); });
+    st.addEventListener("change", () => { f.style = st.value; brChanged(); });
+    rm.addEventListener("click", () => { const before = brRoleVals(); brFonts.splice(i, 1); brFontRows(); brRoles(before); brChanged(); });
+    const row = brEl("div", { class: "br-row" });
+    row.append(fam, wt, st, rm, brEl("span", { class: "br-file" }, f.file));
+    box.appendChild(row);
+  });
+}
+
+function brandFill(b) {
+  b = Object.assign({}, BR_DEFAULTS, b || {});
+  const g = (k) => document.getElementById("br-" + k);
+  ["logo", "logo_alt", "logo_height", "footer_height"].forEach((k) => { g(k).value = b[k] == null ? "" : b[k]; });
+  g("logo_place").value = b.logo_place;
+  g("logo_footer").checked = !!b.logo_footer;
+  g("favicon").checked = !!b.favicon;
+  brFonts = (b.fonts || []).map((f) => Object.assign({}, f));
+  brFontRows();
+  brRoles(b);
+  brThumb();
+}
+
+function brandRead() {
+  const g = (k) => document.getElementById("br-" + k);
+  if (!g("logo")) return undefined;
+  return Object.assign({
+    logo: g("logo").value.trim(), logo_alt: g("logo_alt").value, logo_place: g("logo_place").value,
+    logo_height: parseInt(g("logo_height").value, 10) || 48, logo_footer: g("logo_footer").checked,
+    footer_height: parseInt(g("footer_height").value, 10) || 32, favicon: g("favicon").checked,
+    fonts: brFonts.map((f) => ({ file: f.file, family: f.family, weight: f.weight, style: f.style })),
+  }, brRoleVals());
+}
+
+function brandWire(onChange) {
+  const box = document.getElementById("br-box");
+  if (!box) return;
+  // sit near the top, right after the title and footer fields
+  const foot = document.querySelector("#st-footer, #s-footer");
+  const host = foot && foot.closest("fieldset");
+  if (host && host !== box) host.after(box);
+  else {
+    const first = [...document.querySelectorAll("#left fieldset")].find((f) => !["br-box", "tx-box", "pt-box", "fr-box"].includes(f.id));
+    if (first) first.before(box);
+  }
+  brOnChange = onChange;
+  const g = (k) => document.getElementById("br-" + k);
+  BR_PLACES.forEach(([v, l]) => g("logo_place").appendChild(new Option(l, v)));
+  brandFill(S.site.brand);
+  ["logo", "logo_alt", "logo_height", "footer_height"].forEach((k) => g(k).addEventListener("input", () => { if (k === "logo") brThumb(); onChange(); }));
+  ["logo_place", "logo_footer", "favicon"].forEach((k) => g(k).addEventListener("change", onChange));
+  g("logo-up").addEventListener("click", () => g("logo-file").click());
+  g("logo-clear").addEventListener("click", () => { g("logo").value = ""; brThumb(); onChange(); });
+  g("logo-file").addEventListener("change", async () => {
+    const f = g("logo-file").files[0];
+    g("logo-file").value = "";
+    if (!f) return;
+    try {
+      const d = await postFile("upload", f);
+      g("logo").value = d.path;
+      brThumb();
+      onChange();
+      toast("Logo uploaded. Save settings to keep it.");
+    } catch (e) { toast(e.message, "bad"); }
+  });
+  g("font-up").addEventListener("click", () => g("font-file").click());
+  g("font-file").addEventListener("change", async () => {
+    const files = [...g("font-file").files];
+    g("font-file").value = "";
+    if (!files.length) return;
+    const before = brRoleVals();
+    let added = 0;
+    for (const f of files) {
+      try { brFonts.push(await postFile("upload-font", f)); added += 1; } catch (e) { toast(f.name + ": " + e.message, "bad"); }
+    }
+    if (!added) return;
+    const fams = brFamilies();
+    if (!BR_ROLES.some(([k]) => before[k]) && fams.length === 1) { before.font_body = fams[0]; before.font_heading = fams[0]; }
+    brFontRows();
+    brRoles(before);
+    onChange();
+    toast((added === 1 ? "Font uploaded" : added + " fonts uploaded") + ". Pick where to use it, then save settings.");
+  });
+}
+
+/* ---------- settings ---------- */
+const SET_TPL = `
+<div class="fill">
+  <div class="bar"><strong>Settings</strong><span class="grow"></span><button id="st-save" class="primary">Save settings</button></div>
+  <div class="pad">
+    <fieldset><legend>Site</legend>
+      <label class="field">Title <input id="st-title"></label>
+      <label class="field">Tagline <input id="st-tagline"></label>
+      <label class="field">Author <input id="st-author" placeholder="Used for bylines, meta tags and {author} in the footer"></label>
+      <label class="field">Footer text <input id="st-footer"><span class="hint">You can use {year}, {title} and {author}. Inline markdown works.</span></label>
+      <label class="field">Language code <input id="st-lang" style="max-width:100px"></label>
+      <label class="field">Site URL <input id="st-url" placeholder="https://example.com"><span class="hint">Needed for feeds, canonical links, the sitemap and social tags.</span></label>
+    </fieldset>
+    <fieldset><legend>Search engines and feeds</legend>
+      <label class="field">Meta description <textarea id="st-description" rows="2" maxlength="320" placeholder="Default description. Pages and posts can override it."></textarea></label>
+      <label class="field">Default social image <input id="st-image" placeholder="assets/cover.jpg or a full URL"></label>
+      <label class="field">Twitter / X handle <input id="st-twitter" style="max-width:220px"></label>
+      <label><input type="checkbox" id="st-feeds"> Publish RSS feeds of new posts and chapters</label>
+      <label><input type="checkbox" id="st-sitemap"> Generate sitemap.xml and robots.txt</label>
+      <label><input type="checkbox" id="st-noindex"> Ask search engines not to index this site (for staging)</label>
+    </fieldset>
+    <fieldset data-need="blog"><legend>Blog</legend>
+      <label><input type="checkbox" id="st-post_nav"> Older and newer links at the bottom of posts</label>
+    </fieldset>
+    <fieldset data-need="wiki"><legend>Wiki</legend>
+      <label><input type="radio" name="st-search" value="builtin"> Built-in search. Instant, works offline, adds one small script (search.js).</label>
+      <label><input type="radio" name="st-search" value="web"> Web search form. No JavaScript; searches your site with DuckDuckGo.</label>
+      <label><input type="radio" name="st-search" value="off"> No search box. No JavaScript anywhere in the site.</label>
+      <label><input type="checkbox" id="st-toc"> Table of contents on articles with three or more headings</label>
+      <label><input type="checkbox" id="st-updated"> Show the last updated date on articles</label>
+      <label><input type="checkbox" id="st-expand"> Keep every sidebar section open</label>
+      <label><input type="checkbox" id="st-wiki_cards"> Section cards on the wiki home</label>
+      <label><input type="checkbox" id="st-wiki_recent"> Recently updated articles on the wiki home</label>
+    </fieldset>
+    <fieldset data-need="library"><legend>Library</legend>
+      <label><input type="radio" name="st-prose" value="indented"> Indented paragraphs, like a printed book</label>
+      <label><input type="radio" name="st-prose" value="spaced"> Spaced paragraphs, like a web page</label>
+      <label><input type="checkbox" id="st-dropcap"> Drop capital on the first paragraph of each chapter</label>
+      <label><input type="checkbox" id="st-wordcount"> Show word counts</label>
+      <label><input type="checkbox" id="st-reading_time"> Show estimated reading time</label>
+      <label class="field">Reading speed (words per minute) <input type="number" id="st-wpm" min="60" max="1000" step="10" style="max-width:120px"></label>
+      <label><input type="checkbox" id="st-lib_updates"> Latest chapters on the library page</label>
+    </fieldset>
+    PORTALBOX
+  </div>
+</div>`;
+const SET_TEXT = ["title", "tagline", "author", "footer", "lang", "url", "description", "image", "twitter", "wpm"];
+const SET_BOOL = ["feeds", "sitemap", "noindex", "post_nav", "toc", "updated", "expand", "wiki_cards", "wiki_recent", "dropcap", "wordcount", "reading_time", "lib_updates"];
+
+function readSettings() {
+  const o = {};
+  SET_TEXT.forEach((k) => { o[k] = $("#st-" + k).value; });
+  SET_BOOL.forEach((k) => { o[k] = $("#st-" + k).checked; });
+  o.wpm = parseInt(o.wpm, 10) || 240;
+  o.search = ($("input[name=st-search]:checked") || { value: "builtin" }).value;
+  o.prose = ($("input[name=st-prose]:checked") || { value: "indented" }).value;
+  o.secure = portalRead();
+  o.frame = frameRead();
+  o.text = textRead();
+  o.brand = brandRead();
+  return o;
+}
+
+function openSettings() {
+  view = { type: "settings" };
+  show(SET_TPL.replace("PORTALBOX", brandFieldset() + textFieldset() + portalFieldset() + frameFieldset()));
+  portalWire(markDirty);
+  frameWire(markDirty);
+  textWire(markDirty);
+  brandWire(markDirty);
+  const s = S.site;
+  SET_TEXT.forEach((k) => { $("#st-" + k).value = s[k] == null ? "" : s[k]; });
+  SET_BOOL.forEach((k) => { $("#st-" + k).checked = !!s[k]; });
+  [["search", s.search], ["prose", s.prose]].forEach(([n, v]) => { const r = $("input[name=st-" + n + "][value=" + v + "]"); if (r) r.checked = true; });
+  $$("#left fieldset[data-need]").forEach((f) => { f.hidden = !on(f.dataset.need); });
+  $$("#left input, #left textarea").forEach((i) => i.addEventListener(i.type === "checkbox" || i.type === "radio" ? "change" : "input", markDirty));
+  $("#st-save").addEventListener("click", async () => {
+    try {
+      const body = readSettings();
+      let r = await api("PUT", "settings", body);
+      if (r.needs_confirm) {
+        if (!window.confirm(r.message)) return;
+        r = await api("PUT", "settings", Object.assign(body, { confirm_feed_move: true }));
+      }
+      setDirty(false); await refresh(); toast("Saved");
+    } catch (e) { toast(e.message, "bad"); }
+  });
+  renderSide();
+  renderPreview();
+}
+
+/* ---------- site structure ---------- */
+const STRUCT_TPL = `
+<div class="fill">
+  <div class="bar"><strong>Site structure</strong><span class="grow"></span><button id="x-save" class="primary">Save structure</button></div>
+  <div class="pad">
+    <label class="field">Homepage <select id="x-home"></select></label>
+    <label id="x-rootrow"><input type="checkbox" id="x-root"> Serve it from the site root <span class="hint">(its sections, stories or episodes get addresses like /linux/portainer.html instead of /wiki/linux/portainer.html, which is what WikiGen, StoryGen and PodcastGen produce)</span></label>
+    <div id="x-mods"></div>
+    <p class="hint">Switching a module off removes its pages from the built site but keeps everything you wrote, so switching it back on restores it. Changing the homepage or where a module is served from changes addresses, so links to the old ones from elsewhere will break.</p>
+    <fieldset><legend>Import a SiteGen, WikiGen, StoryGen or PodcastGen site</legend>
+      <div style="display:flex;gap:6px"><input id="x-import" style="flex:1" placeholder="Folder that contains .sitegen, .wikigen, .storygen or .podcastgen"><button id="x-browse">Browse</button><button id="x-check">Check</button></div>
+      <span class="hint" id="x-found"></span>
+      <label><input type="checkbox" id="x-settings"> Also copy its title, URL and other site settings</label>
+      <button id="x-go" disabled>Import into this site</button>
+    </fieldset>
+  </div>
+</div>`;
+
+function openStructure() {
+  view = { type: "structure" };
+  show(STRUCT_TPL);
+  const homeOpts = [["page", "A page"]].concat(["blog", "wiki", "library", "podcast"].map((m) => [m, label(m) + " (" + ({ blog: "blog feed", wiki: "wiki home", library: "book list", podcast: "show page" }[m]) + ")"]));
+  opts($("#x-home"), homeOpts, S.home);
+  $("#x-root").checked = S.home !== "page" && S.home !== "blog" && S.modules[S.home].mount === "";
+  const box = $("#x-mods");
+  ["blog", "wiki", "library", "podcast"].forEach((m) => {
+    const cb = el("input", { type: "checkbox", id: "x-on-" + m });
+    cb.checked = on(m);
+    const name = el("input", { id: "x-label-" + m, placeholder: S.names[m] });
+    name.value = S.modules[m].label;
+    const counts = { blog: S.posts.length + " post(s)", wiki: S.wiki.sections.length + " section(s)", library: S.library.stories.length + " stor(ies)", podcast: pod().episodes.length + " episode(s)" }[m];
+    const rm = el("button", { class: "danger", text: "Move its content to the trash" });
+    rm.hidden = on(m) || counts.startsWith("0");
+    rm.addEventListener("click", async () => {
+      if (!window.confirm("Move all " + S.names[m] + " content (" + counts + ") to the trash folder?")) return;
+      try { const r = await api("POST", "modules/" + m + "/remove"); await refresh(); openStructure(); toast("Moved to the trash folder. " + (r.note || "")); } catch (e) { toast(e.message, "bad"); }
+    });
+    box.appendChild(el("div", { class: "mod-card" }, [
+      el("h4", {}, [cb, el("label", { for: "x-on-" + m, text: S.names[m] }), el("span", { class: "hint", text: counts })]),
+      el("label", { class: "field" }, [el("span", { text: "Name in the menu and headings" }), name]), rm]));
+  });
+  const sync = () => {
+    const h = $("#x-home").value;
+    $("#x-rootrow").hidden = !(h === "wiki" || h === "library" || h === "podcast");
+    if (h !== "page") $("#x-on-" + h).checked = true;
+  };
+  $("#x-home").addEventListener("change", () => { sync(); markDirty(); });
+  $$("#left input").forEach((i) => i.addEventListener(i.type === "checkbox" ? "change" : "input", markDirty));
+  sync();
+  $("#x-save").addEventListener("click", saveStructure);
+  $("#x-browse").addEventListener("click", async () => { const r = await api("POST", "pick-folder"); if (r.path) { $("#x-import").value = r.path; checkImport(); } });
+  $("#x-check").addEventListener("click", checkImport);
+  $("#x-go").addEventListener("click", runImport);
+  renderSide();
+}
+
+async function checkImport() {
+  $("#x-go").disabled = true;
+  try {
+    const r = await api("POST", "detect-import", { path: $("#x-import").value });
+    $("#x-found").textContent = "Found a " + { sitegen: "SiteGen", wikigen: "WikiGen", storygen: "StoryGen", podcastgen: "PodcastGen" }[r.kind] + " site: " + r.title;
+    $("#x-go").disabled = false;
+  } catch (e) { $("#x-found").textContent = e.message; }
+}
+
+async function runImport() {
+  if (!(await guard())) return;
+  try {
+    const r = await api("POST", "import", { path: $("#x-import").value, settings: $("#x-settings").checked });
+    S = r.state; renderTop(); renderSide(); setDirty(false);
+    toast(r.notes.join("\n"));
+    openStructure();
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+async function saveStructure() {
+  const mods = {};
+  ["blog", "wiki", "library", "podcast"].forEach((m) => { mods[m] = { enabled: $("#x-on-" + m).checked, label: $("#x-label-" + m).value }; });
+  const home = $("#x-home").value;
+  const off = ["blog", "wiki", "library", "podcast"].filter((m) => on(m) && !mods[m].enabled);
+  if (off.length && !window.confirm("Switch off " + off.map(label).join(" and ") + "? Its pages leave the built site; your content is kept.")) return;
+  try {
+    const body = { home, modules: mods, root_mount: $("#x-root").checked };
+    const r = await api("PUT", "structure", body);
+    if (r.needs_confirm) {
+      if (!window.confirm(r.message)) return;
+      await api("PUT", "structure", Object.assign(body, { confirm_feed_move: true }));
+    }
+    setDirty(false);
+    await refresh();
+    openStructure();
+    toast("Structure saved");
+    schedulePreview();
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+/* ---------- podcast ---------- */
+function pod() { return S.podcast || { episodes: [], check_fails: 0, checklist_done: 0, checklist_total: 8, upload_limit_mb: 2048, next_number: 1 }; }
+function clockOf(sec) {
+  sec = Math.round(Number(sec) || 0);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const two = (n) => String(n).padStart(2, "0");
+  return h ? h + ":" + two(m) + ":" + two(s) : two(m) + ":" + two(s);
+}
+function fmtSize(n) {
+  n = Number(n) || 0;
+  if (n >= 1073741824) return (n / 1073741824).toFixed(1) + " GB";
+  if (n >= 1048576) return Math.round(n / 1048576) + " MB";
+  if (n >= 1024) return Math.round(n / 1024) + " KB";
+  return n + " bytes";
+}
+function fmtDur(sec) {
+  sec = Math.round(Number(sec) || 0);
+  if (sec <= 0) return "";
+  if (sec < 60) return sec + " sec";
+  const m = Math.floor((sec + 30) / 60);
+  if (m < 60) return m + " min";
+  return Math.floor(m / 60) + " h" + (m % 60 ? " " + (m % 60) + " min" : "");
+}
+function localNow() { const d = new Date(); d.setSeconds(0, 0); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16); }
+function localOffset() { const o = -new Date().getTimezoneOffset(), a = Math.abs(o); return (o < 0 ? "-" : "+") + String(Math.floor(a / 60)).padStart(2, "0") + ":" + String(a % 60).padStart(2, "0"); }
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t); }
+  catch (e) { const ta = el("textarea", {}); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
+}
+function sitePath(p) { return /^https?:\/\//i.test(p) ? p : "/site/" + String(p || "").replace(/^\.?\//, ""); }
+
+let mediaTimer = null, mediaSeen = 0, pendingArt = null;
+
+async function pollMedia() {
+  clearTimeout(mediaTimer);
+  mediaTimer = null;
+  try {
+    const r = await api("GET", "jobs/media/status?since=" + mediaSeen);
+    mediaSeen = r.total;
+    const log = $("#e-log") || $("#m-mlog");
+    if (log && r.lines.length) {
+      if (log.id === "e-log") $("#e-logbox").hidden = false;
+      log.hidden = false;
+      log.textContent += r.lines.join("\n") + "\n";
+      log.scrollTop = log.scrollHeight;
+    }
+    if (view.type === "episode" && $("#e-mstate")) {
+      if (r.running && r.current === view.slug) $("#e-mstate").textContent = "Processing";
+      else if (r.running) $("#e-mstate").textContent = "Waiting for: " + r.what;
+    }
+    if (r.running || r.queued) { mediaTimer = setTimeout(pollMedia, 800); return; }
+    const art = pendingArt;
+    pendingArt = null;
+    await refresh();
+    if (view.type === "episode" && view.slug) {
+      const d = await api("GET", "podcast/episodes/" + enc(view.slug));
+      syncAudio(d);
+      if (art && art.target === "episode" && r.ok) { $("#e-art").value = art.path; artCheck($("#e-art").value, $("#e-artcheck"), "episode"); schedulePreview(); }
+    }
+    if (view.type === "show" && art && art.target === "show" && r.ok) { $("#s-image").value = art.path; artCheck(art.path, $("#s-artcheck"), "show"); schedulePreview(); }
+    if (r.ok === true) toast(r.what + ": done");
+    else if (r.ok === false) toast(r.what + " failed. See the log.", "bad");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+/* ---------- artwork check ---------- */
+async function artCheck(path, box, target) {
+  box.innerHTML = "";
+  if (!path) return;
+  let r;
+  try { r = await api("POST", "podcast/art-check", { path }); } catch (e) { box.textContent = e.message; return; }
+  if (r.info && r.info.format) {
+    box.appendChild(el("img", { src: sitePath(path), alt: "" }));
+    box.appendChild(el("span", { class: "hint", text: r.info.width + " x " + r.info.height + " " + r.info.format.toUpperCase() + ", " + fmtSize(r.info.bytes) }));
+  }
+  const ul = el("ul", { class: "checks" });
+  const probs = r.problems.length ? r.problems : [{ level: "ok", text: "Meets Apple's cover rules." }];
+  probs.forEach((p) => ul.appendChild(el("li", { class: p.level, text: p.text + (p.fix ? " " + p.fix : "") })));
+  box.appendChild(ul);
+  if (r.can_fix && r.problems.some((p) => p.level === "fail" || p.level === "warn")) {
+    const b = el("button", { text: "Fix artwork" });
+    b.addEventListener("click", async () => {
+      try {
+        const f = await api("POST", "podcast/art-fix", { path, target, episode: view.slug || "" });
+        pendingArt = { target, path: f.path };
+        toast("Writing " + f.path + "...");
+        mediaSeen = 0;
+        pollMedia();
+      } catch (e) { toast(e.message, "bad"); }
+    });
+    box.appendChild(b);
+  }
+}
+
+/* ---------- episode editor ---------- */
+const EP_TPL = `
+<div class="fill">
+  <div class="bar">
+    <input id="e-title" class="title-input" placeholder="Episode title (no number in it)" aria-label="Episode title">
+    <span class="chip" id="e-status"></span>
+    <button id="e-save">Save draft</button>
+    <button id="e-publish" class="primary">Publish</button>
+    <button id="e-unpublish" hidden>Unpublish</button>
+  </div>
+  <div class="bar sub">
+    <label>Address <span class="slug-wrap"><span id="e-base"></span><input id="e-slug" aria-label="Episode address">.html</span></label>
+    <label>Episode <input type="number" id="e-number" min="1" style="width:5em"></label>
+    <label>Season <input type="number" id="e-season" min="1" style="width:4.5em"></label>
+    <label>Type <select id="e-kind"><option value="full">Full</option><option value="trailer">Trailer</option><option value="bonus">Bonus</option></select></label>
+  </div>
+  <div class="bar sub">
+    <label>Date and time <input type="datetime-local" id="e-date"></label><span class="hint" id="e-offset"></span>
+    <label>Explicit <select id="e-explicit"><option value="">Show default</option><option value="yes">Yes</option><option value="no">No</option></select></label>
+    <span class="grow"></span>
+    <button id="e-import">Import .md</button>
+    <button id="e-delete" class="danger">Delete episode</button>
+  </div>
+  <details class="box" id="e-audiobox" open>
+    <summary>Audio <span class="chip" id="e-mstate"></span></summary>
+    <div class="pad">
+      <div class="drop" id="e-drop"><span>Drop the recording here, or</span> <button id="e-choose">Choose audio</button><input type="file" id="e-file" accept="audio/*,.mp3,.m4a,.wav,.flac,.aif,.aiff,.ogg,.opus" hidden></div>
+      <div id="e-progress" hidden><progress id="e-bar" max="100" value="0"></progress> <span class="hint" id="e-ptext"></span></div>
+      <div id="e-audioinfo" class="hint"></div>
+      <audio id="e-player" controls preload="none" hidden></audio>
+      <label class="field" id="e-durrow">Length <input id="e-duration" placeholder="H:MM:SS or MM:SS"><span class="hint">Measured for you when ffprobe is installed; type it in otherwise.</span></label>
+      <div class="two"><button id="e-retry" hidden>Retry processing</button><button id="e-stop" class="danger" hidden>Stop processing</button><button id="e-youtube">Copy for YouTube</button></div>
+      <details id="e-logbox" hidden><summary>Processing log</summary><pre class="log" id="e-log"></pre></details>
+    </div>
+  </details>
+  <details class="box">
+    <summary>Summary, art, chapters and transcript</summary>
+    <div class="pad">
+      <label class="field">Summary <textarea id="e-summary" rows="2" maxlength="400" placeholder="Optional plain text. The first paragraph of the show notes is used otherwise."></textarea><span class="hint" id="e-scount"></span></label>
+      <label class="field">Episode art <span style="display:flex;gap:6px"><input id="e-art" style="flex:1" placeholder="Optional. The show art is used otherwise."><button id="e-artup" type="button">Upload</button></span></label>
+      <div class="artcheck" id="e-artcheck"></div>
+      <fieldset><legend>Chapters</legend>
+        <div id="e-chapters"></div>
+        <div class="two"><button id="e-chadd">Add chapter</button><button id="e-chpaste">Paste chapters</button></div>
+        <div id="e-chpastebox" hidden><textarea id="e-chtext" class="small" rows="5" placeholder="00:00 Intro&#10;04:10 The news&#10;1:02:30 Questions"></textarea><button id="e-chapply">Use these</button></div>
+        <span class="hint">The first chapter starts at 0:00. Times are H:MM:SS or MM:SS. The feed, the episode page and Copy for YouTube all use this list.</span>
+      </fieldset>
+      <fieldset><legend>Transcript</legend>
+        <span class="hint" id="e-trinfo"></span>
+        <div class="two"><button id="e-trup">Upload .vtt or .srt</button><button id="e-trdel" class="danger" hidden>Remove</button></div>
+        <input type="file" id="e-trfile" accept=".vtt,.srt" hidden>
+      </fieldset>
+    </div>
+  </details>
+  SEOBLOCK
+  <div class="bar warn" id="missing" hidden></div>
+  MDTOOLS
+  <textarea id="md" class="code" spellcheck="true" placeholder="Show notes in Markdown: what the episode covers, links, guests, credits"></textarea>
+</div>`;
+
+let epChapters = [];
+
+function renderChapters() {
+  const box = $("#e-chapters");
+  box.innerHTML = "";
+  epChapters.forEach((ch, i) => {
+    const row = el("div", { class: "chrow" });
+    const start = el("input", { class: "ch-start", placeholder: "0:00", "aria-label": "Start" });
+    const title = el("input", { class: "ch-title", placeholder: "Chapter title", "aria-label": "Title" });
+    const url = el("input", { class: "ch-url", placeholder: "Link (optional)", "aria-label": "Link" });
+    start.value = ch.start; title.value = ch.title; url.value = ch.url || "";
+    start.addEventListener("input", () => { ch.start = start.value; markDirty(); });
+    title.addEventListener("input", () => { ch.title = title.value; markDirty(); });
+    url.addEventListener("input", () => { ch.url = url.value; markDirty(); });
+    const btn = (text, fn, label) => { const b = el("button", { text, type: "button", title: label, "aria-label": label }); b.addEventListener("click", () => { fn(); renderChapters(); markDirty(); }); return b; };
+    row.append(start, title, url,
+      btn("↑", () => { if (i > 0) epChapters = moved(epChapters, i, i - 1); }, "Move up"),
+      btn("↓", () => { if (i < epChapters.length - 1) epChapters = moved(epChapters, i, i + 1); }, "Move down"),
+      btn("×", () => { epChapters.splice(i, 1); }, "Remove"));
+    box.appendChild(row);
+  });
+}
+
+function chapterVals() { return epChapters.filter((c) => String(c.title).trim()).map((c) => ({ start: String(c.start).trim(), title: c.title, url: c.url || "" })); }
+
+function pasteChapters(text) {
+  const out = [];
+  text.split(/\r?\n/).forEach((line) => {
+    const m = line.trim().match(/^\(?((?:\d+:)?\d{1,2}:\d{2})\)?\s*[-–:.]?\s+(.+)$/);
+    if (m) out.push({ start: m[1], title: m[2].trim(), url: "" });
+  });
+  return out;
+}
+
+function epPayload() {
+  const dv = $("#e-date").value;
+  return Object.assign({ orig_slug: view.slug, new_slug: $("#e-slug").value, title: $("#e-title").value,
+    number: $("#e-number").value, season: $("#e-season").value, kind: $("#e-kind").value,
+    date: dv && view.origDate && view.origDate.slice(0, 16) === dv ? view.origDate : dv,
+    explicit: $("#e-explicit").value, summary: $("#e-summary").value, art: $("#e-art").value.trim(),
+    duration: $("#e-duration").value, chapters: chapterVals(), markdown: $("#md").value }, seoVals());
+}
+
+async function openEpisode(slug) {
+  let e = { title: "", slug: "", number: pod().next_number, season: null, kind: "full", date: "", explicit: "", summary: "", art: "",
+    chapters: [], audio: {}, media: {}, transcript: {}, status: "draft", duration: 0 }, md = "", info = { episode: e, src: "" };
+  if (slug) { info = await api("GET", "podcast/episodes/" + enc(slug)); e = info.episode; md = info.markdown; }
+  view = { type: "episode", slug: slug || "", origDate: e.date };
+  show(EP_TPL);
+  $("#e-title").value = e.title;
+  $("#e-slug").value = e.slug;
+  $("#e-base").textContent = (S.modules.podcast.mount ? S.modules.podcast.mount + "/" : "") + "episodes/";
+  $("#e-number").value = e.number || "";
+  $("#e-season").value = e.season || "";
+  $("#e-kind").value = e.kind;
+  $("#e-date").value = e.date ? e.date.slice(0, 16) : localNow();
+  $("#e-offset").textContent = "UTC" + (e.date ? e.date.slice(19) || "" : localOffset());
+  $("#e-explicit").value = e.explicit || "";
+  $("#e-summary").value = e.summary || "";
+  $("#e-art").value = e.art || "";
+  $("#md").value = md;
+  epChapters = (e.chapters || []).map((c) => ({ start: clockOf(c.start), title: c.title, url: c.url }));
+  renderChapters();
+  slugTouched = !!slug;
+  setSeo(e);
+  syncEpisode(e);
+  syncAudio(info);
+  const scount = () => { const n = $("#e-summary").value.length; $("#e-scount").textContent = n ? n + " of 400 characters" : ""; };
+  scount();
+  $("#e-title").addEventListener("input", () => { if (!slugTouched) $("#e-slug").value = slugify($("#e-title").value); markDirty(); });
+  $("#e-slug").addEventListener("input", () => { slugTouched = true; markDirty(); });
+  $("#e-summary").addEventListener("input", () => { scount(); markDirty(); });
+  watch(["#e-number", "#e-season", "#e-kind", "#e-date", "#e-explicit", "#e-duration"]);
+  let artT = null;
+  $("#e-art").addEventListener("input", () => { markDirty(); clearTimeout(artT); artT = setTimeout(() => artCheck($("#e-art").value.trim(), $("#e-artcheck"), "episode"), 500); });
+  $("#e-artup").addEventListener("click", () => pickFile("image/*", async (f) => {
+    try { $("#e-art").value = await uploadImage(f); markDirty(); artCheck($("#e-art").value, $("#e-artcheck"), "episode"); } catch (err) { toast(err.message, "bad"); }
+  }));
+  artCheck(e.art, $("#e-artcheck"), "episode");
+  $("#e-save").addEventListener("click", () => saveEpisode(false));
+  $("#e-publish").addEventListener("click", () => saveEpisode(true));
+  $("#e-unpublish").addEventListener("click", unpublishEpisode);
+  $("#e-delete").addEventListener("click", deleteEpisode);
+  $("#e-import").addEventListener("click", () => importInto("#e-title", "#e-slug"));
+  $("#e-choose").addEventListener("click", () => $("#e-file").click());
+  $("#e-file").addEventListener("change", () => { const f = $("#e-file").files[0]; $("#e-file").value = ""; uploadAudio(f); });
+  const drop = $("#e-drop");
+  drop.addEventListener("dragover", (ev) => { ev.preventDefault(); drop.classList.add("over"); });
+  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+  drop.addEventListener("drop", (ev) => { ev.preventDefault(); drop.classList.remove("over"); uploadAudio(ev.dataTransfer.files[0]); });
+  $("#e-retry").addEventListener("click", async () => {
+    try { await api("POST", "podcast/episodes/" + enc(view.slug) + "/process"); $("#e-log").textContent = ""; mediaSeen = 0; pollMedia(); toast("Processing again"); }
+    catch (err) { toast(err.message, "bad"); }
+  });
+  $("#e-stop").addEventListener("click", async () => { try { await api("POST", "jobs/media/cancel"); } catch (err) { toast(err.message, "bad"); } });
+  $("#e-youtube").addEventListener("click", copyYouTube);
+  $("#e-chadd").addEventListener("click", () => { epChapters.push({ start: epChapters.length ? "" : "00:00", title: "", url: "" }); renderChapters(); markDirty(); });
+  $("#e-chpaste").addEventListener("click", () => { $("#e-chpastebox").hidden = !$("#e-chpastebox").hidden; });
+  $("#e-chapply").addEventListener("click", () => {
+    const list = pasteChapters($("#e-chtext").value);
+    if (!list.length) { toast("No lines like 00:00 Intro found.", "bad"); return; }
+    epChapters = list; renderChapters(); markDirty(); $("#e-chpastebox").hidden = true; $("#e-chtext").value = "";
+  });
+  $("#e-trup").addEventListener("click", () => $("#e-trfile").click());
+  $("#e-trfile").addEventListener("change", uploadTranscript);
+  $("#e-trdel").addEventListener("click", async () => {
+    if (!window.confirm("Remove the transcript? The file is moved to the trash folder.")) return;
+    try { const r = await api("DELETE", "podcast/episodes/" + enc(view.slug) + "/transcript"); syncTranscript(r.episode); schedulePreview(); }
+    catch (err) { toast(err.message, "bad"); }
+  });
+  syncTranscript(e);
+  bindEditor();
+  renderSide();
+  renderPreview();
+  if (e.media && (e.media.state === "queued" || e.media.state === "processing")) { mediaSeen = 0; $("#e-log").textContent = ""; pollMedia(); }
+  if (!slug) $("#e-title").focus();
+}
+
+function pickFile(accept, fn) {
+  const inp = el("input", { type: "file", accept, hidden: "" });
+  document.body.appendChild(inp);
+  inp.addEventListener("change", () => { const f = inp.files[0]; inp.remove(); if (f) fn(f); });
+  inp.click();
+}
+
+function syncEpisode(e) {
+  const pub = e.status === "published";
+  $("#e-status").textContent = view.slug ? (pub ? "Published" : "Draft") : "New";
+  $("#e-status").className = "chip" + (pub ? "" : " draft");
+  $("#e-save").textContent = pub ? "Save" : "Save draft";
+  $("#e-publish").textContent = pub ? "Update" : "Publish";
+  $("#e-unpublish").hidden = !pub;
+  $("#e-delete").hidden = !view.slug;
+}
+
+function syncAudio(d) {
+  const e = d.episode, a = e.audio || {}, m = e.media || {};
+  const label = { queued: "Queued", processing: "Processing", ready: "Ready", failed: "Failed" }[m.state] || (a.file ? "Ready" : "No audio yet");
+  $("#e-mstate").textContent = label;
+  $("#e-mstate").className = "chip" + (m.state === "failed" ? " bad" : (a.file ? "" : " draft"));
+  const box = $("#e-audioinfo");
+  box.innerHTML = "";
+  if (a.file) {
+    const bits = [a.file, fmtDur(e.duration) || "length unknown", fmtSize(a.bytes), a.type === "audio/mpeg" ? "MP3" : "M4A"];
+    if (a.kbps) bits.push(a.kbps + " kbps");
+    if (a.channels) bits.push(a.channels === 1 ? "mono" : (a.channels === 2 ? "stereo" : a.channels + " channels"));
+    if (a.lufs !== null && a.lufs !== undefined) bits.push(a.lufs + " LUFS");
+    box.appendChild(el("div", { text: bits.join(" · ") }));
+  }
+  if (m.message) box.appendChild(el("div", { class: "warnline", text: m.message }));
+  const p = $("#e-player");
+  if (d.src) { if (p.getAttribute("src") !== d.src) p.src = d.src; p.hidden = false; } else { p.hidden = true; }
+  $("#e-durrow").hidden = !!a.probed;
+  $("#e-duration").value = e.duration ? clockOf(e.duration) : "";
+  $("#e-retry").hidden = !(m.state === "failed" && m.original);
+  $("#e-stop").hidden = !(m.state === "processing" || m.state === "queued");
+  $("#e-choose").textContent = a.file ? "Replace audio" : "Choose audio";
+  if (m.log && m.log.length && m.state !== "processing" && m.state !== "queued") { $("#e-log").textContent = m.log.join("\n") + "\n"; $("#e-logbox").hidden = false; }
+  $("#e-youtube").disabled = !view.slug;
+}
+
+function syncTranscript(e) {
+  const t = e.transcript || {};
+  $("#e-trinfo").textContent = t.file ? t.file + ": " + fmt(t.cues || 0) + " cues. The words show on the episode page under Transcript." : "No transcript. A .vtt or .srt file (from Whisper, for example) puts the words on the episode page and in the feed.";
+  $("#e-trdel").hidden = !t.file;
+  $("#e-trup").textContent = t.file ? "Replace transcript" : "Upload .vtt or .srt";
+}
+
+async function saveEpisode(publish) {
+  try {
+    const r = await api("POST", "podcast/episodes", Object.assign(epPayload(), { publish }));
+    view.slug = r.slug;
+    view.origDate = r.episode.date;
+    $("#e-slug").value = r.slug;
+    slugTouched = true;
+    setDirty(false);
+    S = r.state; renderTop(); renderSide();
+    syncEpisode(r.episode);
+    $("#e-youtube").disabled = false;
+    toast(publish ? "Published. It goes live with the next publish to the server." : "Saved");
+    return true;
+  } catch (e) { toast(e.message, "bad"); return false; }
+}
+
+async function unpublishEpisode() {
+  try { const r = await api("POST", "podcast/episodes/" + enc(view.slug) + "/unpublish"); await refresh(); syncEpisode(r.episode); toast("Moved back to drafts"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+async function deleteEpisode() {
+  if (!window.confirm("Delete this episode? Its show notes go to the trash folder; its audio stays under Unused audio in show settings.")) return;
+  try { const r = await api("DELETE", "podcast/episodes/" + enc(view.slug)); setDirty(false); await refresh(); await openHome(); toast(r.note || "Episode deleted"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+async function uploadAudio(file) {
+  if (!file) return;
+  const limit = pod().upload_limit_mb * 1048576;
+  if (file.size > limit) { toast("That file is " + fmtSize(file.size) + "; the upload limit is " + fmtSize(limit) + ". Raise it under Audio in show settings.", "bad"); return; }
+  if (!view.slug || dirty) {
+    if (!$("#e-title").value.trim()) { toast("Give the episode a title first, so it can be saved before the upload.", "bad"); return; }
+    if (!(await saveEpisode(false))) return;
+  }
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/api/podcast/audio?episode=" + enc(view.slug) + "&name=" + enc(file.name || "audio"));
+  xhr.setRequestHeader("X-Token", TOKEN);
+  $("#e-progress").hidden = false;
+  $("#e-bar").value = 0;
+  $("#e-choose").disabled = true;
+  xhr.upload.onprogress = (ev) => {
+    if (!ev.lengthComputable || !$("#e-bar")) return;
+    $("#e-bar").value = ev.loaded / ev.total * 100;
+    $("#e-ptext").textContent = fmtSize(ev.loaded) + " of " + fmtSize(ev.total);
+  };
+  const done = () => { if ($("#e-progress")) { $("#e-progress").hidden = true; $("#e-choose").disabled = false; } };
+  xhr.onload = () => {
+    done();
+    let d = {};
+    try { d = JSON.parse(xhr.responseText); } catch (e) { /* not json */ }
+    if (xhr.status >= 400) { toast(d.error || "The upload failed.", "bad"); return; }
+    toast("Uploaded. Processing the audio...");
+    if ($("#e-log")) { $("#e-log").textContent = ""; $("#e-logbox").hidden = false; $("#e-logbox").open = true; }
+    mediaSeen = 0;
+    pollMedia();
+  };
+  xhr.onerror = () => { done(); toast("The upload failed: the connection dropped.", "bad"); };
+  xhr.send(file);
+}
+
+async function uploadTranscript() {
+  const f = $("#e-trfile").files[0];
+  $("#e-trfile").value = "";
+  if (!f) return;
+  if (!view.slug) { toast("Save the episode first.", "bad"); return; }
+  try {
+    const r = await fetch("/api/podcast/transcript?episode=" + enc(view.slug) + "&name=" + enc(f.name), { method: "POST", headers: { "X-Token": TOKEN }, body: f });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "Upload failed");
+    syncTranscript(d.episode);
+    schedulePreview();
+    toast("Transcript added");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+async function copyYouTube() {
+  if (!view.slug) { toast("Save the episode first.", "bad"); return; }
+  if (dirty && !(await saveEpisode(false))) return;
+  try { const d = await api("GET", "podcast/episodes/" + enc(view.slug)); await copyText(d.youtube); toast("Copied the title, description and chapter times for YouTube Studio"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+/* ---------- show settings ---------- */
+const SHOW_TPL = `
+<div class="fill">
+  <div class="bar"><strong>Show settings</strong><span class="grow"></span><button id="s-save" class="primary">Save</button></div>
+  <div class="pad podpad">
+    <fieldset><legend>Feed check</legend><ul class="checks" id="s-check"></ul></fieldset>
+    <fieldset><legend>Show</legend>
+      <label class="field">Title <input id="s-title" maxlength="200"></label>
+      <label class="field">Author <input id="s-author" maxlength="200"></label>
+      <span><b>About the show</b> <span class="hint">Markdown. It is the intro on the show page, and the feed carries the first 4,000 bytes of it.</span></span>
+      <div class="mdbox">MDTOOLS<textarea id="md" class="code" rows="8" spellcheck="true"></textarea></div>
+      <div class="two">
+        <label class="field">Language <input id="s-language" placeholder="en or en-US"></label>
+        <label class="field">Type <select id="s-type"><option value="episodic">Episodic: newest first</option><option value="serial">Serial: oldest first</option></select></label>
+      </div>
+      <div class="two"><label class="field">Primary category <select id="s-cat0"></select></label><label class="field">Subcategory <select id="s-sub0"></select></label></div>
+      <div class="two"><label class="field">Secondary category <select id="s-cat1"></select></label><label class="field">Subcategory <select id="s-sub1"></select></label></div>
+      <label><input type="checkbox" id="s-explicit"> Explicit content</label>
+      <label class="field">Copyright <input id="s-copyright"></label>
+      <label class="field">Website link <input id="s-link"></label>
+    </fieldset>
+    <fieldset><legend>Artwork</legend>
+      <div style="display:flex;gap:6px"><input id="s-image" style="flex:1" placeholder="assets/show-art.jpg"><button id="s-imgup" type="button">Upload</button></div>
+      <span class="hint">A square JPG or PNG, 1400 to 3000 pixels, RGB with no transparency. 3000 pixels is best.</span>
+      <div class="artcheck" id="s-artcheck"></div>
+    </fieldset>
+    <fieldset><legend>Owner</legend>
+      <div class="two"><label class="field">Name <input id="s-owner_name"></label><label class="field">Email <input id="s-owner_email" type="email"></label></div>
+      <span class="hint">The email is public in the feed, and Spotify, Amazon and YouTube send their verification codes to it, so an address just for the show is the better choice.</span>
+    </fieldset>
+    <fieldset><legend>Feed</legend>
+      <div style="display:flex;gap:6px"><input id="s-feedurl" readonly style="flex:1" aria-label="Feed URL"><button id="s-copyfeed" type="button">Copy</button></div>
+      <span class="hint" id="s-guid"></span>
+      <span class="hint" id="s-lock"></span>
+      <div id="s-legacy" class="hint"></div>
+      <label><input type="checkbox" id="s-complete"> The show has ended; no new episodes are coming</label>
+      <label><input type="checkbox" id="s-block"> Keep out of directories (for testing)</label>
+      <label><input type="checkbox" id="s-locked"> Locked: directories that honor it refuse imports of this feed by anyone else</label>
+      <div id="s-funding"></div>
+      <label><input type="checkbox" id="s-ping"> Ping Podcast Index after a publish that changed the feed (no key needed)</label>
+      <label><input type="checkbox" id="s-websub"> WebSub: name pubsubhubbub.appspot.com in the feed and notify it on every change</label>
+      <div style="display:flex;gap:8px;align-items:center"><span class="hint grow" id="s-lastping"></span><button id="s-pingnow" type="button">Ping now</button></div>
+    </fieldset>
+    <fieldset><legend>Audio</legend>
+      <label><input type="checkbox" id="s-normalize"> Normalize loudness to -16 LUFS, Apple's target (ffmpeg, two passes)</label>
+      <div class="two">
+        <label class="field">Output format <select id="s-format"><option value="mp3">MP3: plays everywhere</option><option value="m4a">AAC in M4A: smaller, better seeking</option></select></label>
+        <label class="field">Mono bit rate <select id="s-kbps_mono"></select></label>
+        <label class="field">Stereo bit rate <select id="s-kbps_stereo"></select></label>
+      </div>
+      <label><input type="checkbox" id="s-mono"> Mono output: half the size, and most talk shows lose nothing</label>
+      <label><input type="checkbox" id="s-tags"> Write tags, cover art and chapters into the audio file</label>
+      <label class="field">Upload size limit in MB <input type="number" id="s-upload_limit_mb" min="1" style="max-width:10em"></label>
+      <span class="hint" id="s-tools"></span>
+    </fieldset>
+    <fieldset><legend>Media</legend>
+      <label><input type="radio" name="s-mode" value="site"> Audio lives with the site, in <span class="mono" id="s-audiodir"></span>, and goes out with every publish</label>
+      <label><input type="radio" name="s-mode" value="host"> Audio lives on a separate media host, such as Cloudflare R2 or a DNS-only subdomain</label>
+      <div id="s-hostbox" class="sub-fields">
+        <label class="field">Media base URL <input id="s-media_url" placeholder="https://media.example.com/podcast/"><span class="hint">The public address the files are served from. Each publish checks it before the feed goes out.</span></label>
+        <label class="field">Upload method <select id="m-method"><option value="rclone">rclone (R2, B2, S3 and others)</option><option value="rsync">rsync over SSH</option><option value="sftp">SFTP</option><option value="ftps">FTPS</option><option value="ftp">FTP</option><option value="folder">A local folder or mount</option></select></label>
+        <label class="field" id="m-remoterow">rclone target <input id="m-remote" placeholder="r2:my-bucket/podcast"><span class="hint">Set the remote up once with rclone config; the app never holds the cloud keys.</span></label>
+        <div class="two" id="m-hostrow"><label class="field">Host <input id="m-host"></label><label class="field">Port <input id="m-port"></label></div>
+        <div class="two" id="m-userrow"><label class="field">User <input id="m-user"></label><label class="field">Password <input type="password" id="m-pass" placeholder="Leave blank to use an SSH key"></label></div>
+        <label id="m-remember"><input type="checkbox" id="m-save_password"> Remember the password (plain text, readable by your user only)</label>
+        <label class="field" id="m-pathrow">Path <input id="m-path"></label>
+        <label class="field" id="m-keyrow">SSH key file <input id="m-key" placeholder="Optional, for example ~/.ssh/id_ed25519"></label>
+        <label id="m-passiverow"><input type="checkbox" id="m-passive"> Passive mode</label>
+        <label id="m-tlsrow"><input type="checkbox" id="m-insecure_tls"> Trust a self-signed certificate (FTPS only)</label>
+        <div class="two"><button id="m-test" type="button">Test connection</button><button id="m-clean" type="button" class="danger">Remove unused audio from the media host</button></div>
+        <pre class="log" id="m-log" hidden></pre>
+      </div>
+    </fieldset>
+    <fieldset><legend>Unused audio</legend><div id="s-unused"></div></fieldset>
+  </div>
+</div>`;
+
+const SHOW_TEXT = ["title", "author", "language", "copyright", "link", "image", "owner_name", "owner_email", "media_url"];
+const SHOW_BOOL = ["explicit", "complete", "block", "locked", "ping", "websub", "normalize", "mono", "tags"];
+const MEDIA_TEXT = ["remote", "host", "port", "user", "path", "key"];
+const MEDIA_BOOL = ["save_password", "passive", "insecure_tls"];
+let showInfo = null, funding = [];
+
+function catSelects(cats) {
+  [0, 1].forEach((i) => {
+    const c = $("#s-cat" + i), sub = $("#s-sub" + i);
+    opts(c, [["", i ? "None" : "Choose a category"]].concat(showInfo.categories.map(([name]) => [name, name])), (cats[i] || {}).cat || "");
+    const fill = (keep) => {
+      const found = showInfo.categories.find(([name]) => name === c.value);
+      const subs = found ? found[1] : [];
+      opts(sub, [["", subs.length ? "None" : "No subcategories"]].concat(subs.map((s) => [s, s])), keep);
+      sub.disabled = !subs.length;
+    };
+    fill((cats[i] || {}).sub || "");
+    c.addEventListener("change", () => { fill(""); markDirty(); });
+    sub.addEventListener("change", markDirty);
+  });
+}
+
+function renderFunding() {
+  const box = $("#s-funding");
+  box.innerHTML = "";
+  box.appendChild(el("span", { text: "Support links (up to three): ", class: "hint" }));
+  funding.forEach((f, i) => {
+    const row = el("div", { class: "chrow" });
+    const u = el("input", { placeholder: "https://...", "aria-label": "Support link" });
+    const t = el("input", { placeholder: "Support the show", maxlength: "127", "aria-label": "Link text" });
+    u.value = f.url; t.value = f.text;
+    u.addEventListener("input", () => { f.url = u.value; markDirty(); });
+    t.addEventListener("input", () => { f.text = t.value; markDirty(); });
+    const rm = el("button", { text: "×", type: "button", "aria-label": "Remove" });
+    rm.addEventListener("click", () => { funding.splice(i, 1); renderFunding(); markDirty(); });
+    row.append(u, t, rm);
+    box.appendChild(row);
+  });
+  if (funding.length < 3) {
+    const add = el("button", { text: "Add a support link", type: "button" });
+    add.addEventListener("click", () => { funding.push({ url: "", text: "" }); renderFunding(); });
+    box.appendChild(add);
+  }
+}
+
+function renderChecks(list, box) {
+  box.innerHTML = "";
+  if (!list.length) { box.appendChild(el("li", { class: "ok", text: "Everything checks out." })); return; }
+  const order = { fail: 0, warn: 1, info: 2 };
+  list.slice().sort((a, b) => order[a.level] - order[b.level]).forEach((x) => {
+    const li = el("li", { class: x.level }, [el("b", { text: { fail: "Fail", warn: "Warning", info: "Note" }[x.level] + ": " }), document.createTextNode(x.text)]);
+    if (x.fix) li.appendChild(el("span", { class: "hint", text: " " + x.fix }));
+    box.appendChild(li);
+  });
+}
+
+function mediaSync() {
+  const m = $("#m-method").value;
+  const ssh = m === "rsync" || m === "sftp", ftp = m === "ftp" || m === "ftps";
+  $("#s-hostbox").hidden = ($("input[name=s-mode]:checked") || {}).value !== "host";
+  $("#m-remoterow").hidden = m !== "rclone";
+  $("#m-hostrow").hidden = !(ssh || ftp);
+  $("#m-userrow").hidden = !(ssh || ftp);
+  $("#m-remember").hidden = !(ssh || ftp);
+  $("#m-pathrow").hidden = m === "rclone";
+  $("#m-keyrow").hidden = !ssh;
+  $("#m-passiverow").hidden = !ftp;
+  $("#m-tlsrow").hidden = m !== "ftps";
+}
+
+function readMedia() {
+  const o = { method: $("#m-method").value };
+  MEDIA_TEXT.forEach((k) => { o[k] = $("#m-" + k).value.trim(); });
+  MEDIA_BOOL.forEach((k) => { o[k] = $("#m-" + k).checked; });
+  return o;
+}
+
+function readShow() {
+  const o = { markdown: $("#md").value, media_mode: ($("input[name=s-mode]:checked") || { value: "site" }).value };
+  SHOW_TEXT.forEach((k) => { o[k] = $("#s-" + k).value.trim(); });
+  SHOW_BOOL.forEach((k) => { o[k] = $("#s-" + k).checked; });
+  ["type", "format", "kbps_mono", "kbps_stereo", "upload_limit_mb"].forEach((k) => { o[k] = $("#s-" + k).value; });
+  o.categories = [0, 1].map((i) => ({ cat: $("#s-cat" + i).value, sub: $("#s-sub" + i).value })).filter((x) => x.cat);
+  o.funding = funding.filter((f) => f.url.trim());
+  if (o.media_mode === "host" || showInfo.show.media_target.method) o.media_target = readMedia();
+  if ($("#m-pass").value) o.media_password = $("#m-pass").value;
+  return o;
+}
+
+function fillShow(info) {
+  showInfo = info;
+  const s = info.show, r = info.resolved;
+  SHOW_TEXT.forEach((k) => { $("#s-" + k).value = s[k] || ""; });
+  SHOW_BOOL.forEach((k) => { $("#s-" + k).checked = !!s[k]; });
+  $("#s-title").placeholder = r.title;
+  $("#s-author").placeholder = r.author;
+  $("#s-language").placeholder = r.language;
+  $("#s-copyright").placeholder = r.copyright || "Defaults to the site footer";
+  $("#s-link").placeholder = r.link || "Defaults to the show page";
+  $("#s-type").value = s.type;
+  $("#s-format").value = s.format;
+  opts($("#s-kbps_mono"), [64, 80, 96, 112, 128].map((n) => [String(n), n + " kbps"]), String(s.kbps_mono));
+  opts($("#s-kbps_stereo"), [128, 160, 192, 224, 256].map((n) => [String(n), n + " kbps"]), String(s.kbps_stereo));
+  $("#s-upload_limit_mb").value = s.upload_limit_mb;
+  catSelects(s.categories);
+  funding = (s.funding || []).map((f) => ({ url: f.url, text: f.text }));
+  renderFunding();
+  $("#s-feedurl").value = info.feed_url || "Set the site URL under Settings to get a feed address.";
+  $("#s-guid").textContent = info.guid ? "podcast:guid " + info.guid : "";
+  $("#s-lock").textContent = s.feed_lock ? "Locked to " + s.feed_lock + " since " + s.locked_at.slice(0, 10) + ". A change that would move it asks first." : "Not locked yet. The first successful publish locks this address.";
+  $("#s-legacy").textContent = info.legacy.length ? "Old addresses that still get a copy of the feed pointing here: " + info.legacy.map((l) => l.url + (l.rel ? "" : " (on another domain; that server has to redirect it)")).join(", ") : "";
+  const lp = s.last_ping || {};
+  $("#s-lastping").textContent = lp.at ? "Last Podcast Index ping " + lp.at.replace("T", " ").slice(0, 16) + ": " + (lp.ok ? "" : "failed, ") + (lp.message || "") : "Podcast Index has not been pinged yet.";
+  $("#s-audiodir").textContent = (S.modules.podcast.mount ? S.modules.podcast.mount + "/" : "") + "audio/";
+  const mode = $("input[name=s-mode][value=" + s.media_mode + "]");
+  if (mode) mode.checked = true;
+  const mt = info.media_target || {};
+  $("#m-method").value = mt.method || "rclone";
+  MEDIA_TEXT.forEach((k) => { $("#m-" + k).value = mt[k] || ""; });
+  MEDIA_BOOL.forEach((k) => { $("#m-" + k).checked = !!mt[k]; });
+  if (info.media_password) $("#m-pass").placeholder = "Saved password in use. Type to change it.";
+  mediaSync();
+  renderChecks(info.check, $("#s-check"));
+  renderUnused(info.unused);
+  artCheck(s.image, $("#s-artcheck"), "show");
+}
+
+function renderUnused(list) {
+  const box = $("#s-unused");
+  box.innerHTML = "";
+  if (!list.length) { box.appendChild(el("span", { class: "hint", text: "Every audio file in the audio folder belongs to an episode." })); return; }
+  box.appendChild(el("span", { class: "hint", text: "Files in the audio folder that no episode uses, such as replaced recordings. They are still published until you remove them." }));
+  list.forEach((f) => box.appendChild(el("div", { class: "row" }, [el("span", { class: "t mono", text: f.file }), el("span", { class: "n", text: fmtSize(f.bytes) })])));
+  const b = el("button", { text: "Move these to the trash", class: "danger", type: "button" });
+  b.addEventListener("click", async () => {
+    if (!window.confirm("Move " + list.length + " unused audio file(s) to the trash folder? They leave the site with the next publish.")) return;
+    try { const r = await api("POST", "podcast/unused/trash", { files: list.map((f) => f.file) }); renderUnused(r.unused); toast("Moved " + r.trashed + " file(s) to the trash"); }
+    catch (e) { toast(e.message, "bad"); }
+  });
+  box.appendChild(b);
+}
+
+async function openShow() {
+  const info = await api("GET", "podcast/show");
+  view = { type: "show" };
+  show(SHOW_TPL);
+  $("#md").value = info.markdown;
+  fillShow(info);
+  $$("#left input, #left textarea, #left select").forEach((i) => i.addEventListener(i.type === "checkbox" || i.type === "radio" || i.tagName === "SELECT" ? "change" : "input", markDirty));
+  $$("input[name=s-mode]").forEach((r) => r.addEventListener("change", mediaSync));
+  $("#m-method").addEventListener("change", mediaSync);
+  let artT = null;
+  $("#s-image").addEventListener("input", () => { clearTimeout(artT); artT = setTimeout(() => artCheck($("#s-image").value.trim(), $("#s-artcheck"), "show"), 500); });
+  $("#s-imgup").addEventListener("click", () => pickFile("image/png,image/jpeg", async (f) => {
+    try { $("#s-image").value = await uploadImage(f); markDirty(); artCheck($("#s-image").value, $("#s-artcheck"), "show"); schedulePreview(); } catch (e) { toast(e.message, "bad"); }
+  }));
+  $("#s-copyfeed").addEventListener("click", async () => { if (showInfo.feed_url) { await copyText(showInfo.feed_url); toast("Feed URL copied"); } });
+  $("#s-pingnow").addEventListener("click", async () => {
+    try { const r = await api("POST", "podcast/ping"); $("#s-lastping").textContent = "Pinged just now: " + (r.ping.ok ? "" : "failed, ") + r.ping.message; } catch (e) { toast(e.message, "bad"); }
+  });
+  $("#m-test").addEventListener("click", () => mediaJob("test"));
+  $("#m-clean").addEventListener("click", () => mediaJob("clean"));
+  $("#s-save").addEventListener("click", saveShow);
+  api("GET", "podcast/tools").then((t) => {
+    const v = t.tools;
+    const line = ["ffmpeg", "ffprobe", "rclone"].map((k) => k + ": " + (v[k] ? v[k] : "not found")).join(" · ");
+    const hints = [];
+    if (!v.ffmpeg || !v.ffprobe) hints.push("Without ffmpeg, MP3 and M4A files are used as they are and other formats are refused. " + t.hint_ffmpeg);
+    if (!v.rclone) hints.push("rclone is only needed for an R2, B2 or S3 media host. " + t.hint_rclone);
+    if ($("#s-tools")) $("#s-tools").textContent = line + ". " + hints.join(" ");
+  }).catch(() => {});
+  bindEditor();
+  renderSide();
+  renderPreview();
+}
+
+async function saveShow() {
+  try {
+    const info = await api("PUT", "podcast/show", readShow());
+    setDirty(false);
+    $("#m-pass").value = "";
+    fillShow(info);
+    await refresh();
+    toast("Show settings saved");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+let mjobTimer = null, mjobSeen = 0;
+async function mediaJob(kind, confirmed) {
+  if (mjobTimer) return;
+  const body = { media_target: readMedia(), media_password: $("#m-pass").value, confirm: !!confirmed };
+  try {
+    const r = await api("POST", "podcast/media/" + kind, body);
+    if (r.needs_confirm) { if (window.confirm(r.message)) return mediaJob(kind, true); return; }
+    if (!r.started) { toast(r.message || "Nothing to do"); return; }
+    const log = $("#m-log");
+    log.hidden = false;
+    log.textContent = "";
+    mjobSeen = 0;
+    const poll = async () => {
+      const s = await api("GET", "jobs/publish/status?since=" + mjobSeen);
+      if (s.lines.length && $("#m-log")) { $("#m-log").textContent += s.lines.join("\n") + "\n"; $("#m-log").scrollTop = $("#m-log").scrollHeight; mjobSeen = s.total; }
+      if (s.running) { mjobTimer = setTimeout(poll, 700); return; }
+      mjobTimer = null;
+      toast(s.what + (s.ok ? " finished" : " failed. See the log."), s.ok ? "" : "bad");
+    };
+    poll();
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+/* ---------- directories checklist ---------- */
+const DIR_TPL = `
+<div class="fill">
+  <div class="bar"><strong>Directories</strong><span class="hint" id="dir-count"></span><span class="grow"></span><button id="dir-save" class="primary">Save</button></div>
+  <div class="pad podpad">
+    <div class="bar warn" id="dir-gate" hidden></div>
+    <div style="display:flex;gap:6px;align-items:center"><span>Feed</span><input id="dir-feed" readonly style="flex:1" aria-label="Feed URL"><button id="dir-copy" type="button">Copy feed URL</button></div>
+    <span class="hint">Owner email in the feed: <b id="dir-email"></b>. Most directories send their verification code to it.</span>
+    <p class="hint">Work down the list once. Paste each listing address back in as it goes live; they become the subscribe links on the show page.</p>
+    <div id="dir-rows"></div>
+    <p class="hint">Before the first submission, run the feed through Apple's validation in Podcasts Connect, and add the show by its feed URL in the Apple Podcasts app as a test. Google Podcasts and RadioPublic shut down in 2024; older guides still list them.</p>
+  </div>
+</div>`;
+
+async function openDirs() {
+  const info = await api("GET", "podcast/show");
+  view = { type: "dirs" };
+  show(DIR_TPL);
+  const s = info.show;
+  const fails = info.check.filter((x) => x.level === "fail");
+  const ready = !fails.length && !!s.live_seen;
+  $("#dir-gate").hidden = ready;
+  $("#dir-gate").textContent = fails.length ? "The feed check has " + fails.length + " failure(s); fix them in Show settings first. Directories turn down a feed they cannot use."
+    : "Publish once so the live check can see the feed online. Directories turn down a feed they cannot fetch.";
+  $("#dir-feed").value = info.feed_url || "";
+  $("#dir-email").textContent = s.owner_email || "not set";
+  const count = () => { $("#dir-count").textContent = $$(".dir-done:checked").length + " of " + info.directories.length + " done"; };
+  const box = $("#dir-rows");
+  info.directories.forEach((d, i) => {
+    const done = el("input", { type: "checkbox", class: "dir-done", id: "dir-done-" + d.id });
+    done.checked = !!s.checklist[d.id];
+    const url = el("input", { id: "dir-link-" + d.id, placeholder: "Listing address once it is live, for example https://..." });
+    url.value = s.links[d.id] || "";
+    const open = el("a", { href: d.url, target: "_blank", rel: "noopener", class: "btnlink", text: "Open " + d.where });
+    const copy = el("button", { type: "button", text: "Copy feed URL" });
+    copy.addEventListener("click", async () => { await copyText(info.feed_url); toast("Feed URL copied"); });
+    const card = el("div", { class: "mod-card dir" + (ready ? "" : " grey") }, [
+      el("h4", {}, [done, el("label", { for: done.id, text: (i + 1) + ". " + d.name }), el("span", { class: "hint", text: s.checklist[d.id] ? "done " + s.checklist[d.id] : "" })]),
+      el("span", { class: "hint", text: d.needs }),
+      el("div", { class: "two" }, [open, copy]),
+      el("label", { class: "field" }, [el("span", { text: "Listing address" }), url])]);
+    [done, url].forEach((x) => x.addEventListener(x.type === "checkbox" ? "change" : "input", () => { markDirty(); count(); }));
+    box.appendChild(card);
+  });
+  count();
+  $("#dir-copy").addEventListener("click", async () => { if (info.feed_url) { await copyText(info.feed_url); toast("Feed URL copied"); } });
+  $("#dir-save").addEventListener("click", async () => {
+    const checklist = {}, links = {};
+    info.directories.forEach((d) => { checklist[d.id] = $("#dir-done-" + d.id).checked; links[d.id] = $("#dir-link-" + d.id).value.trim(); });
+    try { await api("PUT", "podcast/checklist", { checklist, links }); setDirty(false); await refresh(); openDirs(); toast("Saved"); }
+    catch (e) { toast(e.message, "bad"); }
+  });
+  renderSide();
+  renderPreview();
+}
+
+/* ---------- publish panel ---------- */
+const PUB_TPL = `
+<div class="fill">
+  <div class="bar">
+    <strong>Publish to a server</strong>
+    <span class="grow"></span>
+    <button id="d-test">Test connection</button>
+    <button id="d-dry">Dry run</button>
+    <button id="d-save">Save settings</button>
+    <button id="d-go" class="primary">Build and publish</button>
+    <button id="d-stop" class="danger" hidden>Stop</button>
+  </div>
+  <div class="pad">
+    <label class="field">Method
+      <select id="d-method">
+        <option value="rsync">rsync over SSH (fastest, only sends what changed)</option>
+        <option value="sftp">SFTP (OpenSSH)</option>
+        <option value="ftps">FTPS (FTP with TLS)</option>
+        <option value="ftp">FTP (unencrypted)</option>
+        <option value="git">git push</option>
+        <option value="folder">Copy to a local folder or mount</option>
+      </select>
+    </label>
+    <div class="two" id="d-hostrow">
+      <label class="field">Host <input id="d-host" placeholder="vps.example.com"></label>
+      <label class="field">Port <input id="d-port" placeholder="22"></label>
+    </div>
+    <div class="two" id="d-userrow">
+      <label class="field">User <input id="d-user" placeholder="deploy"></label>
+      <label class="field">Password <input type="password" id="d-pass" placeholder="Leave blank to use an SSH key"></label>
+    </div>
+    <label id="d-remember"><input type="checkbox" id="d-save_password"> Remember the password in <span class="mono" id="d-secret-path"></span> (plain text, readable by your user only)</label>
+    <label class="field" id="d-pathrow">Path <input id="d-path" placeholder="/var/www/example.com"><span class="hint">The folder on the server that the web server serves. Its contents are replaced by your site.</span></label>
+    <label class="field" id="d-keyrow">SSH key file <input id="d-key" placeholder="Optional, for example ~/.ssh/id_ed25519"></label>
+    <div class="two" id="d-gitrow">
+      <label class="field">Git remote URL <input id="d-remote" placeholder="git@github.com:you/site.git"></label>
+      <label class="field">Branch <input id="d-branch" placeholder="main"></label>
+    </div>
+    <label id="d-mirrorrow"><input type="checkbox" id="d-mirror"> Remove files on the server that are no longer part of the site</label>
+    <label id="d-fullrow"><input type="checkbox" id="d-full_upload"> Upload every file, not only the ones that changed since the last publish</label>
+    <p class="hint" id="d-mirrorhint"></p>
+    <label id="d-srcrow"><input type="checkbox" id="d-include_sources"> Include the hidden source folder</label>
+    <label id="d-passiverow"><input type="checkbox" id="d-passive"> Passive mode (leave this on unless the server says otherwise)</label>
+    <label id="d-tlsrow"><input type="checkbox" id="d-insecure_tls"> Trust a self-signed certificate (FTPS only, weaker)</label>
+    <label id="d-anywayrow" hidden><input type="checkbox" id="d-anyway"> Publish anyway, even when the podcast feed check fails</label>
+    <p class="hint" id="d-podnote" hidden></p>
+    <p class="hint" id="d-tools"></p>
+    <p class="hint" id="d-note"></p>
+  </div>
+  <pre class="log" id="d-log" aria-live="polite" aria-label="Publish log"></pre>
+</div>`;
+
+let pubTimer = null, pubSeen = 0;
+const DEPLOY_BOOLS = ["mirror", "include_sources", "save_password", "passive", "insecure_tls", "full_upload"];
+
+function readDeploy() {
+  const o = { method: $("#d-method").value };
+  ["host", "port", "user", "path", "key", "remote", "branch"].forEach((k) => { o[k] = $("#d-" + k).value.trim(); });
+  DEPLOY_BOOLS.forEach((k) => { o[k] = $("#d-" + k).checked; });
+  return o;
+}
+
+function pubSync(info) {
+  const m = $("#d-method").value;
+  const ssh = m === "rsync" || m === "sftp";
+  const ftp = m === "ftp" || m === "ftps";
+  $("#d-hostrow").hidden = !(ssh || ftp);
+  $("#d-userrow").hidden = m === "folder";
+  $("#d-remember").hidden = m === "folder";
+  $("#d-keyrow").hidden = !(ssh || m === "git");
+  $("#d-gitrow").hidden = m !== "git";
+  $("#d-pathrow").hidden = m === "git";
+  $("#d-srcrow").hidden = m !== "git";
+  $("#d-passiverow").hidden = !ftp;
+  $("#d-tlsrow").hidden = m !== "ftps";
+  $("#d-mirrorrow").hidden = m === "git";
+  $("#d-mirrorhint").hidden = m === "git";
+  $("#d-fullrow").hidden = !(m === "sftp" || ftp || m === "folder");
+  $("#d-mirrorhint").textContent = m === "rsync"
+    ? "rsync mirrors the folder: anything there that is not part of the site is deleted, apart from hidden files. The first publish to a new folder asks before doing that."
+    : "Only files that an earlier publish sent are removed. Nothing else on the server is touched.";
+  const t = info.tools || {};
+  const notes = [];
+  if (ssh && !t[m === "rsync" ? "rsync" : "sftp"]) notes.push((m === "rsync" ? "rsync" : "sftp") + " is not installed on this machine, so this method will not work yet.");
+  if (ssh && !t.sshpass) notes.push("sshpass is not installed, so a password cannot be handed to ssh. Use an SSH key, or install sshpass.");
+  if (m === "git" && !t.git) notes.push("git is not installed on this machine.");
+  if (m === "ftp") notes.push("Plain FTP sends your password and files in the clear. Prefer FTPS or SFTP.");
+  if (m === "rsync") notes.push("rsync only transfers what changed, so repeat publishes are quick.");
+  if (m === "sftp" || ftp || m === "folder") notes.push("Only files that changed since the last publish to this target are sent; the first publish sends everything.");
+  if (m === "git") notes.push("For GitHub or GitLab pages, or a bare repo on your VPS with a post-receive hook that checks the files out into the web root.");
+  if (m === "git" && on("podcast") && pod().media_mode !== "host") notes.push("With the podcast's audio in the site, git keeps every version of every recording forever, and GitHub refuses files over 100 MB. A separate media host (show settings, Media) avoids both.");
+  $("#d-note").textContent = notes.join(" ");
+  $("#d-tools").textContent = "On this machine: " + ["rsync", "ssh", "sftp", "sshpass", "git"]
+    .map((x) => x + (t[x] ? " yes" : " no")).join(", ") + ". The password can also come from the "
+    + info.env_var + " environment variable.";
+}
+
+function pubLog(lines, clear) {
+  const el = $("#d-log");
+  if (!el) return;
+  if (clear) el.textContent = "";
+  lines.forEach((l) => { el.textContent += l + "\n"; });
+  el.scrollTop = el.scrollHeight;
+}
+
+async function pollJob() {
+  try {
+    const r = await api("GET", "publish/status?since=" + pubSeen);
+    if (r.lines.length) { pubLog(r.lines); pubSeen = r.total; }
+    if (r.running) { pubTimer = setTimeout(pollJob, 600); return; }
+    pubTimer = null;
+    pubBusy(false);
+    if (r.ok === true) toast(r.what + " finished");
+    else if (r.ok === false) toast(r.what + " failed. See the log.", "bad");
+  } catch (e) { pubTimer = null; toast(e.message, "bad"); }
+}
+
+function pubBusy(on) {
+  $$("#left .bar button").forEach((b) => { b.disabled = on; });
+  const stop = $("#d-stop");
+  if (stop) { stop.hidden = !on; stop.disabled = false; }
+}
+
+async function pubRun(kind, confirmed) {
+  if (pubTimer) return;
+  const body = readDeploy();
+  body.password = $("#d-pass").value;
+  body.dry = kind === "dry";
+  body.test = kind === "test";
+  body.anyway = !!($("#d-anyway") && $("#d-anyway").checked);
+  if (confirmed) body.confirm_mirror = true;
+  try {
+    const r = await api("POST", "publish", body);
+    if (r.needs_confirm) {
+      if (window.confirm(r.message)) return pubRun(kind, true);
+      return;
+    }
+    pubSeen = 0;
+    pubLog([], true);
+    pubBusy(true);
+    setDirty(false);
+    pollJob();
+  } catch (e) {
+    pubBusy(false);
+    toast(e.message, "bad");
+  }
+}
+
+async function pubStop() {
+  try { $("#d-stop").disabled = true; await api("POST", "publish/cancel"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+async function saveDeploy() {
+  try {
+    const body = readDeploy();
+    body.password = $("#d-pass").value;
+    const r = await api("PUT", "deploy", body);
+    setDirty(false);
+    $("#d-pass").value = "";
+    $("#d-pass").placeholder = r.has_password ? "Saved password in use. Type to change it." : "Leave blank to use an SSH key";
+    toast("Publish settings saved");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+async function openPublish() {
+  const info = await api("GET", "deploy");
+  view = { type: "publish" };
+  $("#left").innerHTML = PUB_TPL;
+  const d = info.deploy;
+  $("#d-method").value = d.method;
+  ["host", "port", "user", "path", "key", "remote", "branch"].forEach((k) => { $("#d-" + k).value = d[k] || ""; });
+  DEPLOY_BOOLS.forEach((k) => { $("#d-" + k).checked = !!d[k]; });
+  $("#d-secret-path").textContent = info.secret_path;
+  if (info.has_password) $("#d-pass").placeholder = "Saved password in use. Type to change it.";
+  $("#d-method").addEventListener("change", () => { pubSync(info); markDirty(); });
+  $$("#left input").forEach((i) => i.addEventListener(i.type === "checkbox" ? "change" : "input", markDirty));
+  $("#d-save").addEventListener("click", saveDeploy);
+  $("#d-go").addEventListener("click", () => pubRun("publish"));
+  $("#d-dry").addEventListener("click", () => pubRun("dry"));
+  $("#d-test").addEventListener("click", () => pubRun("test"));
+  $("#d-stop").addEventListener("click", pubStop);
+  if (on("podcast")) {
+    $("#d-anywayrow").hidden = false;
+    $("#d-podnote").hidden = false;
+    $("#d-podnote").textContent = pod().media_mode === "host"
+      ? "This publish has two stages: first the audio goes to the media host and every episode's audio address is checked, then the site goes out with the podcast feed last. After that the live check looks at the published feed and Podcast Index is pinged when the feed changed."
+      : "The podcast feed goes out last, after the audio it points at. After that the live check looks at the published feed and audio, and Podcast Index is pinged when the feed changed.";
+    if (pod().check_fails) $("#d-podnote").textContent += " The feed check has " + pod().check_fails + " failure(s) right now (see Show settings), so Build and publish stops unless Publish anyway is ticked.";
+  }
+  pubSync(info);
+  renderSide();
+  if (info.running) { pubSeen = 0; pubBusy(true); pollJob(); }
+}
+
+/* ---------- top bar ---------- */
+function themeLabel() { $("#b-theme").textContent = document.documentElement.getAttribute("data-theme") === "dark" ? "Light mode" : "Dark mode"; }
+
+async function act(name) {
+  if (name === "theme") {
+    const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", next);
+    try { localStorage.setItem("siteforge-theme", next); } catch (e) { /* ignore */ }
+    themeLabel();
+    return;
+  }
+  if (name === "quit") {
+    if (!(await guard())) return;
+    await api("POST", "quit");
+    document.body.innerHTML = "<p style='padding:40px;font:16px system-ui'>__APP__ has stopped. You can close this tab.</p>";
+    return;
+  }
+  await go(async () => {
+    const fns = {
+      "new-page": newPage, "new-post": () => openPost(null), "new-article": () => openArticle(null, null, null),
+      "new-story": newStory, "new-chapter": () => openChapter(null, null, null), "new-episode": () => openEpisode(null),
+      structure: openStructure, menu: openMenu,
+      css: openCss, settings: openSettings, publish: openPublish, switch: chooseFolder,
+      rescan: async () => {
+        const r = await api("POST", "rescan");
+        await refresh();
+        const bits = Object.entries(r).filter(([, v]) => v).map(([k, v]) => v + " " + k.replace(/_/g, " "));
+        toast(bits.length ? bits.join(", ") : "No new files found. Site rebuilt.");
+        schedulePreview();
+      },
+    };
+    if (fns[name]) await fns[name]();
+  });
+}
+
+/* ---------- folders, setup and startup ---------- */
+async function openFolder(path, ok, setup) {
+  const r = await api("POST", "open", { path, confirm: !!ok, setup });
+  if (r.needs_confirm) { if (window.confirm(r.message)) return openFolder(path, true, setup); return; }
+  if (r.needs_setup) { showSetup(r.folder); return; }
+  S = r.state;
+  await boot();
+}
+
+async function chooseFolder(inputEl) {
+  const r = await api("POST", "pick-folder");
+  let path = r.path;
+  if (!r.available) path = window.prompt("Folder path for your site", (S && S.folder) || (inputEl && inputEl.value) || "");
+  if (!path) return;
+  if (inputEl) inputEl.value = path;
+  await openFolder(path, false);
+}
+
+function showWelcome() {
+  $("#workspace").hidden = true; $("#setup").hidden = true; $("#welcome").hidden = false;
+  $("#w-path").value = S.last || S.suggest || "";
+  $("#w-browse").onclick = () => chooseFolder($("#w-path")).catch((e) => toast(e.message, "bad"));
+  $("#w-open").onclick = () => openFolder($("#w-path").value, false).catch((e) => toast(e.message, "bad"));
+}
+
+function showSetup(folder) {
+  $("#workspace").hidden = true; $("#welcome").hidden = true; $("#setup").hidden = false;
+  $("#u-folder").textContent = folder;
+  $("#u-title").value = folder.split("/").filter(Boolean).pop().replace(/[-_]+/g, " ").replace(/^./, (c) => c.toUpperCase());
+  const sel = $("#u-theme");
+  if (!sel.options.length) {
+    const groups = {};
+    (S.themes || []).forEach((t) => {
+      if (!groups[t.group]) { groups[t.group] = el("optgroup", { label: t.group + " themes" }); sel.appendChild(groups[t.group]); }
+      groups[t.group].appendChild(el("option", { value: t.id, text: t.label }));
+    });
+  }
+  $("#u-structure").hidden = !!S.only;
+  $("#u-importbox").hidden = !!S.only;
+  if (S.only) $("input[name=u-home][value=" + S.only + "]").checked = true;
+  const pickTheme = () => { sel.value = { page: "site-clean", blog: "site-clean", wiki: "wiki-classic", library: "book-paperback", podcast: "site-clean" }[$("input[name=u-home]:checked").value]; };
+  $$("input[name=u-home]").forEach((r) => { r.onchange = pickTheme; });
+  pickTheme();
+  $("#u-detect").onclick = async () => {
+    try {
+      const r = await api("POST", "detect-import", { path: $("#u-import").value });
+      $("#u-detected").textContent = "Found a " + { sitegen: "SiteGen", wikigen: "WikiGen", storygen: "StoryGen", podcastgen: "PodcastGen" }[r.kind] + " site: " + r.title;
+      $("input[name=u-home][value=" + r.home + "]").checked = true;
+      pickTheme();
+      $("#u-rootrow").hidden = r.home === "page";
+    } catch (e) { $("#u-detected").textContent = e.message; }
+  };
+  $("#u-import-browse").onclick = async () => { const r = await api("POST", "pick-folder"); if (r.path) { $("#u-import").value = r.path; $("#u-detect").onclick(); } };
+  $("#u-cancel").onclick = () => { S = S || {}; showWelcome(); };
+  $("#u-create").onclick = async () => {
+    const home = $("input[name=u-home]:checked").value;
+    const setup = { title: $("#u-title").value, home, theme: sel.value, modules: $$(".u-mod:checked").map((c) => c.value),
+      import: $("#u-import").value.trim(), root_mount: !$("#u-rootrow").hidden && $("#u-root").checked };
+    try { await openFolder(folder, true, setup); } catch (e) { toast(e.message, "bad"); }
+  };
+}
+
+async function boot() {
+  $("#welcome").hidden = true; $("#setup").hidden = true; $("#workspace").hidden = false;
+  setDirty(false);
+  view = { type: "none" };
+  renderTop();
+  renderSide();
+  await openHome();
+}
+
+$$("#top [data-act]").forEach((b) => b.addEventListener("click", () => act(b.dataset.act)));
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+    e.preventDefault();
+    if (view.type === "publish") return;
+    const saveBtn = view.type === "post" ? $("#p-save") : $("#left .bar .primary");
+    if (saveBtn && !saveBtn.disabled) saveBtn.click();
+  }
+});
+window.addEventListener("beforeunload", (e) => { if (dirty) { e.preventDefault(); e.returnValue = ""; } });
+themeLabel();
+
+(async function init() {
+  try {
+    S = await api("GET", "state");
+    if (S.folder) await boot();
+    else if (S.pending) showSetup(S.pending);
+    else showWelcome();
+  } catch (e) { toast(e.message, "bad"); }
+})();
+
+</script>
+</body>
+</html>
+'''
+
+
+def headless_publish(folder):
+    """Build and publish without the editor, with the saved settings: for a cron job or a
+    systemd timer, so scheduled episodes go out after their date. Returns the exit code."""
+    if not folder:
+        print("--publish needs the site folder, for example: %s.py ~/my-site --publish" % APP.lower(), file=sys.stderr)
+        return 2
+    root = Path(folder).expanduser().resolve()
+    if not (root / META_DIR / "config.json").is_file():
+        print("There is no %s site in %s." % (APP, root), file=sys.stderr)
+        return 2
+    try:
+        site = Site(root)
+        site.load()
+        CURRENT["site"] = site
+        if not site.cfg.get("deploy"):
+            print("Set up publishing once in the editor (Publish, Save settings) first.", file=sys.stderr)
+            return 2
+        r = start_publish(site, {})
+    except ApiError as e:
+        print("Stopped: %s" % e, file=sys.stderr)
+        return 1
+    if r.get("needs_confirm"):
+        print(r["message"], file=sys.stderr)
+        print("Publish once from the editor to confirm that, then run this again.", file=sys.stderr)
+        return 2
+    seen = 0
+    while True:
+        st = job_status(seen)
+        for line in st["lines"]:
+            print(line, flush=True)
+        seen = st["total"]
+        if not st["running"]:
+            break
+        time.sleep(0.5)
+    return 0 if st["ok"] else 1
+
+
+def main():
+    what = ("a podcast site: a show page, episode pages and the feed podcast apps read" if ONLY_MODULE else
+            "one site generator for pages, a blog, a wiki, a story library and a podcast")
+    ap = argparse.ArgumentParser(description="%s: %s." % (APP, what))
+    ap.add_argument("folder", nargs="?", help="site folder to open (created if it does not exist)")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="port for the local editor (default %d)" % DEFAULT_PORT)
+    ap.add_argument("--no-browser", action="store_true", help="do not open a browser tab automatically")
+    ap.add_argument("--publish", action="store_true",
+                    help="build the site in FOLDER and publish it with its saved settings, print the log and exit; "
+                         "exits non-zero on failure (for a cron job or systemd timer)")
+    args = ap.parse_args()
+    if args.publish:
+        sys.exit(headless_publish(args.folder))
+
+    if args.folder:
+        try:
+            r = open_site(args.folder)
+            if r.get("needs_confirm"):
+                PENDING["folder"] = str(Path(args.folder).expanduser().resolve())
+                print("That folder has files %s did not create. Confirm in the editor to use it." % APP)
+            elif r.get("needs_setup"):
+                print("New site: finish the setup in your browser.")
+        except ApiError as e:
+            print("Could not open folder:", e)
+    else:
+        last = last_folder()
+        if last and (Path(last) / META_DIR / "config.json").exists():
+            try:
+                open_site(last)
+            except Exception as e:  # noqa: BLE001
+                print("Could not reopen the last site:", e)
+
+    httpd = None
+    for port in (args.port, 0):
+        try:
+            httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+            break
+        except OSError:
+            continue
+    if httpd is None:
+        sys.exit("Could not start the local server.")
+    httpd.daemon_threads = True
+    SERVER["httpd"] = httpd
+    SERVER["port"] = httpd.server_address[1]
+    url = "http://127.0.0.1:%d/" % SERVER["port"]
+    print("%s is running at %s (Ctrl+C to stop)" % (APP, url))
+    if not args.no_browser:
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+
+
+if __name__ == "__main__":
+    main()

@@ -3709,25 +3709,49 @@ def resolve_password(site, dep, given):
 
 # ---- the methods
 
-def deploy_rsync(dep, password, staged, dry):
-    if not shutil.which("rsync"):
-        raise ApiError("rsync is not installed on this machine. Install it, or choose another method.")
+def rsync_commands(dep, password, staged, dry, last=(), exclude=()):
+    """The rsync command lines for a publish: one run, or two when some files must go last.
+    Run 1 excludes those files and the excluded folders, and rsync never deletes an excluded
+    file on the receiver, so mirror mode leaves them alone. Run 2 sends only the held-back
+    files and never deletes anything."""
     ssh = ["ssh"] + ssh_opts(dep, password)
     # -r -t -z without -l or -p: no symlinks, no local permission bits; --chmod gives sane web
     # permissions. The protect filter keeps server-side dotfiles (.htaccess, .well-known) safe
     # from --delete.
-    cmd = ["rsync", "-rtz", "--human-readable", "--itemize-changes", "--timeout=120",
-           "--chmod=D755,F644", "--filter=P .*"]
+    base = ["rsync", "-rtz", "--human-readable", "--itemize-changes", "--timeout=120",
+            "--chmod=D755,F644", "--filter=P .*"]
     if dry:
-        cmd.append("--dry-run")
-    if dep.get("mirror"):
-        cmd.append("--delete")
-    cmd += ["-e", " ".join(shlex.quote(x) for x in ssh), "--",
+        base.append("--dry-run")
+    tail = ["-e", " ".join(shlex.quote(x) for x in ssh), "--",
             str(staged) + "/", "%s:%s/" % (remote_target(dep), server_path(dep).rstrip("/"))]
-    cmd, env = with_sshpass(cmd, password)
-    code = run_stream(cmd, env=env)
-    if code != 0:
-        raise ApiError("rsync exited with code %d. The log above says why." % code)
+    first = list(base)
+    if dep.get("mirror"):
+        first.append("--delete")
+    first += ["--exclude=/" + f for f in last] + ["--exclude=/" + e.strip("/") + "/" for e in exclude]
+    cmds = [first + tail]
+    if last:
+        inc = []
+        for f in last:
+            parts = f.split("/")
+            for i in range(1, len(parts)):
+                d = "--include=/" + "/".join(parts[:i]) + "/"
+                if d not in inc:
+                    inc.append(d)
+            inc.append("--include=/" + f)
+        cmds.append(base + inc + ["--exclude=*"] + tail)
+    return cmds
+
+
+def deploy_rsync(dep, password, staged, dry, last=(), exclude=()):
+    if not shutil.which("rsync"):
+        raise ApiError("rsync is not installed on this machine. Install it, or choose another method.")
+    for i, cmd in enumerate(rsync_commands(dep, password, staged, dry, last, exclude)):
+        if i:
+            job_say("Now the files that go last: %s" % ", ".join(last))
+        cmd, env = with_sshpass(cmd, password)
+        code = run_stream(cmd, env=env)
+        if code != 0:
+            raise ApiError("rsync exited with code %d. The log above says why." % code)
 
 
 def sftp_quote(s):
@@ -3907,7 +3931,7 @@ def git_cmd(*args):
             "-c", "protocol.ext.allow=never", "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60"] + list(args)
 
 
-def deploy_git(site, dep, password, dry):
+def deploy_git(site, dep, password, dry, exclude=()):
     if not shutil.which("git"):
         raise ApiError("git is not installed on this machine.")
     branch = dep.get("branch") or "main"
@@ -3923,13 +3947,19 @@ def deploy_git(site, dep, password, dry):
     ignore = site.root / ".gitignore"
     current = read_text(ignore)
     if dep.get("include_sources"):
-        wanted = [META_DIR + "/secret.json", META_DIR + "/secret.json.tmp", META_DIR + "/published.json"]
+        wanted = [META_DIR + "/secret.json", META_DIR + "/secret.json.tmp", META_DIR + "/published.json",
+                  META_DIR + "/media-secret.json", META_DIR + "/staging/", META_DIR + "/podcast/incoming/"]
     else:
         wanted = [META_DIR + "/"]
+    wanted += ["/" + e.strip("/") + "/" for e in exclude]
     add = [w for w in wanted if w not in current.split("\n")]
     if add:
         write_text(ignore, (current.rstrip("\n") + "\n" if current.strip() else "") + "\n".join(add) + "\n")
-    run_stream(git_cmd("rm", "-r", "-q", "--cached", "--ignore-unmatch", META_DIR + "/secret.json"), cwd=root, env=env)
+    run_stream(git_cmd("rm", "-r", "-q", "--cached", "--ignore-unmatch", META_DIR + "/secret.json",
+                       META_DIR + "/media-secret.json"), cwd=root, env=env)
+    for e in exclude:
+        # Ignoring a folder does not untrack files already committed, so take them out of the index.
+        run_stream(git_cmd("rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", e.strip("/")), cwd=root, env=env)
     if run_stream(git_cmd("add", "-A"), cwd=root, env=env) != 0:
         raise ApiError("git add failed.")
     if dry:
@@ -3986,16 +4016,37 @@ def deploy_folder(site, dep, files, staged, dry, send=None):
 
 
 def run_deploy(site, dep, password, dry):
+    """Send the site. A site object may offer publish_plan(dep, dry), a dict with any of: last
+    (files sent after everything else, such as a podcast feed that must not point at audio that
+    is not up yet), exclude (folders left out and left alone on the server), before (run after
+    staging, ahead of the transfer) and after (run once a real publish succeeded)."""
     method = dep["method"]
+    plan_of = getattr(site, "publish_plan", None)
+    plan = (plan_of(dep, dry) if plan_of else None) or {}
+    exclude = tuple(plan.get("exclude") or ())
     if method == "git":
-        deploy_git(site, dep, password, dry)
+        if plan.get("before"):
+            plan["before"]()
+        deploy_git(site, dep, password, dry, exclude)
+        if plan.get("after") and not dry:
+            plan["after"]()
         return
     files, skipped = local_files(site.root)
     for s in skipped:
         job_say("Skipped %s (a symlink or special file, which is never published)" % s)
+    if exclude:
+        kept = [f for f in files if not f.startswith(exclude)]
+        if len(kept) < len(files):
+            job_say("%d file(s) under %s are left out here; they go to their own host." % (len(files) - len(kept),
+                                                                                          ", ".join(exclude)))
+        files = kept
+    last = [f for f in (plan.get("last") or ()) if f in files]
+    files = [f for f in files if f not in last] + last
     job_say("%d file(s) to publish from %s" % (len(files), site.root))
     staged, files = stage(site, files)
     try:
+        if plan.get("before"):
+            plan["before"]()
         sigs = file_sigs(staged, files)
         send = files
         if method in ("sftp", "ftp", "ftps", "folder"):
@@ -4004,7 +4055,7 @@ def run_deploy(site, dep, password, dry):
                 job_say("%d of them changed since the last publish to this target; only those are sent. "
                         "Tick \"Upload every file\" to send them all." % len(send))
         if method == "rsync":
-            deploy_rsync(dep, password, staged, dry)
+            deploy_rsync(dep, password, staged, dry, last, exclude)
         elif method == "sftp":
             deploy_sftp(site, dep, password, files, staged, dry, send)
         elif method in ("ftp", "ftps"):
@@ -4017,6 +4068,8 @@ def run_deploy(site, dep, password, dry):
         shutil.rmtree(staged, ignore_errors=True)
     if not dry:
         save_published(site, dep, files, sigs)
+        if plan.get("after"):
+            plan["after"]()
 
 
 def remote_dir_test(path):
@@ -4075,6 +4128,10 @@ def start_publish(site, d, dry=False, test=False):
     with JOB_LOCK:
         if JOB["running"]:
             raise ApiError("A publish is already running.")
+    blocker = getattr(site, "publish_blocker", None)
+    reason = blocker() if blocker else ""
+    if reason:
+        raise ApiError(reason)
     dep = validate_deploy(clean_deploy(d, site.cfg.get("deploy")))
     if dep["method"] == "folder":
         folder_dest(site, dep)
@@ -4096,11 +4153,19 @@ def start_publish(site, d, dry=False, test=False):
         store_password(site, dep, given, dep.get("save_password"))
     if not test:
         site.build()
+    # A site can hold the publish back when its own checks fail (the podcast feed check does).
+    # A dry run still goes ahead, and "anyway" overrides it.
+    check = getattr(site, "publish_check", None)
+    problem = check() if (check and not test) else ""
+    if problem and not dry and not d.get("anyway"):
+        raise ApiError(problem)
     what = "Testing the connection" if test else ("Dry run" if dry else "Publishing")
     with JOB_LOCK:
         JOB.update(running=True, ok=None, what=what, lines=[], proc=None, cancel=False,
                    started=datetime.datetime.now().isoformat(" ", "seconds"))
     job_say("%s (%s) at %s" % (what, dep["method"], JOB["started"]))
+    if problem:
+        job_say("Warning: " + problem)
 
     def work():
         ok = False

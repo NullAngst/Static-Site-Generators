@@ -19,14 +19,16 @@ REPO = Path(__file__).resolve().parent.parent
 TOOLS = ["siteforge.py", "sitegen.py", "wikigen.py", "storygen.py", "podcastgen.py"]
 
 # Each tool has its own version of these: its name and folders, its page types, its editor,
-# its API, its site class, and a few helpers that grew tool-specific behavior.
+# its API, its site class, and a few helpers that grew tool-specific behavior. podcastgen.py is
+# generated from siteforge.py (tools/make_podcastgen.py), so the two differ only in APP,
+# META_DIR, CONFIG_HOME, ONLY_MODULE and DEFAULT_PORT.
 ALLOWED_TO_DIFFER = {
-    "ABOUT_MD", "APP", "BASE_CSS", "CONFIG_HOME", "CSS_HEADER", "HOME_MD", "Handler", "LAYOUTS",
+    "ABOUT_MD", "APP", "BASE_CSS", "CONFIG_HOME", "CSS_HEADER", "DEFAULT_PORT", "HOME_MD", "Handler", "LAYOUTS",
     "LAYOUT_SHARED_CSS", "LOGO_CSS", "META_DIR", "Markdown", "OWN_GROUP", "PAGE_HELP", "PAGE_MARK",
     "PRIVACY_MD", "RESERVED_SLUGS", "SECURE_TOOL_CSS", "SITE_BOOLS", "STATUSES", "Site", "THEMES",
     "UI_HTML", "VAR_CONSTS", "VAR_ORDER", "_layout_css_base", "_theme_id", "api", "app_state",
     "card_image", "clean_tags", "count_words", "css_stub", "default_cfg", "default_css", "layout_css",
-    "layout_list", "main", "nice_words", "open_site", "page_scripts", "plain_text", "rename_path",
+    "layout_list", "main", "nice_words", "ONLY_MODULE", "open_site", "page_scripts", "plain_text", "rename_path",
     "root_block", "strip_title_h1", "title_from_name",
 }
 
