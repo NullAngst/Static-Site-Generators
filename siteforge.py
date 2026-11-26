@@ -2832,6 +2832,11 @@ class SiteBase:
         self.cfg["home"] = home
         if home in ROOT_MOUNTABLE and setup.get("root_mount"):
             self.cfg["modules"][home]["mount"] = ""
+        if ONLY_MODULE:
+            # The module is the homepage, so a second menu entry for it would point at the same page.
+            for n in self.cfg["nav"]:
+                if n.get("type") == "module":
+                    n["visible"] = False
         self.normalize()
         self.save_cfg()
         self.build()
@@ -5942,7 +5947,7 @@ def probe_audio(path):
             return 0.0
 
         return {"kind": kind, "codec": codec, "duration": num(fmt.get("duration"), a.get("duration")),
-                "kbps": int(num(fmt.get("bit_rate"), a.get("bit_rate")) // 1000),
+                "kbps": int(num(a.get("bit_rate"), fmt.get("bit_rate")) // 1000),
                 "sample_rate": int(num(a.get("sample_rate"))), "channels": int(num(a.get("channels"))), "probed": True}
     kind = sniff_audio(path)
     if not kind:
@@ -6064,7 +6069,7 @@ def art_problems(info, what):
 def parse_transcript(text, ext):
     """Cues from a WebVTT or SubRip file as (speaker, words). Raises ApiError when the file is
     not the format its name says."""
-    text = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("﻿")
+    text = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
     if ext == ".vtt" and not text.startswith("WEBVTT"):
         raise ApiError("A .vtt transcript must start with WEBVTT.")
     cues = []
@@ -6265,13 +6270,6 @@ def _pos_int(v):
     except (TypeError, ValueError):
         return None
     return n if n > 0 else None
-
-
-def _clamp_int(v, lo, hi, default):
-    try:
-        return max(lo, min(hi, int(v)))
-    except (TypeError, ValueError):
-        return default
 
 
 def clean_categories(raw):
@@ -6818,7 +6816,9 @@ class PodcastMixin:
                         '%s%s%s%s</div>\n</section>' % (art, title, meta, summ, self.player_html(c, e, prefix)))
             if style == "cards":
                 img = card_image(e.get("art") or show["image"], prefix)
-                over = '<span class="pod-thumb-num">%s</span>' % esc(label) if label and not e.get("art") else ""
+                over = '<span class="pod-thumb-num">%s</span>' % esc(label) if label and not e.get("art") and img else ""
+                if over:
+                    title = '<h3><a href="%s">%s</a>%s</h3>\n' % (href, esc(e["title"]), self.ep_badge(e))
                 thumb = ('<a class="pod-thumb" href="%s" tabindex="-1" aria-hidden="true"><img src="%s" alt="" loading="lazy">%s</a>\n'
                          % (href, attr(img), over)) if img else ""
                 return '<li class="pod-ep%s">\n%s<div class="pod-body">\n%s%s%s</div>\n</li>' % (
@@ -6829,6 +6829,9 @@ class PodcastMixin:
         lead = ""
         if style == "spotlight" and not serial:
             lead, eps = entry(eps[0], featured=True) + "\n", eps[1:]
+            if not eps:
+                return lead
+            head = '<h2 class="pod-episodes-title">Earlier episodes</h2>\n'
         ul = '<ul class="pod-episodes%s">\n%s\n</ul>' % (" cards" if style == "cards" else (" archive" if style == "archive" else ""), "%s")
         seasons = any(e.get("season") for e in eps)
         if style == "archive" or (serial and seasons):
@@ -7599,7 +7602,7 @@ class PodcastMixin:
         old = (e.get("transcript") or {}).get("file")
         if old and old != fname:
             self.to_trash(folder / old)
-        write_text(folder / fname, text.replace("\r\n", "\n").lstrip("﻿"))
+        write_text(folder / fname, text.replace("\r\n", "\n").lstrip("\ufeff"))
         e["transcript"] = {"file": fname, "type": TRANSCRIPT_TYPES[ext], "cues": len(cues)}
         self.save_cfg()
         self.build()
@@ -9813,6 +9816,7 @@ ul.checks li.ok { border-left-color: var(--ok); }
 .mdbox .code { min-height: 170px; resize: vertical; }
 .btnlink { display: inline-flex; align-items: center; justify-content: center; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px; color: var(--accent); text-decoration: none; background: var(--btn-bg); }
 .mod-card.grey { opacity: 0.55; }
+#dir-rows { display: flex; flex-direction: column; gap: 10px; }
 .sub-fields { display: flex; flex-direction: column; gap: 8px; padding-left: 12px; border-left: 2px solid var(--line); }
 #e-player { width: 100%; }
 #e-progress progress { width: 60%; }
@@ -11701,10 +11705,13 @@ function openStructure() {
   renderSide();
 }
 
+let importKind = "";
 async function checkImport() {
   $("#x-go").disabled = true;
+  importKind = "";
   try {
     const r = await api("POST", "detect-import", { path: $("#x-import").value });
+    importKind = r.kind;
     $("#x-found").textContent = "Found a " + { sitegen: "SiteGen", wikigen: "WikiGen", storygen: "StoryGen", podcastgen: "PodcastGen" }[r.kind] + " site: " + r.title;
     $("#x-go").disabled = false;
   } catch (e) { $("#x-found").textContent = e.message; }
@@ -11713,7 +11720,10 @@ async function checkImport() {
 async function runImport() {
   if (!(await guard())) return;
   try {
-    const r = await api("POST", "import", { path: $("#x-import").value, settings: $("#x-settings").checked });
+    const body = { path: $("#x-import").value, settings: $("#x-settings").checked };
+    if (importKind === "podcastgen" && window.confirm("Make the podcast the homepage and serve it from the site root? Then every address it had stays the same, its feed included. Cancel keeps it under /podcast/, and the old feed address gets a copy of the feed that tells apps to move."))
+      Object.assign(body, { home: "podcast", root_mount: true });
+    const r = await api("POST", "import", body);
     S = r.state; renderTop(); renderSide(); setDirty(false);
     toast(r.notes.join("\n"));
     openStructure();
@@ -11798,6 +11808,7 @@ async function pollMedia() {
     if (view.type === "episode" && view.slug) {
       const d = await api("GET", "podcast/episodes/" + enc(view.slug));
       syncAudio(d);
+      schedulePreview();
       if (art && art.target === "episode" && r.ok) { $("#e-art").value = art.path; artCheck($("#e-art").value, $("#e-artcheck"), "episode"); schedulePreview(); }
     }
     if (view.type === "show" && art && art.target === "show" && r.ok) { $("#s-image").value = art.path; artCheck(art.path, $("#s-artcheck"), "show"); schedulePreview(); }
@@ -11911,9 +11922,9 @@ function renderChapters() {
     url.addEventListener("input", () => { ch.url = url.value; markDirty(); });
     const btn = (text, fn, label) => { const b = el("button", { text, type: "button", title: label, "aria-label": label }); b.addEventListener("click", () => { fn(); renderChapters(); markDirty(); }); return b; };
     row.append(start, title, url,
-      btn("↑", () => { if (i > 0) epChapters = moved(epChapters, i, i - 1); }, "Move up"),
-      btn("↓", () => { if (i < epChapters.length - 1) epChapters = moved(epChapters, i, i + 1); }, "Move down"),
-      btn("×", () => { epChapters.splice(i, 1); }, "Remove"));
+      btn("\u2191", () => { if (i > 0) epChapters = moved(epChapters, i, i - 1); }, "Move up"),
+      btn("\u2193", () => { if (i < epChapters.length - 1) epChapters = moved(epChapters, i, i + 1); }, "Move down"),
+      btn("\u00d7", () => { epChapters.splice(i, 1); }, "Remove"));
     box.appendChild(row);
   });
 }
@@ -11923,7 +11934,7 @@ function chapterVals() { return epChapters.filter((c) => String(c.title).trim())
 function pasteChapters(text) {
   const out = [];
   text.split(/\r?\n/).forEach((line) => {
-    const m = line.trim().match(/^\(?((?:\d+:)?\d{1,2}:\d{2})\)?\s*[-–:.]?\s+(.+)$/);
+    const m = line.trim().match(/^\(?((?:\d+:)?\d{1,2}:\d{2})\)?\s*[-\u2013:.]?\s+(.+)$/);
     if (m) out.push({ start: m[1], title: m[2].trim(), url: "" });
   });
   return out;
@@ -12042,7 +12053,7 @@ function syncAudio(d) {
     if (a.kbps) bits.push(a.kbps + " kbps");
     if (a.channels) bits.push(a.channels === 1 ? "mono" : (a.channels === 2 ? "stereo" : a.channels + " channels"));
     if (a.lufs !== null && a.lufs !== undefined) bits.push(a.lufs + " LUFS");
-    box.appendChild(el("div", { text: bits.join(" · ") }));
+    box.appendChild(el("div", { text: bits.join(" \u00b7 ") }));
   }
   if (m.message) box.appendChild(el("div", { class: "warnline", text: m.message }));
   const p = $("#e-player");
@@ -12256,7 +12267,7 @@ function renderFunding() {
     u.value = f.url; t.value = f.text;
     u.addEventListener("input", () => { f.url = u.value; markDirty(); });
     t.addEventListener("input", () => { f.text = t.value; markDirty(); });
-    const rm = el("button", { text: "×", type: "button", "aria-label": "Remove" });
+    const rm = el("button", { text: "\u00d7", type: "button", "aria-label": "Remove" });
     rm.addEventListener("click", () => { funding.splice(i, 1); renderFunding(); markDirty(); });
     row.append(u, t, rm);
     box.appendChild(row);
@@ -12388,7 +12399,7 @@ async function openShow() {
   $("#s-save").addEventListener("click", saveShow);
   api("GET", "podcast/tools").then((t) => {
     const v = t.tools;
-    const line = ["ffmpeg", "ffprobe", "rclone"].map((k) => k + ": " + (v[k] ? v[k] : "not found")).join(" · ");
+    const line = ["ffmpeg", "ffprobe", "rclone"].map((k) => k + ": " + (v[k] ? v[k] : "not found")).join(" \u00b7 ");
     const hints = [];
     if (!v.ffmpeg || !v.ffprobe) hints.push("Without ffmpeg, MP3 and M4A files are used as they are and other formats are refused. " + t.hint_ffmpeg);
     if (!v.rclone) hints.push("rclone is only needed for an R2, B2 or S3 media host. " + t.hint_rclone);

@@ -19,10 +19,19 @@ jobs:
         with:
           python-version: "3.x"
 
+      # ffmpeg and ffprobe let the podcast media tests run instead of being skipped.
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
       # Everything runs through python3, so it does not matter that files uploaded through
       # GitHub's web page lose their executable bit.
       - name: Compile every tool
-        run: python3 -W error::DeprecationWarning -m py_compile *.py
+        run: python3 -W error::DeprecationWarning -m py_compile *.py tools/*.py
+
+      - name: podcastgen.py matches siteforge.py
+        run: python3 tools/make_podcastgen.py --check
 
       - name: Shared code has not drifted
         run: python3 tools/check_shared.py

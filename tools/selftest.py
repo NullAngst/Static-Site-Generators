@@ -449,7 +449,7 @@ class PodcastFeedTests(PodcastCase):
         for tag in ("title", "link", "description", "language", "itunes:author", "itunes:image", "itunes:explicit",
                     "itunes:category", "itunes:owner/itunes:email", "itunes:type", "podcast:guid", "podcast:locked"):
             self.assertIsNotNone(ch.find(tag, NS), tag)
-        self.assertEqual(ch.find("copyright").text, "© %d Example Show" % time.localtime().tm_year)
+        self.assertEqual(ch.find("copyright").text, "\u00a9 %d Example Show" % time.localtime().tm_year)
         item = ch.find("item")
         for tag in ("title", "link", "guid", "pubDate", "description", "content:encoded", "enclosure",
                     "itunes:duration", "itunes:episode", "itunes:season", "itunes:episodeType", "podcast:chapters"):
@@ -524,7 +524,7 @@ class PodcastFeedTests(PodcastCase):
 
     def test_descriptions_are_cut_at_apple_limits(self):
         mod, site = self.show()
-        long = "\n\n".join("Paragraph %d with é accents and [a link](https://example.com/%d)." % (i, i) for i in range(300))
+        long = "\n\n".join("Paragraph %d with \u00e9 accents and [a link](https://example.com/%d)." % (i, i) for i in range(300))
         site.save_show({"markdown": long})
         self.episode(site, "Long notes", "2026-01-01T06:00:00+00:00", notes=long)
         ch = ET.fromstring(self.feed(site).encode("utf-8")).find("channel")
