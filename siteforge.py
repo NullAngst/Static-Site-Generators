@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SiteForge: one local site generator for pages, a blog, a wiki and a story library.
+SiteForge: one local site generator for pages, a blog, a wiki, a story library and a podcast.
 
 Run it:
     python3 siteforge.py                opens the last site you used
@@ -13,10 +13,11 @@ it builds is HTML and CSS, plus two kinds of script: the wiki's optional search.
 lines of inline script on pages with a side menu or a dropdown menu, which remember "Hide menu"
 between pages and close dropdowns when you click elsewhere. Both menus work without it.
 
-A site always has pages. On top of that you can switch on any of three modules:
+A site always has pages. On top of that you can switch on any of four modules:
     Blog      posts, drafts, tags, a feed page and RSS
     Wiki      sections of articles, a sidebar with dropdowns, search, [[wiki links]], callouts
     Library   short stories and serials with chapters, covers, genres and reading typography
+    Podcast   a show page, episode pages with a player, and the RSS feed podcast apps read
 The homepage is either a normal page or the landing page of one module.
 
 Folder layout (inside the site folder you choose):
@@ -24,14 +25,19 @@ Folder layout (inside the site folder you choose):
     blog/                           posts, tag pages, blog/rss.xml
     wiki/                           wiki sections and articles, wiki/search.js
     stories/                        stories, chapters, genre pages, stories/rss.xml
+    podcast/                        show page, episodes/, feed.xml, audio/, transcripts/, chapters/
     rss, rss.xml                    one feed of new posts and chapters, when feeds are on
     style.css                       your stylesheet (edited through "Edit CSS", never overwritten)
     assets/                         images you add, and fonts/ for uploaded fonts
     .siteforge/                     your markdown sources and settings
 
-The wiki or the library can instead be mounted at the site root when it is the homepage, which
-reproduces the URLs WikiGen and StoryGen used. Existing SiteGen, WikiGen and StoryGen folders can
-be imported from the Site structure view.
+The wiki, the library or the podcast can instead be mounted at the site root when it is the
+homepage, which reproduces the URLs WikiGen, StoryGen and PodcastGen use. Existing SiteGen, WikiGen,
+StoryGen and PodcastGen folders can be imported from the Site structure view.
+
+ffmpeg, ffprobe and rclone are optional. The podcast uses them to measure, normalize and encode
+audio and to upload it to a separate media host; without them MP3 and M4A files are used as they
+are. Run headless with --publish to build and publish with the saved settings, for a cron job.
 
 Do not hand-edit the generated .html files; they are rewritten on every save.
 """
@@ -41,7 +47,9 @@ import argparse
 import copy
 import datetime
 import email.utils
+import filecmp
 import ftplib
+import hashlib
 import json
 import mimetypes
 import os
@@ -54,17 +62,26 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import unicodedata
+import urllib.error
+import urllib.request
+import uuid
 import webbrowser
+import xml.etree.ElementTree as ET
 from html import escape as _escape, unescape as _unescape
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 APP = "SiteForge"
 META_DIR = ".siteforge"
+# PodcastGen is this file with these set (tools/make_podcastgen.py writes it): one module, served
+# from the site root, and its own port.
+ONLY_MODULE = None
+DEFAULT_PORT = 8768
 TOKEN = secrets.token_urlsafe(24)
 LOCK = threading.RLock()
 CURRENT = {"site": None}
@@ -73,13 +90,16 @@ CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"
 IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif"}
 MAX_UPLOAD = 25 * 1024 * 1024
 SEARCH_TEXT_LIMIT = 8000
-MODULES = ("blog", "wiki", "library")
-MODULE_NAMES = {"blog": "Blog", "wiki": "Wiki", "library": "Stories"}
-MOUNT_DEFAULT = {"blog": "blog", "wiki": "wiki", "library": "stories"}
+MODULES = ("blog", "wiki", "library", "podcast")
+MODULE_NAMES = {"blog": "Blog", "wiki": "Wiki", "library": "Stories", "podcast": "Podcast"}
+MOUNT_DEFAULT = {"blog": "blog", "wiki": "wiki", "library": "stories", "podcast": "podcast"}
+# Modules that can be served from the site root when they are the homepage.
+ROOT_MOUNTABLE = ("wiki", "library", "podcast")
 HOME_MODES = ("page",) + MODULES
 # Folder names a page, wiki section or story can never take, because something else lives there.
 RESERVED = {"index", "style", "assets", "blog", "wiki", "stories", "genre", "tag", "posts", "rss", "sitemap",
-            "robots", "search", "site", "api", "404"}
+            "robots", "search", "site", "api", "404", "podcast", "episodes", "audio", "transcripts", "chapters",
+            "feed"}
 CALLOUTS = {"NOTE": "Note", "TIP": "Tip", "IMPORTANT": "Important", "WARNING": "Warning", "CAUTION": "Caution"}
 STATUSES = [("draft", "Draft"), ("ongoing", "Ongoing"), ("hiatus", "On hiatus"), ("complete", "Complete")]
 STATUS_LABELS = dict(STATUSES)
@@ -119,11 +139,28 @@ def slugify(s):
 
 
 def write_text(path, text):
+    """Write through a hidden temporary file and swap it in, so a reader never sees half a file
+    and a publish walking the folder at the same moment never picks the temporary file up."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    tmp = path.with_name(".%s.%s.tmp" % (path.name, secrets.token_hex(4)))
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def md_files(folder):
+    """The .md files directly in a folder, leaving out symlinks. A symlinked folder gives none,
+    the same rule publishing and importing follow."""
+    if folder.is_symlink() or not folder.is_dir():
+        return []
+    return [f for f in folder.glob("*.md") if not f.is_symlink() and f.is_file()]
 
 
 def read_text(path):
@@ -689,7 +726,8 @@ THEMES = {
     "book-pulp": ("Pulp", "Reading", {"bg": "#1b1712", "bg-image": "none", "surface": "#241e17", "surface-opacity": "1", "text": "#f2e6d2", "muted": "#b3a48c", "accent": "#e0a63c", "border": "#3a3126", "code-bg": "#171310", "header-bg": "#1b1712", "header-text": "#f2e6d2", "sidebar-bg": "#1f1a14", "sidebar-text": "#e2d6c0", "sidebar-active": "#312819", "font-body": "\"Iowan Old Style\", \"Palatino Linotype\", Palatino, \"Book Antiqua\", Georgia, serif", "font-heading": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-ui": "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif", "font-mono": "ui-monospace, \"SF Mono\", \"Cascadia Code\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace", "base-size": "18px", "line-height": "1.75", "max-width": "44rem", "measure": "34rem", "sidebar-width": "16rem", "radius": "4px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.4em"}),
     "retro-portal": ("Secure portal", "Retro", {"bg": "#141414", "bg-image": "none", "surface": "#050505", "surface-opacity": "1", "text": "#c0c0c0", "muted": "#808080", "accent": "#6699ff", "border": "#555555", "code-bg": "#000000", "header-bg": "#0a0a0a", "header-text": "#e8e8e8", "sidebar-bg": "#0b0b12", "sidebar-text": "#c0c0c0", "sidebar-active": "#1a1a26", "font-body": "\"Times New Roman\", Times, serif", "font-heading": "Arial, Helvetica, sans-serif", "font-ui": "Verdana, Geneva, Arial, sans-serif", "font-mono": "\"Courier New\", Courier, monospace", "base-size": "16px", "line-height": "1.45", "max-width": "46rem", "measure": "38rem", "sidebar-width": "15rem", "radius": "0px", "heading-weight": "700", "heading-transform": "none", "letter-spacing": "0", "dropcap-size": "3.1em"}),
 }
-DEFAULT_THEME = {"page": "site-clean", "blog": "site-clean", "wiki": "wiki-classic", "library": "book-paperback"}
+DEFAULT_THEME = {"page": "site-clean", "blog": "site-clean", "wiki": "wiki-classic", "library": "book-paperback",
+                 "podcast": "site-clean"}
 
 
 def root_block(theme_id):
@@ -2337,6 +2375,103 @@ body.layout-secure .pt-main .side {
 body.layout-secure .pt-main .side-button { display: none; }
 """
 
+PODCAST_BASE_CSS = """
+/* podcast: the show page and episode pages. Theme variables only, so every theme styles it. */
+.pod-show, .pod-ep-head { display: flex; flex-wrap: wrap; gap: 1.25rem; align-items: flex-start; margin: 0 0 1rem; }
+.pod-show .pod-art, .pod-ep-head .pod-art {
+  width: 11rem; max-width: 38%; aspect-ratio: 1 / 1; object-fit: cover; border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+.pod-head { flex: 1 1 15rem; min-width: 0; }
+.content .pod-head .page-title { margin: 0 0 0.3rem; }
+.pod-author { margin: 0; color: var(--muted); font-family: var(--font-ui); }
+.pod-badge {
+  display: inline-block; vertical-align: middle; margin-left: 0.4rem; padding: 0.05rem 0.5rem; border: 1px solid var(--border);
+  border-radius: 99px; color: var(--muted); font: 600 0.7rem/1.5 var(--font-ui); letter-spacing: 0.05em; text-transform: uppercase;
+}
+.pod-subscribe {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem 1rem; margin: 0.5rem 0 1.25rem; padding: 0;
+  list-style: none; font-family: var(--font-ui); font-size: 0.92rem;
+}
+.pod-subscribe code { font-size: 0.8rem; word-break: break-all; user-select: all; }
+.pod-subscribe.compact { margin-top: 2rem; padding-top: 0.75rem; border-top: 1px solid var(--border); }
+.content .pod-episodes-title { margin: 1.75rem 0 0.25rem; }
+.pod-episodes { margin: 0; padding: 0; list-style: none; }
+.pod-ep { padding: 0.9rem 0; border-top: 1px solid var(--border); }
+.pod-ep:first-child { border-top: 0; }
+.content .pod-ep h3 { margin: 0 0 0.2rem; font-size: 1.15rem; }
+.pod-ep h3 a { text-decoration: none; }
+.pod-num { color: var(--muted); font: 600 0.82rem/1 var(--font-ui); letter-spacing: 0.03em; }
+.pod-meta { margin: 0 0 0.35rem; color: var(--muted); font: 0.85rem/1.5 var(--font-ui); }
+.pod-summary { margin: 0; }
+.pod-player { margin: 1rem 0 1.5rem; }
+.pod-player audio { display: block; width: 100%; }
+.pod-download { margin: 0.4rem 0 0; font: 0.85rem/1.5 var(--font-ui); }
+.pod-chapters ol { margin: 0; padding: 0; list-style: none; }
+.pod-chapters li { padding: 0.15rem 0; }
+.pod-time { display: inline-block; min-width: 4.2rem; color: var(--muted); font: 0.9rem var(--font-ui); font-variant-numeric: tabular-nums; }
+.pod-transcript { margin: 1.5rem 0; padding: 0.6rem 0.9rem; border: 1px solid var(--border); border-radius: var(--radius); }
+.pod-transcript summary { cursor: pointer; font-weight: 600; font-family: var(--font-ui); }
+.pod-back { margin: 0 0 1rem; font: 0.9rem var(--font-ui); }
+.pod-season { margin-top: 1.25rem; }
+.content .pod-group {
+  margin: 0 0 0.3rem; padding-bottom: 0.3rem; border-bottom: 1px solid var(--border); color: var(--muted);
+  font: 600 0.8rem/1.4 var(--font-ui); letter-spacing: 0.12em; text-transform: uppercase;
+}
+.pod-kicker { margin: 0 0 0.25rem; color: var(--accent); font: 600 0.75rem/1.4 var(--font-ui); letter-spacing: 0.1em; text-transform: uppercase; }
+@media (max-width: 560px) {
+  .pod-show .pod-art, .pod-ep-head .pod-art { width: 8rem; }
+}
+"""
+
+PODCAST_CARDS_CSS = """
+/* podcast as a grid of cards */
+body.podcast-layout-cards .pod-episodes.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: 1rem; }
+body.podcast-layout-cards .pod-episodes.cards .pod-ep {
+  display: flex; flex-direction: column; padding: 0; border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden; background: var(--surface);
+}
+body.podcast-layout-cards .pod-thumb { position: relative; display: block; aspect-ratio: 1 / 1; }
+body.podcast-layout-cards .pod-thumb img { display: block; width: 100%; height: 100%; object-fit: cover; }
+body.podcast-layout-cards .pod-thumb-num {
+  position: absolute; inset: auto 0 0 0; padding: 0.4rem 0.7rem; color: #fff; background: rgba(0, 0, 0, 0.55);
+  font: 700 1.4rem/1.2 var(--font-ui);
+}
+body.podcast-layout-cards .pod-episodes.cards .pod-body { padding: 0.75rem 0.9rem 0.9rem; }
+body.podcast-layout-cards .pod-episodes.cards .pod-summary { font-size: 0.92rem; }
+@media (min-width: 720px) {
+  body.podcast-layout-cards.podcast-episode .pod-ep-head { flex-wrap: nowrap; }
+  body.podcast-layout-cards.podcast-episode .pod-ep-head .pod-art { width: 14rem; }
+}
+"""
+
+PODCAST_SPOTLIGHT_CSS = """
+/* podcast spotlight: the newest episode in a raised panel with a player */
+body.podcast-layout-spotlight .pod-spotlight {
+  display: flex; flex-wrap: wrap; gap: 1.25rem; margin: 1.5rem 0 0.5rem; padding: 1.1rem; background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius); box-shadow: 0 6px 24px rgba(0, 0, 0, 0.08);
+}
+body.podcast-layout-spotlight .pod-spotlight .pod-art {
+  width: 15rem; max-width: 100%; aspect-ratio: 1 / 1; object-fit: cover; border-radius: var(--radius);
+}
+body.podcast-layout-spotlight .pod-spotlight .pod-body { flex: 1 1 16rem; min-width: 0; }
+body.podcast-layout-spotlight .pod-spotlight h3 { margin: 0 0 0.3rem; font-size: 1.5rem; }
+body.podcast-layout-spotlight .pod-spotlight .pod-player { margin: 0.75rem 0 0; }
+body.podcast-layout-spotlight.podcast-episode .pod-ep-head { display: block; }
+body.podcast-layout-spotlight.podcast-episode .pod-ep-head .pod-art { display: block; width: 100%; max-width: 26rem; margin: 0 0 1rem; }
+"""
+
+PODCAST_ARCHIVE_CSS = """
+/* podcast as an archive: one line per episode, grouped by season or year */
+body.podcast-layout-archive .pod-episodes.archive .pod-ep {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 1rem; align-items: baseline; padding: 0.35rem 0; border-top: 0;
+}
+body.podcast-layout-archive .content .pod-episodes.archive h3 { grid-column: 1; margin: 0; font-size: 1.02rem; font-weight: 600; }
+body.podcast-layout-archive .pod-episodes.archive .pod-meta { grid-column: 2; grid-row: 1; margin: 0; white-space: nowrap; }
+body.podcast-layout-archive .pod-episodes.archive .pod-summary { display: none; }
+"""
+
+
 # Each axis: id -> label, description, CSS and the structural switches the renderers read.
 LAYOUTS = {
     "site": {
@@ -2386,10 +2521,22 @@ LAYOUTS = {
         "spotlight": {"label": "Spotlight", "chapters": "side", "featured": True, "backdrop": True, "css": LIB_SPOTLIGHT_CSS,
                       "desc": "The first story fills the top of the library with a read button. Story pages open on a blurred copy of the cover."},
     },
+    "podcast": {
+        "list": {"label": "List", "list": "list", "css": PODCAST_BASE_CSS,
+                 "desc": "Episodes in rows with the number, date, length and summary."},
+        "cards": {"label": "Cards", "list": "cards", "css": PODCAST_BASE_CSS + PODCAST_CARDS_CSS,
+                  "desc": "A grid of cards with each episode's art, or the show art with the episode number over it."},
+        "spotlight": {"label": "Spotlight", "list": "spotlight", "css": PODCAST_BASE_CSS + PODCAST_SPOTLIGHT_CSS,
+                      "desc": "The newest episode in a raised panel with large art and a player; the rest as a list."},
+        "archive": {"label": "Archive", "list": "archive", "css": PODCAST_BASE_CSS + PODCAST_ARCHIVE_CSS,
+                    "desc": "One line per episode, grouped by season, or by year when there are no seasons."},
+    },
 }
-LAYOUT_KEYS = {"site": "layout", "blog": "blog_layout", "wiki": "wiki_layout", "library": "lib_layout"}
-LAYOUT_CLASS = {"site": "layout-", "blog": "blog-layout-", "wiki": "wiki-layout-", "library": "lib-layout-"}
-LAYOUT_DEFAULTS = {"site": "classic", "blog": "list", "wiki": "classic", "library": "classic"}
+LAYOUT_KEYS = {"site": "layout", "blog": "blog_layout", "wiki": "wiki_layout", "library": "lib_layout",
+               "podcast": "podcast_layout"}
+LAYOUT_CLASS = {"site": "layout-", "blog": "blog-layout-", "wiki": "wiki-layout-", "library": "lib-layout-",
+                "podcast": "podcast-layout-"}
+LAYOUT_DEFAULTS = {"site": "classic", "blog": "list", "wiki": "classic", "library": "classic", "podcast": "list"}
 
 
 def layout_id(c, axis):
@@ -2603,6 +2750,7 @@ SITE_DEFAULTS = {
     "post_nav": True,
     # layouts
     "layout": "classic", "blog_layout": "list", "wiki_layout": "classic", "lib_layout": "classic",
+    "podcast_layout": "list",
 }
 SITE_BOOLS = ("noindex", "sitemap", "feeds", "toc", "updated", "expand", "wiki_cards", "wiki_recent", "dropcap",
               "wordcount", "reading_time", "lib_updates", "post_nav")
@@ -2621,6 +2769,7 @@ def default_cfg(title):
         "posts": [],
         "wiki": {"sections": []},
         "library": {"stories": []},
+        "podcast": {"show": {}, "episodes": []},
         "deploy": {},
         "generated": [],
     }
@@ -2637,6 +2786,8 @@ class SiteBase:
         self.cfg = None
         self._mds = []
         self._res = (None, None)
+        self._pod_check = []
+        self._art_cache = {}
 
     # ---- paths
     def page_md(self, slug):
@@ -2656,12 +2807,15 @@ class SiteBase:
         if not self.css_path().exists():
             write_text(self.css_path(), default_css())
         self.normalize()
+        self.clear_incoming()
         self.rescan()
         self.save_cfg()
         self.build()
 
     def create(self, setup):
         """First run: make a new site with the homepage and modules chosen in the setup screen."""
+        if ONLY_MODULE:
+            setup = dict(setup, home=ONLY_MODULE, modules=[ONLY_MODULE], root_mount=True)
         home = setup.get("home") if setup.get("home") in HOME_MODES else "page"
         self.cfg = default_cfg(str(setup.get("title") or "").strip()[:120] or title_from_name(self.root.name))
         theme = setup.get("theme") if setup.get("theme") in THEMES else None
@@ -2676,8 +2830,13 @@ class SiteBase:
             if m in wanted:
                 self.enable_module(m)
         self.cfg["home"] = home
-        if home in ("wiki", "library") and setup.get("root_mount"):
+        if home in ROOT_MOUNTABLE and setup.get("root_mount"):
             self.cfg["modules"][home]["mount"] = ""
+        if ONLY_MODULE:
+            # The module is the homepage, so a second menu entry for it would point at the same page.
+            for n in self.cfg["nav"]:
+                if n.get("type") == "module":
+                    n["visible"] = False
         self.normalize()
         self.save_cfg()
         self.build()
@@ -2716,6 +2875,11 @@ class SiteBase:
                 "mount": cur.get("mount") if cur.get("mount") in ("", MOUNT_DEFAULT[m]) else MOUNT_DEFAULT[m],
             }
         c["modules"] = mods
+        if ONLY_MODULE:
+            for m in MODULES:
+                mods[m]["enabled"] = m == ONLY_MODULE
+            c["home"] = ONLY_MODULE
+            mods[ONLY_MODULE]["mount"] = ""
         if c.get("home") not in HOME_MODES or (c["home"] in MODULES and not mods[c["home"]]["enabled"]):
             c["home"] = "page"
         for m in MODULES:
@@ -2744,6 +2908,7 @@ class SiteBase:
         self.normalize_blog()
         self.normalize_wiki()
         self.normalize_library()
+        self.normalize_podcast()
         self.normalize_nav()
 
     def normalize_nav(self):
@@ -2778,6 +2943,8 @@ class SiteBase:
             r.update(self.wiki_rescan())
         if self.enabled("library"):
             r.update(self.lib_rescan())
+        if self.enabled("podcast"):
+            r.update(self.pod_rescan())
         return r
 
     def api_rescan(self):
@@ -2806,6 +2973,9 @@ class SiteBase:
             "secure_defaults": PORTAL_DEFAULTS,
             "frame_defaults": FRAME_DEFAULTS,
             "names": MODULE_NAMES,
+            "podcast": self.pod_state(),
+            "app": APP,
+            "only": ONLY_MODULE,
         }
 
     # ---- modules
@@ -2836,11 +3006,19 @@ class SiteBase:
             (self.meta / "library" / "stories").mkdir(parents=True, exist_ok=True)
             if not self.lib_home_md().exists():
                 write_text(self.lib_home_md(), LIB_HOME_MD)
+        if mid == "podcast":
+            (self.meta / "podcast" / "episodes").mkdir(parents=True, exist_ok=True)
+            if not self.pod_intro_md().exists():
+                write_text(self.pod_intro_md(), PODCAST_ABOUT_MD)
         if not any(n.get("type") == "module" and n.get("id") == mid for n in c.get("nav", [])):
             c.setdefault("nav", []).append({"type": "module", "id": mid, "label": "", "visible": True})
 
     def save_structure(self, d):
-        """Homepage choice, which modules are on, their labels and whether the homepage module sits at the root."""
+        """Homepage choice, which modules are on, their labels and whether the homepage module sits at the root.
+        A change that would move a locked podcast feed returns needs_confirm and changes nothing."""
+        if ONLY_MODULE:
+            raise ApiError("%s has one fixed structure." % APP)
+        backup = copy.deepcopy(self.cfg)
         c = self.cfg
         mods = d.get("modules") if isinstance(d.get("modules"), dict) else {}
         for m in MODULES:
@@ -2860,9 +3038,16 @@ class SiteBase:
         if home in MODULES and not c["modules"][home]["enabled"]:
             self.enable_module(home)
         c["home"] = home
-        for m in ("wiki", "library"):
+        for m in ROOT_MOUNTABLE:
             c["modules"][m]["mount"] = "" if (home == m and d.get("root_mount")) else MOUNT_DEFAULT[m]
         self.normalize()
+        moved = self.pod_feed_moved(backup)
+        if moved and not d.get("confirm_feed_move"):
+            self.cfg = backup
+            return {"needs_confirm": True, "message": moved}
+        if moved:
+            self.pod_accept_move()
+        self.pod_move_files(backup)
         self.save_cfg()
         self.build()
         return {"ok": True}
@@ -2877,15 +3062,21 @@ class SiteBase:
         folder = self.meta / mid
         if folder.exists():
             self.to_trash(folder)
+        note = ""
         if mid == "blog":
             c["posts"] = []
         elif mid == "wiki":
             c["wiki"] = {"sections": []}
-        else:
+        elif mid == "library":
             c["library"] = {"stories": []}
+        else:
+            if self.audio_dir().is_dir():
+                note = "Audio files are never deleted this way; they are still in %s." % self.audio_dir()
+            c["podcast"] = {"show": {}, "episodes": []}
+            self.normalize_podcast()
         self.save_cfg()
         self.build()
-        return {"ok": True}
+        return {"ok": True, "note": note}
 
     # ---- lookups
     def find_page(self, slug, cfg=None):
@@ -3128,6 +3319,8 @@ class SiteBase:
             return self.wiki_landing(c, "index.html", css=css, base=base)
         if home == "library":
             return self.lib_landing(c, "index.html", css=css, base=base)
+        if home == "podcast":
+            return self.pod_landing(c, "index.html", css=css, base=base)
         return self.render_page(c, self.find_page("index", c), read_text(self.page_md("index")), css=css, base=base)
 
     def add_page(self, d):
@@ -3270,7 +3463,14 @@ class SiteBase:
             raise ApiError("Enter the site URL to generate a sitemap. It needs full web addresses.")
         if site.get("search") == "web" and not url:
             raise ApiError("Web search needs the site URL, so the search engine knows which site to look in.")
+        backup = copy.deepcopy(self.cfg)
         self.cfg["site"] = site
+        moved = self.pod_feed_moved(backup)
+        if moved and not d.get("confirm_feed_move"):
+            self.cfg = backup
+            return {"needs_confirm": True, "message": moved}
+        if moved:
+            self.pod_accept_move()
         self.save_cfg()
         self.build()
         return {"ok": True}
@@ -3311,6 +3511,8 @@ class SiteBase:
             files.update(self.wiki_files(c))
         if self.enabled("library"):
             files.update(self.lib_files(c))
+        if self.enabled("podcast"):
+            files.update(self.pod_files(c))
         if c["site"].get("feeds") and c["site"].get("url") and (self.enabled("blog") or self.enabled("library")):
             xml = self.feed_xml(c, self.feed_items(c, blog=True, library=True), c["site"]["title"], "rss.xml")
             files["rss"] = xml
@@ -3320,6 +3522,7 @@ class SiteBase:
         for rel in set(c.get("generated", [])) - set(files):
             self.remove_generated(rel)
         c["generated"] = sorted(files)
+        self._pod_check = self.pod_check(c, files.get(self.feed_rel(c), "")) if self.enabled("podcast") else []
         self.write_seo_files()
         self.save_cfg()
         self._mds = []
@@ -3334,7 +3537,8 @@ class SiteBase:
             return
         if not parts or parts[0].startswith(".") or parts[0] == "assets":
             return
-        if p.suffix not in (".html", ".xml", ".js") and p.name != "rss" and parts != (TEXT_FILE,):
+        chapters = p.suffix == ".json" and len(parts) > 1 and parts[-2] == "chapters"
+        if p.suffix not in (".html", ".xml", ".js") and p.name != "rss" and parts != (TEXT_FILE,) and not chapters:
             return
         if p.is_file():
             p.unlink()
@@ -3351,14 +3555,17 @@ class SiteBase:
     def feed_items(self, c, blog, library):
         """(date, title, rel, html) for recent posts and chapters, newest first."""
         items = []
+        # Feed readers resolve relative links against the item's page or the feed, never the
+        # site root, so bodies are rendered with absolute links.
+        base = c["site"]["url"].rstrip("/") + "/"
         if blog and self.enabled("blog", c):
             for p in self.published_posts(c):
                 items.append((p["date"], p["title"], self.post_rel(p["slug"], c),
-                              Markdown("").render(read_text(self.post_md(p["slug"]))), p.get("tags", [])))
+                              Markdown(base).render(read_text(self.post_md(p["slug"]))), p.get("tags", [])))
         if library and self.enabled("library", c):
             for s, ch in self.lib_recent(c, 50):
                 items.append((ch["date"], "%s: %s" % (s["title"], ch["title"]), self.chapter_rel(s, ch, c),
-                              Markdown("").render(read_text(self.chapter_md(s["slug"], ch["slug"]))), [s["title"]]))
+                              Markdown(base).render(read_text(self.chapter_md(s["slug"], ch["slug"]))), [s["title"]]))
         items.sort(key=lambda x: x[0], reverse=True)
         return items[:50]
 
@@ -3375,7 +3582,7 @@ class SiteBase:
                 "<description>%s</description>\n<content:encoded><![CDATA[%s]]></content:encoded>\n</item>"
                 % (_escape(t, quote=False), _escape(link, quote=False), _escape(link, quote=False), when,
                    "".join("<category>%s</category>\n" % _escape(x, quote=False) for x in cats),
-                   _escape(auto_summary(body), quote=False), body.replace("]]>", "]]&gt;"))
+                   _escape(auto_summary(body), quote=False), body.replace("]]>", "]]]]><![CDATA[>"))
             )
         return (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -3400,6 +3607,8 @@ class SiteBase:
             rows += self.wiki_sitemap(c)
         if self.enabled("library", c):
             rows += self.lib_sitemap(c)
+        if self.enabled("podcast", c):
+            rows += self.pod_sitemap(c)
         return rows
 
     def write_seo_files(self):
@@ -3468,6 +3677,17 @@ class SiteBase:
             html_ = self.wiki_preview(cfg, p, md, css, base)
         elif view in ("libhome", "story", "chapter"):
             html_ = self.lib_preview(cfg, p, md, css, base)
+        elif view in ("podcasthome", "episode") and self.enabled("podcast", cfg):
+            if isinstance(p.get("show"), dict):
+                for k in ("title", "author", "image", "link"):
+                    if k in p["show"]:
+                        cfg["podcast"]["show"][k] = str(p["show"][k] or "").strip()[:400]
+                for k in ("explicit", "complete"):
+                    if k in p["show"]:
+                        cfg["podcast"]["show"][k] = bool(p["show"][k])
+                if p["show"].get("type") in ("episodic", "serial"):
+                    cfg["podcast"]["show"]["type"] = p["show"]["type"]
+            html_ = self.pod_preview(cfg, p, md, css, base)
         if html_ is None:
             html_ = self.preview_target(cfg, str(p.get("target") or "home"), css)
         missing = sorted({x for m in self._mds for x in m.missing})
@@ -3494,6 +3714,10 @@ class SiteBase:
             r = self.lib_preview_target(c, rest, css)
             if r:
                 return r
+        if kind == "podcast" and self.enabled("podcast", c):
+            r = self.pod_preview_target(c, rest, css)
+            if r:
+                return r
         return self.render_home(c, css=css, base=rel_base)
 
     def preview_targets(self):
@@ -3516,6 +3740,8 @@ class SiteBase:
                 out.append({"id": "library:" + s["slug"], "label": "Story: " + s["title"]})
                 out += [{"id": "library:%s/%s" % (s["slug"], ch["slug"]), "label": "   Chapter: " + ch["title"]}
                         for ch in s["chapters"]]
+        if self.enabled("podcast"):
+            out += self.pod_preview_targets(c)
         return {"targets": out}
 
 
@@ -3882,7 +4108,7 @@ class WikiMixin:
         r = {"wiki_sections_added": 0, "wiki_articles_added": 0, "wiki_articles_removed": 0}
         known = {s["slug"] for s in self.cfg["wiki"]["sections"]}
         for d in sorted(base.iterdir(), key=lambda p: p.name.lower()):
-            if not d.is_dir() or d.name.startswith(".") or d.name in known:
+            if not d.is_dir() or d.is_symlink() or d.name.startswith(".") or d.name in known:
                 continue
             slug = self.unique_section_slug(d.name, exclude=d.name if slugify(d.name) == d.name else None)
             if slug != d.name:
@@ -3896,7 +4122,7 @@ class WikiMixin:
             d = self.wsec_dir(sec["slug"])
             d.mkdir(parents=True, exist_ok=True)
             arts = {a["slug"]: a for a in sec["articles"]}
-            for f in sorted(d.glob("*.md"), key=lambda p: p.name.lower()):
+            for f in sorted(md_files(d), key=lambda p: p.name.lower()):
                 if f.name == "_index.md" or f.name.startswith("."):
                     continue
                 if f.stem in arts:
@@ -4583,7 +4809,7 @@ class LibraryMixin:
         r = {"stories_added": 0, "chapters_added": 0, "chapters_removed": 0}
         known = {s["slug"] for s in self.cfg["library"]["stories"]}
         for d in sorted(base.iterdir(), key=lambda p: p.name.lower()):
-            if not d.is_dir() or d.name.startswith(".") or d.name in known:
+            if not d.is_dir() or d.is_symlink() or d.name.startswith(".") or d.name in known:
                 continue
             slug = self.unique_story_slug(d.name, exclude=d.name if slugify(d.name) == d.name else None)
             if slug != d.name:
@@ -4600,7 +4826,7 @@ class LibraryMixin:
             d = self.story_dir(st["slug"])
             d.mkdir(parents=True, exist_ok=True)
             chs = {ch["slug"]: ch for ch in st["chapters"]}
-            for f in sorted(d.glob("*.md"), key=lambda p: p.name.lower()):
+            for f in sorted(md_files(d), key=lambda p: p.name.lower()):
                 if f.name == "_index.md" or f.name.startswith(".") or f.stem in chs:
                     continue
                 orig = f.stem
@@ -5057,7 +5283,7 @@ class LibraryMixin:
 # summary reports. Generated .html in the source folder is ignored; everything is rebuilt.
 # ----------------------------------------------------------------------------
 
-IMPORT_KINDS = {".sitegen": "sitegen", ".wikigen": "wikigen", ".storygen": "storygen"}
+IMPORT_KINDS = {".sitegen": "sitegen", ".wikigen": "wikigen", ".storygen": "storygen", ".podcastgen": "podcastgen"}
 
 
 def detect_import(path):
@@ -5072,16 +5298,23 @@ def detect_import(path):
             if not isinstance(cfg, dict):
                 raise ApiError("%s is not a site settings file." % f)
             return kind, root, cfg
-    raise ApiError("No SiteGen, WikiGen or StoryGen site found in %s. Pick the folder that contains the hidden "
-                   ".sitegen, .wikigen or .storygen folder." % root)
+    raise ApiError("No SiteGen, WikiGen, StoryGen or PodcastGen site found in %s. Pick the folder that contains the "
+                   "hidden .sitegen, .wikigen, .storygen or .podcastgen folder." % root)
+
+
+IMPORT_RENAMES = {}
 
 
 def src_text(path):
-    """Read a markdown file from the source, refusing symlinks and anything that is not a file."""
+    """Read a markdown file from the source, refusing symlinks and anything that is not a file.
+    References to assets that were renamed on the way in are rewritten."""
     p = Path(path)
     if p.is_symlink() or not p.is_file():
         return ""
-    return read_text(p)
+    text = read_text(p)
+    for old, new in IMPORT_RENAMES.items():
+        text = re.sub(r"(assets/)%s(?![\w.-])" % re.escape(old), lambda m, n=new: m.group(1) + n, text)
+    return text
 
 
 class ImportMixin:
@@ -5090,17 +5323,29 @@ class ImportMixin:
         if src.resolve() == self.root.resolve():
             raise ApiError("That is this site's own folder.")
         report = {"kind": kind, "notes": []}
-        if kind == "sitegen":
-            self._import_sitegen(src, scfg, report, bool(d.get("settings")))
-        elif kind == "wikigen":
-            self._import_wikigen(src, scfg, report, bool(d.get("settings")))
-        else:
-            self._import_storygen(src, scfg, report, bool(d.get("settings")))
+        # Assets first, so Markdown read during the import can point at any renamed copies.
+        copied, renames = self._import_assets(src)
+        IMPORT_RENAMES.clear()
+        IMPORT_RENAMES.update(renames)
+        try:
+            if kind == "sitegen":
+                self._import_sitegen(src, scfg, report, bool(d.get("settings")))
+            elif kind == "wikigen":
+                self._import_wikigen(src, scfg, report, bool(d.get("settings")))
+            elif kind == "podcastgen":
+                self._import_podcastgen(src, scfg, report, bool(d.get("settings")))
+            else:
+                self._import_storygen(src, scfg, report, bool(d.get("settings")))
+        finally:
+            IMPORT_RENAMES.clear()
         if d.get("settings"):
             self._import_layout(kind, scfg, report)
-        copied = self._import_assets(src)
         if copied:
             report["notes"].append("Copied %d file(s) from assets/." % copied)
+        for old, new in sorted(renames.items()):
+            report["notes"].append("assets/%s was already taken by a different file, so it came over as "
+                                   "assets/%s. Links in the imported text were updated; check covers, logos "
+                                   "and other settings that name it." % (old, new))
         old_css = src / "style.css"
         if old_css.is_file() and not old_css.is_symlink():
             dest = self.meta / "imported" / ("%s-style.css" % kind)
@@ -5109,9 +5354,12 @@ class ImportMixin:
         home = d.get("home")
         if home in MODULES and self.enabled(home):
             self.cfg["home"] = home
-            if home in ("wiki", "library") and d.get("root_mount"):
+            if home in ROOT_MOUNTABLE and d.get("root_mount"):
                 self.cfg["modules"][home]["mount"] = ""
         self.normalize()
+        pending = report.pop("_podcastgen", None)
+        if pending:
+            self._finish_podcastgen(pending, report)
         self.save_cfg()
         self.build()
         report["state"] = self.state()
@@ -5147,16 +5395,29 @@ class ImportMixin:
             self.cfg["site"]["brand"] = clean_brand(s["brand"])
 
     def _import_assets(self, src):
+        """Copy assets/ over. A file whose name is taken by a different file is copied under a
+        new name, and IMPORT_RENAMES carries old to new so src_text() rewrites references in the
+        Markdown it reads. Returns (files copied, renames)."""
         a = src / "assets"
         if not a.is_dir() or a.is_symlink():
-            return 0
-        n = 0
+            return 0, {}
+        n, renames = 0, {}
         dest = self.root / "assets"
         dest.mkdir(exist_ok=True)
         for f in sorted(a.iterdir()):
-            if f.is_file() and not f.is_symlink() and not f.name.startswith(".") and not (dest / f.name).exists():
-                shutil.copy2(f, dest / f.name, follow_symlinks=False)
-                n += 1
+            if not f.is_file() or f.is_symlink() or f.name.startswith("."):
+                continue
+            target = dest / f.name
+            if target.exists():
+                if target.is_file() and filecmp.cmp(f, target, shallow=False):
+                    continue
+                stem, ext, i = Path(f.name).stem, Path(f.name).suffix, 2
+                while (dest / ("%s-%d%s" % (stem, i, ext))).exists():
+                    i += 1
+                target = dest / ("%s-%d%s" % (stem, i, ext))
+                renames[f.name] = target.name
+            shutil.copy2(f, target, follow_symlinks=False)
+            n += 1
         fonts = a / "fonts"
         if fonts.is_dir() and not fonts.is_symlink():
             (dest / "fonts").mkdir(exist_ok=True)
@@ -5165,7 +5426,7 @@ class ImportMixin:
                         and not (dest / "fonts" / f.name).exists()):
                     shutil.copy2(f, dest / "fonts" / f.name, follow_symlinks=False)
                     n += 1
-        return n
+        return n, renames
 
     def _new_page_slug(self, wanted):
         taken = self.taken_root_names()
@@ -5334,7 +5595,2598 @@ class ImportMixin:
             stories, "y" if stories == 1 else "ies", chapters, pages))
 
 
-class Site(ImportMixin, BlogMixin, WikiMixin, LibraryMixin, SiteBase):
+# ----------------------------------------------------------------------------
+# Podcast module
+#
+# A show page, one page per episode and an RSS feed that podcast apps and directories read.
+# Directories pull the feed; nothing is pushed to them. Audio is an upload kept in
+# <podcast>/audio/ that a build never deletes. ffprobe and ffmpeg are optional: they measure,
+# normalize and encode, and without them MP3 and M4A files are used exactly as they are.
+# ----------------------------------------------------------------------------
+
+PODCAST_GUID_NS = uuid.UUID("ead4c236-bf58-58c6-a2c6-a6b28d128cb6")
+PODCAST_INDEX_PING = "https://api.podcastindex.org/api/1.0/hub/pubnotify?url="
+WEBSUB_HUB = "https://pubsubhubbub.appspot.com/"
+CLOUDFLARE_TERMS = "https://www.cloudflare.com/service-specific-terms-application-services/"
+PODCAST_FEED_NS = ('xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" '
+                   'xmlns:content="http://purl.org/rss/1.0/modules/content/" '
+                   'xmlns:atom="http://www.w3.org/2005/Atom" '
+                   'xmlns:podcast="https://podcastindex.org/namespace/1.0"')
+PODCAST_ABOUT_MD = "Tell listeners what the show is about, who makes it and how often new episodes come out.\n"
+
+# Apple's category list, as the feed writes it. A show has a primary and an optional
+# secondary category, each with an optional subcategory.
+APPLE_CATEGORIES = [
+    ("Arts", ["Books", "Design", "Fashion & Beauty", "Food", "Performing Arts", "Visual Arts"]),
+    ("Business", ["Careers", "Entrepreneurship", "Investing", "Management", "Marketing", "Non-Profit"]),
+    ("Comedy", ["Comedy Interviews", "Improv", "Stand-Up"]),
+    ("Education", ["Courses", "How To", "Language Learning", "Self-Improvement"]),
+    ("Fiction", ["Comedy Fiction", "Drama", "Science Fiction"]),
+    ("Government", []),
+    ("Health & Fitness", ["Alternative Health", "Fitness", "Medicine", "Mental Health", "Nutrition", "Sexuality"]),
+    ("History", []),
+    ("Kids & Family", ["Education for Kids", "Parenting", "Pets & Animals", "Stories for Kids"]),
+    ("Leisure", ["Animation & Manga", "Automotive", "Aviation", "Crafts", "Games", "Hobbies", "Home & Garden",
+                 "Video Games"]),
+    ("Music", ["Music Commentary", "Music History", "Music Interviews"]),
+    ("News", ["Business News", "Daily News", "Entertainment News", "News Commentary", "Politics", "Sports News",
+              "Tech News"]),
+    ("Religion & Spirituality", ["Buddhism", "Christianity", "Hinduism", "Islam", "Judaism", "Religion",
+                                 "Spirituality"]),
+    ("Science", ["Astronomy", "Chemistry", "Earth Sciences", "Life Sciences", "Mathematics", "Natural Sciences",
+                 "Nature", "Physics", "Social Sciences"]),
+    ("Society & Culture", ["Documentary", "Personal Journals", "Philosophy", "Places & Travel", "Relationships"]),
+    ("Sports", ["Baseball", "Basketball", "Cricket", "Fantasy Sports", "Football", "Golf", "Hockey", "Rugby",
+                "Running", "Soccer", "Swimming", "Tennis", "Volleyball", "Wilderness", "Wrestling"]),
+    ("Technology", []),
+    ("True Crime", []),
+    ("TV & Film", ["After Shows", "Film History", "Film Interviews", "Film Reviews", "TV Reviews"]),
+]
+APPLE_CATEGORY_MAP = dict(APPLE_CATEGORIES)
+
+# The one-time directory submissions, in the order they are best done. The listing URL pasted
+# back for a row becomes a subscribe link on the show page.
+DIRECTORIES = [
+    {"id": "apple", "name": "Apple Podcasts", "where": "Podcasts Connect", "url": "https://podcastsconnect.apple.com/",
+     "needs": "An Apple Account with two-factor authentication. Choose +, New Show, then Add a show with an RSS "
+              "feed. Do this one first: Overcast and other apps take their shows from Apple's directory."},
+    {"id": "spotify", "name": "Spotify", "where": "Spotify for Creators", "url": "https://creators.spotify.com/",
+     "needs": "Any Spotify account. Add a new show, Find an existing show, Somewhere else, then enter the "
+              "8-digit code Spotify sends to the feed's owner email."},
+    {"id": "amazon", "name": "Amazon Music", "where": "Amazon Music for Podcasters",
+     "url": "https://podcasters.amazon.com/",
+     "needs": "An Amazon login. Add or Claim Your Podcast, verified through the feed's owner email. This also "
+              "covers Audible."},
+    {"id": "youtube", "name": "YouTube", "where": "YouTube Studio", "url": "https://studio.youtube.com/",
+     "needs": "Optional. For an audio-only show: Create, New podcast, Submit RSS feed, then identity verification "
+              "and a code to the feed's owner email. YouTube makes a still-image video per episode. Skip this "
+              "row when episodes go up as real video by hand."},
+    {"id": "iheart", "name": "iHeartRadio", "where": "iHeart for Podcasters",
+     "url": "https://help.iheart.com/hc/en-au/articles/228920687-Submitting-a-podcast-to-iHeartRadio",
+     "needs": "An iHeart account. Add Your Podcast, then the feed. Approval is not guaranteed."},
+    {"id": "pocketcasts", "name": "Pocket Casts", "where": "pocketcasts.com/submit",
+     "url": "https://pocketcasts.com/submit/",
+     "needs": "Nothing. It no longer adds shows from Apple's directory on its own, so it needs its own submission."},
+    {"id": "podcastindex", "name": "Podcast Index", "where": "podcastindex.org/add",
+     "url": "https://podcastindex.org/add",
+     "needs": "Nothing. Many smaller apps read from it. After this, every publish pings it so new episodes show "
+              "up quickly."},
+    {"id": "overcast", "name": "Overcast", "where": "Nothing to submit", "url": "https://overcast.fm/podcasterinfo",
+     "needs": "Overcast, Castro, Podcast Addict and Goodpods list shows from Apple's directory, usually within a "
+              "day or two of Apple. Tick this once the show turns up and paste its Overcast address."},
+]
+DIRECTORY_IDS = [d["id"] for d in DIRECTORIES]
+
+EPISODE_KINDS = ("full", "trailer", "bonus")
+AUDIO_TYPES = {"mp3": "audio/mpeg", "m4a": "audio/x-m4a"}
+TRANSCRIPT_TYPES = {".vtt": "text/vtt", ".srt": "application/x-subrip"}
+MAX_TRANSCRIPT = 5 * 1024 * 1024
+PODCAST_SHOW_DEFAULTS = {
+    "title": "", "author": "", "owner_name": "", "owner_email": "", "language": "", "categories": [],
+    "explicit": False, "type": "episodic", "image": "", "link": "", "copyright": "", "complete": False,
+    "block": False, "locked": True, "funding": [], "guid": "", "feed_lock": "", "locked_at": "",
+    "legacy_feeds": [], "normalize": True, "format": "mp3", "mono": False, "kbps_mono": 64, "kbps_stereo": 128,
+    "tags": True, "upload_limit_mb": 2048, "media_mode": "site", "media_url": "", "media_target": {},
+    "ping": True, "websub": False, "last_ping": {}, "checklist": {}, "links": {}, "saved": "", "live_seen": "",
+    "verified": [],
+}
+PODCAST_SHOW_BOOLS = ("explicit", "complete", "block", "locked", "normalize", "mono", "tags", "ping", "websub")
+_RCLONE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*:[A-Za-z0-9_./-]*$")
+_EMAIL_RE = re.compile(r"^[^@\s<>\"']+@[^@\s<>\"']+\.[^@\s<>\"']+$")
+_LANG_RE = re.compile(r"^[a-z]{2,3}(-[A-Za-z]{2,4})?$")
+PKG_MANAGERS = [("apt", "sudo apt install %s"), ("dnf", "sudo dnf install %s"), ("zypper", "sudo zypper install %s"),
+                ("pacman", "sudo pacman -S %s"), ("apk", "sudo apk add %s"), ("emerge", "sudo emerge --ask %s")]
+GENTOO_NAMES = {"ffmpeg": "media-video/ffmpeg", "rclone": "net-misc/rclone"}
+
+
+def xml_text(s):
+    """Text for an XML element. HTML entities are decoded first, so &copy; becomes a real
+    copyright sign, then &, < and > are escaped. No HTML named entity reaches the feed."""
+    return _escape(_unescape(str(s or "")), quote=False)
+
+
+def xml_attr(s):
+    """Text for an XML attribute, with &quot; and &apos;, the forms Apple asks for."""
+    return xml_text(s).replace('"', "&quot;").replace("'", "&apos;")
+
+
+def cdata(html_):
+    """A CDATA section. A ]]> inside the text is split so it cannot end the section early."""
+    return "<![CDATA[%s]]>" % html_.replace("]]>", "]]]]><![CDATA[>")
+
+
+_VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+_HTML_TOKEN = re.compile(r"<!--.*?-->|<[^>]*>|[^<]+", re.S)
+
+
+def cut_html(html_, limit, by_bytes=False):
+    """Shorten HTML to a size limit at a tag boundary, closing whatever was left open. The limit
+    counts characters, or bytes of UTF-8 when by_bytes is set. Text cut short ends in ..."""
+    size = (lambda s: len(s.encode("utf-8"))) if by_bytes else len
+    if size(html_) <= limit:
+        return html_
+    out, stack, used = [], [], 0
+
+    def closers():
+        return "".join("</%s>" % t for t in reversed(stack))
+
+    for tok in _HTML_TOKEN.findall(html_):
+        if tok.startswith("<!--"):
+            continue
+        if tok.startswith("<"):
+            m = re.match(r"<(/?)([A-Za-z][A-Za-z0-9]*)", tok)
+            if not m:
+                continue
+            name = m.group(2).lower()
+            if m.group(1):
+                # A close tag was already counted in closers(), so it always fits.
+                if name in stack:
+                    while stack:
+                        t = stack.pop()
+                        out.append("</%s>" % t)
+                        used += size("</%s>" % t)
+                        if t == name:
+                            break
+                continue
+            void = name in _VOID_TAGS or tok.endswith("/>")
+            need = size(tok) + (0 if void else size("</%s>" % name))
+            if used + need + size(closers()) > limit:
+                break
+            out.append(tok)
+            used += size(tok)
+            if not void:
+                stack.append(name)
+            continue
+        room = limit - used - size(closers())
+        if size(tok) <= room:
+            out.append(tok)
+            used += size(tok)
+            continue
+        cut = tok[:max(0, room - 3)]
+        while cut and size(cut) + 3 > room:
+            cut = cut[:-1]
+        if " " in cut[-60:]:
+            cut = cut.rsplit(" ", 1)[0]
+        cut = re.sub(r"&[#A-Za-z0-9]*$", "", cut).rstrip()
+        if cut:
+            out.append(cut + "...")
+        break
+    return "".join(out) + closers()
+
+
+def parse_when(s):
+    """An aware datetime from an ISO date or date-time. One typed without an offset gets this
+    computer's offset for that moment, which is the offset at save time."""
+    s = str(s or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00").replace(" ", "T", 1))
+    except ValueError:
+        try:
+            dt = datetime.datetime.combine(datetime.date.fromisoformat(s[:10]), datetime.time(6, 0))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.replace(microsecond=0)
+
+
+def now_when():
+    return datetime.datetime.now().astimezone().replace(microsecond=0)
+
+
+def clean_when(s):
+    return (parse_when(s) or now_when().replace(second=0)).isoformat()
+
+
+def podcast_guid(feed_url):
+    """The podcast:guid for a feed URL: UUID version 5 of the URL without its scheme and
+    trailing slashes, in the namespace the Podcasting 2.0 spec gives."""
+    u = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", str(feed_url or "").strip()).rstrip("/")
+    return str(uuid.uuid5(PODCAST_GUID_NS, u)) if u else ""
+
+
+def fmt_duration(sec):
+    """50 min, 1 h 12 min. Empty when the length is unknown."""
+    try:
+        sec = int(round(float(sec or 0)))
+    except (TypeError, ValueError):
+        return ""
+    if sec <= 0:
+        return ""
+    if sec < 60:
+        return "%d sec" % sec
+    m = (sec + 30) // 60
+    if m < 60:
+        return "%d min" % m
+    return ("%d h %d min" % (m // 60, m % 60)) if m % 60 else "%d h" % (m // 60)
+
+
+def clock(sec):
+    """00:00 under an hour, 1:02:30 from an hour up: the form YouTube reads as chapters."""
+    sec = int(round(float(sec or 0)))
+    h, rest = divmod(sec, 3600)
+    m, s = divmod(rest, 60)
+    return "%d:%02d:%02d" % (h, m, s) if h else "%02d:%02d" % (m, s)
+
+
+def parse_clock(s):
+    """Seconds from H:MM:SS, MM:SS or plain seconds. None when it is not a time."""
+    s = str(s if s is not None else "").strip()
+    m = re.match(r"^(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d+)?)$", s)
+    if m:
+        return int(m.group(1) or 0) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    if re.match(r"^\d+(\.\d+)?$", s):
+        return float(s)
+    return None
+
+
+def fmt_size(n):
+    n = int(n or 0)
+    if n >= 1024 ** 3:
+        return "%.1f GB" % (n / 1024.0 ** 3)
+    if n >= 1024 ** 2:
+        return "%d MB" % round(n / 1024.0 ** 2)
+    if n >= 1024:
+        return "%d KB" % round(n / 1024.0)
+    return "%d bytes" % n
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def install_hint(*pkgs):
+    """The install line for the package manager this machine has, or a general hint."""
+    for name, line in PKG_MANAGERS:
+        if shutil.which(name):
+            names = [GENTOO_NAMES.get(p, p) for p in pkgs] if name == "emerge" else list(pkgs)
+            return "Install it with: " + line % " ".join(names)
+    return "Install %s with your system's package manager." % " and ".join(pkgs)
+
+
+def run_quiet(cmd, timeout=60):
+    """Run a program and collect its output: (exit code, stdout, stderr)."""
+    try:
+        p = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, errors="replace", timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        return 127, "", "%s is not installed." % cmd[0]
+    except subprocess.TimeoutExpired:
+        return 124, "", "%s took longer than %d seconds." % (cmd[0], timeout)
+
+
+def tool_versions():
+    """The outside programs the podcast tools use, with the first line of their version."""
+    out = {}
+    for name, flag in (("ffmpeg", "-version"), ("ffprobe", "-version"), ("rclone", "version")):
+        path = shutil.which(name)
+        if not path:
+            out[name] = ""
+            continue
+        code, text, _ = run_quiet([path, flag], 15)
+        first = (text.strip().splitlines() or [""])[0]
+        out[name] = (first[:80] or "found") if code == 0 else "found"
+    return out
+
+
+def sniff_audio(path):
+    """mp3 or m4a from the first bytes of a file (an ID3 header or MPEG frame sync, or an ftyp
+    box), or None."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+    except OSError:
+        return None
+    if head[:3] == b"ID3" or (len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+        return "mp3"
+    if head[4:8] == b"ftyp":
+        return "m4a"
+    return None
+
+
+def probe_audio(path):
+    """What an audio file is: kind (mp3, m4a or other), codec, duration in seconds, bit rate
+    in kbps, sample rate and channels. Raises ApiError when it holds no usable audio."""
+    if shutil.which("ffprobe"):
+        code, out, err = run_quiet(["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json",
+                                    str(Path(path).resolve())], 60)
+        if code != 0:
+            raise ApiError("ffprobe could not read that file: %s" % ((err.strip().splitlines() or ["no details"])[-1]))
+        try:
+            d = json.loads(out or "{}")
+        except ValueError:
+            raise ApiError("ffprobe gave an answer that could not be read.")
+        streams = d.get("streams") or []
+        audio = [s for s in streams if s.get("codec_type") == "audio"]
+        if not audio:
+            raise ApiError("That file has no audio in it.")
+        video = [s for s in streams if s.get("codec_type") == "video"
+                 and not (s.get("disposition") or {}).get("attached_pic")]
+        a, fmt = audio[0], d.get("format") or {}
+        codec, names = a.get("codec_name") or "", fmt.get("format_name") or ""
+        kind = "other"
+        if not video and codec == "mp3" and "mp3" in names:
+            kind = "mp3"
+        elif not video and codec == "aac" and "mp4" in names:
+            kind = "m4a"
+
+        def num(*vals):
+            for v in vals:
+                try:
+                    if v not in (None, "", "N/A"):
+                        return float(v)
+                except (TypeError, ValueError):
+                    continue
+            return 0.0
+
+        return {"kind": kind, "codec": codec, "duration": num(fmt.get("duration"), a.get("duration")),
+                "kbps": int(num(a.get("bit_rate"), fmt.get("bit_rate")) // 1000),
+                "sample_rate": int(num(a.get("sample_rate"))), "channels": int(num(a.get("channels"))), "probed": True}
+    kind = sniff_audio(path)
+    if not kind:
+        raise ApiError("Without ffprobe only MP3 and M4A files can be added, and this is neither. "
+                       + install_hint("ffmpeg"))
+    return {"kind": kind, "codec": "mp3" if kind == "mp3" else "aac", "duration": 0, "kbps": 0, "sample_rate": 0,
+            "channels": 0, "probed": False}
+
+
+def image_header(path):
+    """Width, height and colour facts read straight from a PNG IHDR chunk or a JPEG SOF marker,
+    with no outside program. None when the file is neither."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+            if head[:8] == b"\x89PNG\r\n\x1a\n" and head[12:16] == b"IHDR":
+                w, h, ct = int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big"), head[25]
+                alpha = ct in (4, 6)
+                if ct == 3:
+                    # A palette image is transparent when it carries a tRNS chunk before its data.
+                    f.seek(8)
+                    while True:
+                        hdr = f.read(8)
+                        if len(hdr) < 8 or hdr[4:8] in (b"IDAT", b"IEND"):
+                            break
+                        if hdr[4:8] == b"tRNS":
+                            alpha = True
+                            break
+                        f.seek(int.from_bytes(hdr[:4], "big") + 4, 1)
+                color = {0: "gray", 2: "rgb", 3: "palette", 4: "gray", 6: "rgb"}.get(ct, "rgb")
+                return {"format": "png", "width": w, "height": h, "alpha": alpha, "color": color}
+            if head[:2] != b"\xff\xd8":
+                return None
+            f.seek(2)
+            while True:
+                b = f.read(1)
+                if not b:
+                    return None
+                if b != b"\xff":
+                    continue
+                m = f.read(1)
+                while m == b"\xff":
+                    m = f.read(1)
+                if not m:
+                    return None
+                mk = m[0]
+                if mk in (0x01, 0xD8) or 0xD0 <= mk <= 0xD7:
+                    continue
+                if mk == 0xD9:
+                    return None
+                ln = int.from_bytes(f.read(2), "big")
+                if 0xC0 <= mk <= 0xCF and mk not in (0xC4, 0xC8, 0xCC):
+                    seg = f.read(6)
+                    if len(seg) < 6:
+                        return None
+                    return {"format": "jpeg", "width": int.from_bytes(seg[3:5], "big"),
+                            "height": int.from_bytes(seg[1:3], "big"), "alpha": False,
+                            "color": {1: "gray", 3: "rgb", 4: "cmyk"}.get(seg[5], "rgb")}
+                f.seek(max(0, ln - 2), 1)
+    except OSError:
+        return None
+
+
+def image_info(path):
+    """Format, size, colour and alpha of an image file, from ffprobe when it is installed and
+    from the file header otherwise. None when the file does not exist."""
+    p = Path(path)
+    if not p.is_file() or p.is_symlink():
+        return None
+    info = None
+    if shutil.which("ffprobe"):
+        code, out, _ = run_quiet(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                  "stream=codec_name,width,height,pix_fmt", "-of", "json", str(p.resolve())], 30)
+        try:
+            st = json.loads(out)["streams"][0] if code == 0 else None
+            if st:
+                pf = st.get("pix_fmt") or ""
+                info = {"format": {"mjpeg": "jpeg", "png": "png"}.get(st.get("codec_name"), st.get("codec_name") or ""),
+                        "width": int(st["width"]), "height": int(st["height"]),
+                        "alpha": bool(re.search(r"rgba|bgra|argb|abgr|ya8|ya16|yuva|gbrap", pf)),
+                        "color": "gray" if pf.startswith(("gray", "ya")) else ("cmyk" if "cmyk" in pf else "rgb")}
+                if pf == "pal8":
+                    hdr = image_header(p)
+                    info["alpha"], info["color"] = bool(hdr and hdr["alpha"]), "palette"
+        except (ValueError, KeyError, IndexError, TypeError):
+            info = None
+    if info is None:
+        info = image_header(p) or {"format": "", "width": 0, "height": 0, "alpha": False, "color": ""}
+    info["bytes"] = p.stat().st_size
+    return info
+
+
+def art_problems(info, what):
+    """Feed check lines for show or episode art, against Apple's cover rules."""
+    if info is None:
+        return [("fail", "%s is missing." % what, "Upload a square JPG or PNG between 1400 and 3000 pixels.")]
+    out = []
+    if info["format"] not in ("png", "jpeg"):
+        out.append(("fail", "%s must be a JPG or PNG file." % what, "Use Fix artwork, or export it as JPG or PNG."))
+        return out
+    w, h = info["width"], info["height"]
+    if w != h:
+        out.append(("fail", "%s is %d x %d pixels, and it must be square." % (what, w, h),
+                    "Fix artwork crops it to a 3000 pixel square."))
+    elif not 1400 <= w <= 3000:
+        out.append(("fail", "%s is %d pixels square; Apple needs 1400 to 3000." % (what, w),
+                    "Fix artwork scales it to 3000 pixels. Starting from a larger original looks better."))
+    if info.get("alpha"):
+        out.append(("warn", "%s has transparency, which Apple does not accept." % what,
+                    "Fix artwork flattens it onto the theme background."))
+    elif info.get("color") in ("gray", "cmyk", "palette"):
+        out.append(("warn", "%s is not plain RGB (%s)." % (what, info["color"]), "Fix artwork writes an RGB copy."))
+    if info.get("bytes", 0) > 1024 * 1024:
+        out.append(("warn", "%s is %s; podcast apps fetch it often, so under 1 MB is kinder." % (what, fmt_size(info["bytes"])),
+                    "Fix artwork writes a smaller JPG."))
+    return out
+
+
+def parse_transcript(text, ext):
+    """Cues from a WebVTT or SubRip file as (speaker, words). Raises ApiError when the file is
+    not the format its name says."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    if ext == ".vtt" and not text.startswith("WEBVTT"):
+        raise ApiError("A .vtt transcript must start with WEBVTT.")
+    cues = []
+    for block in re.split(r"\n[ \t]*\n", text):
+        lines = [x for x in block.split("\n") if x.strip()]
+        at = next((k for k, x in enumerate(lines) if "-->" in x), None)
+        if at is None:
+            continue
+        if ext == ".srt" and at > 0 and not re.match(r"^\s*\d+\s*$", lines[at - 1]):
+            continue
+        words = " ".join(x.strip() for x in lines[at + 1:])
+        speaker = ""
+        m = re.match(r"^<v(?:\.[^\s>]*)?\s+([^>]+)>", words)
+        if m:
+            speaker = m.group(1).strip()
+        words = re.sub(r"\s+", " ", _unescape(re.sub(r"<[^>]*>", "", words))).strip()
+        if not speaker:
+            m = re.match(r"^([A-Z][\w .'-]{0,30}):\s+(.+)$", words)
+            if m:
+                speaker, words = m.group(1).strip(), m.group(2)
+        if words:
+            cues.append((speaker, words))
+    if not cues:
+        raise ApiError("No cues found. A cue is a line with --> between two times and the words under it.")
+    return cues
+
+
+def transcript_html(cues):
+    """The words of a transcript as paragraphs: a new one when the speaker changes, or every few
+    cues when there are no speaker labels. Timestamps are dropped."""
+    paras, cur, spk = [], [], None
+    for speaker, words in cues:
+        if cur and (speaker != spk or (not speaker and len(cur) >= 6)):
+            paras.append((spk, " ".join(cur)))
+            cur = []
+        spk = speaker
+        cur.append(words)
+    if cur:
+        paras.append((spk, " ".join(cur)))
+    return "\n".join("<p>%s%s</p>" % ("<b>%s:</b> " % esc(s) if s else "", esc(t)) for s, t in paras)
+
+
+def html_to_text(html_):
+    """Plain text with paragraphs kept apart, for the YouTube description."""
+    t = re.sub(r'<a class="anchor"[^>]*>#</a>', "", html_)
+    t = re.sub(r"<(script|style)\b.*?</\1>", " ", t, flags=re.S | re.I)
+    t = re.sub(r"<li[^>]*>", "\n- ", t)
+    t = re.sub(r"</(p|h[1-6]|li|ul|ol|blockquote|pre|div|figure|table|tr)>|<br\s*/?>", "\n", t)
+    t = _unescape(re.sub(r"<[^>]+>", "", t))
+    lines = [re.sub(r"[ \t]+", " ", x).strip() for x in t.split("\n")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def http_check(url, method="HEAD", timeout=20):
+    """Ask a live server about a URL. (status, headers dict with lower-case keys, body or None,
+    error text). Follows redirects; never raises."""
+    req = urllib.request.Request(url, method=method, headers={"User-Agent": "%s podcast checker" % APP})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read() if method == "GET" else None
+            return r.status, {k.lower(): v for k, v in r.headers.items()}, body, ""
+    except urllib.error.HTTPError as e:
+        return e.code, {k.lower(): v for k, v in (e.headers or {}).items()}, None, "HTTP %d" % e.code
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return 0, {}, None, str(getattr(e, "reason", e))
+
+
+# ---- the media job: uploads, encoding and artwork fixes, one at a time, with a log
+
+MEDIA = {"running": False, "ok": None, "what": "", "lines": [], "base": 0, "proc": None, "cancel": False,
+         "queue": [], "current": ""}
+MEDIA_LOCK = threading.Lock()
+
+
+def media_say(line):
+    with MEDIA_LOCK:
+        MEDIA["lines"].append(str(line).rstrip("\r\n"))
+        extra = len(MEDIA["lines"]) - 1500
+        if extra > 0:
+            del MEDIA["lines"][:extra]
+            MEDIA["base"] += extra
+
+
+def media_status(since=0):
+    try:
+        since = max(0, int(since))
+    except (TypeError, ValueError):
+        since = 0
+    with MEDIA_LOCK:
+        lines = MEDIA["lines"][max(0, since - MEDIA["base"]):]
+        return {"running": MEDIA["running"], "ok": MEDIA["ok"], "what": MEDIA["what"], "queued": len(MEDIA["queue"]),
+                "current": MEDIA["current"], "total": MEDIA["base"] + len(MEDIA["lines"]), "lines": lines}
+
+
+def media_busy():
+    with MEDIA_LOCK:
+        return MEDIA["running"] or bool(MEDIA["queue"])
+
+
+def media_cancel():
+    """Stop the running media job. Queued jobs still run; the original upload is kept."""
+    with MEDIA_LOCK:
+        if not MEDIA["running"]:
+            return {"ok": False}
+        MEDIA["cancel"] = True
+        proc = MEDIA["proc"]
+    media_say("Stopping at your request...")
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+    return {"ok": True}
+
+
+def media_queue(what, run, episode=""):
+    """Add a job; one runs at a time, in the order they came in."""
+    with MEDIA_LOCK:
+        MEDIA["queue"].append({"what": what, "run": run, "episode": episode})
+        if MEDIA["running"]:
+            return
+        MEDIA["running"] = True
+    threading.Thread(target=media_worker, daemon=True, name="media").start()
+
+
+def media_worker():
+    while True:
+        with MEDIA_LOCK:
+            if not MEDIA["queue"]:
+                MEDIA.update(running=False, proc=None, current="")
+                return
+            task = MEDIA["queue"].pop(0)
+            MEDIA.update(cancel=False, what=task["what"], current=task["episode"], ok=None)
+        media_say("== %s (%s)" % (task["what"], datetime.datetime.now().isoformat(" ", "seconds")))
+        ok = False
+        try:
+            task["run"]()
+            ok = True
+            media_say("Done.")
+        except ApiError as e:
+            media_say("Stopped: %s" % e)
+        except Exception as e:  # noqa: BLE001  (report anything unexpected instead of dying silently)
+            media_say("Stopped: %s: %s" % (type(e).__name__, e))
+            traceback.print_exc()
+        with MEDIA_LOCK:
+            MEDIA["ok"] = ok
+
+
+def media_cancelled():
+    with MEDIA_LOCK:
+        return MEDIA["cancel"]
+
+
+def run_ffmpeg(cmd, log):
+    """Run ffmpeg or ffprobe for the media job. Output goes to the job log and to log (a list
+    kept with the episode). Returns (exit code, all stderr lines)."""
+    shown = "$ " + " ".join(shlex.quote(c) for c in cmd)
+    media_say(shown)
+    log.append(shown)
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                             text=True, errors="replace", bufsize=1)
+    except FileNotFoundError:
+        raise ApiError("%s is not installed. %s" % (cmd[0], install_hint("ffmpeg")))
+    with MEDIA_LOCK:
+        MEDIA["proc"] = p
+    lines = []
+    try:
+        for line in p.stderr:
+            line = line.rstrip()
+            lines.append(line)
+            if line:
+                media_say(line)
+        code = p.wait()
+    finally:
+        p.stderr.close()
+        with MEDIA_LOCK:
+            MEDIA["proc"] = None
+    if media_cancelled():
+        raise ApiError("Stopped at your request. The original upload is kept; Retry processing starts again.")
+    log.extend(lines[-30:])
+    return code, lines
+
+
+def loudnorm_json(lines):
+    """The statistics block loudnorm prints at the end of its run, or None."""
+    text = "\n".join(lines)
+    i, j = text.rfind("{"), text.rfind("}")
+    if i < 0 or j < i:
+        return None
+    try:
+        d = json.loads(text[i:j + 1])
+    except ValueError:
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def _pos_int(v):
+    try:
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def clean_categories(raw):
+    """Up to two categories, each a known Apple category with an optional subcategory of it."""
+    out = []
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, (list, tuple)) and item:
+            item = {"cat": item[0], "sub": item[1] if len(item) > 1 else ""}
+        if not isinstance(item, dict):
+            continue
+        cat, sub = str(item.get("cat") or "").strip(), str(item.get("sub") or "").strip()
+        if cat not in APPLE_CATEGORY_MAP:
+            continue
+        if sub not in APPLE_CATEGORY_MAP[cat]:
+            sub = ""
+        if any(x["cat"] == cat and x["sub"] == sub for x in out):
+            continue
+        out.append({"cat": cat, "sub": sub})
+    return out[:2]
+
+
+def clean_funding(raw):
+    out = []
+    for f in raw if isinstance(raw, list) else []:
+        if not isinstance(f, dict):
+            continue
+        url, text = str(f.get("url") or "").strip()[:400], re.sub(r"\s+", " ", str(f.get("text") or "")).strip()[:127]
+        if re.match(r"^https?://\S+$", url, re.I):
+            out.append({"url": url, "text": text or "Support the show"})
+    return out[:3]
+
+
+def clean_chapters(raw):
+    out = []
+    for ch in raw if isinstance(raw, list) else []:
+        if not isinstance(ch, dict):
+            continue
+        t = ch.get("start")
+        t = float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) else parse_clock(t)
+        title = re.sub(r"\s+", " ", str(ch.get("title") or "")).strip()[:200]
+        if t is None or t < 0 or not title:
+            continue
+        url = str(ch.get("url") or "").strip()[:400]
+        out.append({"start": round(t, 3), "title": title, "url": url if re.match(r"^https?://\S+$", url, re.I) else ""})
+    out.sort(key=lambda x: x["start"])
+    return out[:500]
+
+
+def _no_scheme(url):
+    return re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", str(url or "")).rstrip("/")
+
+
+def _host_of(url):
+    return urlsplit(str(url or "")).netloc.lower()
+
+
+def media_secret_path(site):
+    return site.meta / "media-secret.json"
+
+
+def media_password(site, dep):
+    """The saved password for the media host, tied to that exact target, else the environment."""
+    try:
+        d = json.loads(media_secret_path(site).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        d = {}
+    if isinstance(d, dict) and d.get("for") == secret_key(dep) and d.get("password"):
+        return str(d["password"])
+    return os.environ.get(APP.upper() + "_MEDIA_PASSWORD", "")
+
+
+def store_media_password(site, dep, password, keep):
+    p = media_secret_path(site)
+    if not keep:
+        if p.exists():
+            p.unlink()
+        return
+    if not password:
+        return
+    tmp = p.with_name(p.name + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"for": secret_key(dep), "password": password}, f)
+    os.replace(tmp, p)
+
+
+def clean_media_target(t):
+    """The media host settings: rclone with a remote:path, or any publish method but git,
+    checked by the same rules as the site's own target."""
+    t = t if isinstance(t, dict) else {}
+    method = t.get("method") or "rsync"
+    if method == "rclone":
+        remote = str(t.get("remote") or "").strip()
+        if remote and not _RCLONE_RE.match(remote):
+            raise ApiError("The rclone target looks like remote:bucket/folder, for example r2:my-bucket/podcast. "
+                           "Letters, digits, dots, dashes, underscores and slashes only.")
+        return {"method": "rclone", "remote": remote, "save_password": False}
+    if method == "git":
+        raise ApiError("git cannot be the media host: it keeps every version of every audio file forever. "
+                       "Use rsync, SFTP, FTPS, a folder or rclone.")
+    dep = clean_deploy(t, {})
+    dep["mirror"] = False
+    return dep
+
+
+class MediaRecord:
+    """Stands in for the site in the publish helpers when the target is the media host, so its
+    record of what was sent lives in .siteforge/media/published.json and the site's own record
+    and the media host's never overwrite each other."""
+
+    def __init__(self, site):
+        self.root = site.root
+        self.meta = site.meta / "media"
+
+
+def deploy_rclone(dep, staged, dry):
+    """Copy the staged audio to an rclone remote such as r2:bucket/podcast. rclone copy never
+    deletes anything at the destination."""
+    if not shutil.which("rclone"):
+        raise ApiError("rclone is not installed on this machine. " + install_hint("rclone"))
+    if not _RCLONE_RE.match(dep.get("remote") or ""):
+        raise ApiError("Set the rclone target first, for example r2:my-bucket/podcast.")
+    cmd = ["rclone", "copy", "-v", "--stats-one-line", "--stats", "10s", "--transfers", "4"]
+    if dry:
+        cmd.append("--dry-run")
+    cmd += ["--", str(staged), dep["remote"]]
+    if run_stream(cmd) != 0:
+        raise ApiError("rclone exited with an error. The log above says why.")
+
+
+class PodcastMixin:
+    # ---- paths and addresses
+    def pod_meta(self):
+        return self.meta / "podcast"
+
+    def pod_intro_md(self):
+        return self.pod_meta() / "_index.md"
+
+    def episode_md(self, slug):
+        return self.pod_meta() / "episodes" / (slug + ".md")
+
+    def incoming_dir(self):
+        return self.pod_meta() / "incoming"
+
+    def pod_base(self, c=None):
+        return self.mbase("podcast", c)
+
+    def feed_rel(self, c=None):
+        return self.pod_base(c) + "feed.xml"
+
+    def episode_rel(self, slug, c=None):
+        return self.pod_base(c) + "episodes/%s.html" % slug
+
+    def chapters_rel(self, slug, c=None):
+        return self.pod_base(c) + "chapters/%s.json" % slug
+
+    def audio_dir(self, c=None):
+        return self.root / (self.pod_base(c) + "audio")
+
+    def transcript_dir(self, c=None):
+        return self.root / (self.pod_base(c) + "transcripts")
+
+    def feed_url(self, c=None):
+        c = c or self.cfg
+        return abs_url(c["site"].get("url"), self.feed_rel(c))
+
+    def media_host(self, c=None):
+        show = (c or self.cfg)["podcast"]["show"]
+        return show["media_mode"] == "host" and bool(show["media_url"])
+
+    def enclosure_url(self, c, ep):
+        f = (ep.get("audio") or {}).get("file")
+        if not f:
+            return ""
+        if self.media_host(c):
+            return c["podcast"]["show"]["media_url"].rstrip("/") + "/" + f
+        return abs_url(c["site"].get("url"), self.pod_base(c) + "audio/" + f)
+
+    def audio_src(self, c, ep, prefix):
+        f = ep["audio"]["file"]
+        if self.media_host(c):
+            return c["podcast"]["show"]["media_url"].rstrip("/") + "/" + f
+        return prefix + self.pod_base(c) + "audio/" + f
+
+    def art_url(self, c, path):
+        return resolve_img(c["site"], path)
+
+    def local_file(self, rel):
+        """A site-relative path as a file inside the site folder, or None."""
+        rel = str(rel or "").strip().lstrip("/")
+        if not rel or _SCHEME.match(rel) or not safe_rel(rel):
+            return None
+        p = self.root / rel
+        return p if p.is_file() and not p.is_symlink() else None
+
+    # ---- settings and records
+    def normalize_podcast(self):
+        c = self.cfg
+        pod = c.get("podcast") if isinstance(c.get("podcast"), dict) else {}
+        raw = pod.get("show") if isinstance(pod.get("show"), dict) else {}
+        show = dict(PODCAST_SHOW_DEFAULTS)
+        show.update({k: v for k, v in raw.items() if k in PODCAST_SHOW_DEFAULTS})
+        for k in PODCAST_SHOW_BOOLS:
+            show[k] = bool(show[k])
+        for k in ("title", "author", "owner_name", "owner_email", "language", "image", "link", "copyright", "guid",
+                  "feed_lock", "locked_at", "media_url", "saved", "live_seen"):
+            show[k] = str(show[k] or "")[:400]
+        show["type"] = "serial" if show["type"] == "serial" else "episodic"
+        show["format"] = "m4a" if show["format"] == "m4a" else "mp3"
+        show["media_mode"] = "host" if show["media_mode"] == "host" else "site"
+        show["kbps_mono"] = _clamp_int(show["kbps_mono"], 64, 128, 64)
+        show["kbps_stereo"] = _clamp_int(show["kbps_stereo"], 128, 256, 128)
+        show["upload_limit_mb"] = _clamp_int(show["upload_limit_mb"], 1, 1024 * 1024, 2048)
+        show["categories"] = clean_categories(show["categories"])
+        show["funding"] = clean_funding(show["funding"])
+        show["legacy_feeds"] = [str(u)[:400] for u in (show["legacy_feeds"] if isinstance(show["legacy_feeds"], list) else [])
+                                if re.match(r"^https?://\S+$", str(u))][:20]
+        show["verified"] = [str(u) for u in (show["verified"] if isinstance(show["verified"], list) else [])][-3000:]
+        cl = show["checklist"] if isinstance(show["checklist"], dict) else {}
+        show["checklist"] = {k: str(v)[:40] for k, v in cl.items() if k in DIRECTORY_IDS and v}
+        ln = show["links"] if isinstance(show["links"], dict) else {}
+        show["links"] = {k: str(v).strip()[:400] for k, v in ln.items()
+                         if k in DIRECTORY_IDS and re.match(r"^https?://\S+$", str(v).strip())}
+        show["last_ping"] = show["last_ping"] if isinstance(show["last_ping"], dict) else {}
+        show["media_target"] = show["media_target"] if isinstance(show["media_target"], dict) else {}
+        busy = media_busy()
+        eps, seen, guids = [], set(), set()
+        for e in pod.get("episodes") if isinstance(pod.get("episodes"), list) else []:
+            if not isinstance(e, dict) or not slugify(e.get("slug", "")) or slugify(e["slug"]) in seen:
+                continue
+            e["slug"] = slugify(e["slug"])
+            seen.add(e["slug"])
+            e["title"] = re.sub(r"\s+", " ", str(e.get("title") or title_from_name(e["slug"]))).strip()[:200]
+            g = str(e.get("guid") or "").strip()[:300]
+            if not g or g in guids:
+                g = "urn:uuid:%s" % uuid.uuid4()
+            guids.add(g)
+            e["guid"] = g
+            e["number"], e["season"] = _pos_int(e.get("number")), _pos_int(e.get("season"))
+            e["kind"] = e.get("kind") if e.get("kind") in EPISODE_KINDS else "full"
+            e["status"] = "published" if e.get("status") == "published" else "draft"
+            e["date"] = clean_when(e.get("date"))
+            e["summary"] = re.sub(r"\s+", " ", str(e.get("summary") or "")).strip()[:400]
+            e["explicit"] = e.get("explicit") if e.get("explicit") in ("yes", "no") else ""
+            for k in ("art", "seo_title", "description", "image", "canonical"):
+                e[k] = str(e.get(k) or "")[:400]
+            e["noindex"] = bool(e.get("noindex"))
+            try:
+                e["duration"] = max(0, int(round(float(e.get("duration") or 0))))
+            except (TypeError, ValueError):
+                e["duration"] = 0
+            a = e.get("audio") if isinstance(e.get("audio"), dict) else {}
+            name = str(a.get("file") or "")
+            if name and safe_rel(name) and "/" not in name:
+                e["audio"] = {"file": name, "bytes": _clamp_int(a.get("bytes"), 0, 1 << 50, 0),
+                              "type": a.get("type") if a.get("type") in AUDIO_TYPES.values() else AUDIO_TYPES["mp3"],
+                              "kbps": _clamp_int(a.get("kbps"), 0, 10000, 0), "channels": _clamp_int(a.get("channels"), 0, 16, 0),
+                              "sample_rate": _clamp_int(a.get("sample_rate"), 0, 1000000, 0), "codec": str(a.get("codec") or "")[:20],
+                              "lufs": a.get("lufs") if isinstance(a.get("lufs"), (int, float)) else None,
+                              "sha256": str(a.get("sha256") or "")[:64], "probed": bool(a.get("probed"))}
+            else:
+                e["audio"] = {}
+            m = e.get("media") if isinstance(e.get("media"), dict) else {}
+            state = m.get("state") if m.get("state") in ("queued", "processing", "ready", "failed") else ""
+            message = str(m.get("message") or "")[:400]
+            if state in ("queued", "processing") and not busy:
+                state, message = "failed", "Processing was interrupted. Retry processing starts it again."
+            e["media"] = {"state": state, "message": message,
+                          "log": [str(x)[:300] for x in (m.get("log") if isinstance(m.get("log"), list) else [])][-80:],
+                          "original": str(m.get("original") or "")[:200], "name": str(m.get("name") or "")[:200]}
+            t = e.get("transcript") if isinstance(e.get("transcript"), dict) else {}
+            tf = str(t.get("file") or "")
+            e["transcript"] = ({"file": tf, "type": t.get("type") if t.get("type") in TRANSCRIPT_TYPES.values() else "text/vtt",
+                                "cues": _clamp_int(t.get("cues"), 0, 10 ** 7, 0)}
+                               if tf and safe_rel(tf) and "/" not in tf else {})
+            e["chapters"] = clean_chapters(e.get("chapters"))
+            eps.append(e)
+        c["podcast"] = {"show": show, "episodes": eps}
+
+    def pod_show(self, c):
+        """Show settings with the blanks filled in from the site settings."""
+        s, site = dict(c["podcast"]["show"]), c["site"]
+        s["title"] = s["title"] or site["title"]
+        s["author"] = s["author"] or site.get("author") or s["title"]
+        s["language"] = s["language"] or site.get("lang") or "en"
+        if not s["copyright"]:
+            foot = (site.get("footer") or "").replace("{year}", str(datetime.date.today().year)) \
+                .replace("{title}", site["title"]).replace("{author}", site.get("author") or site["title"])
+            s["copyright"] = plain_text(Markdown("").inline(foot)) if foot.strip() else ""
+        s["link"] = s["link"] or re.sub(r"(^|/)index\.html$", r"\1", abs_url(site.get("url"), self.landing_rel("podcast", c)))
+        return s
+
+    def find_episode(self, slug, c=None):
+        return next((e for e in (c or self.cfg)["podcast"]["episodes"] if e["slug"] == slug), None)
+
+    def get_episode_rec(self, slug):
+        e = self.find_episode(slug)
+        if not e:
+            raise ApiError("That episode does not exist.", 404)
+        return e
+
+    def pod_episodes(self, c, scheduled=False):
+        """Published episodes newest first. scheduled: the ones dated in the future instead."""
+        now = now_when()
+        out = []
+        for e in c["podcast"]["episodes"]:
+            if e["status"] != "published":
+                continue
+            if (parse_when(e["date"]) > now) == scheduled:
+                out.append(e)
+        out.sort(key=lambda e: (parse_when(e["date"]), e["title"].lower()), reverse=True)
+        return out
+
+    def ep_label(self, e):
+        n, s = e.get("number"), e.get("season")
+        if not n:
+            return ""
+        return "S%d E%d" % (s, n) if s else "E%d" % n
+
+    def next_number(self):
+        nums = [e["number"] for e in self.cfg["podcast"]["episodes"] if e.get("number") and e["kind"] == "full"]
+        return (max(nums) + 1) if nums else 1
+
+    # ---- the feed
+    def pod_last_date(self, c, eps):
+        dates = [parse_when(e["date"]) for e in eps[:1]]
+        saved = parse_when(c["podcast"]["show"].get("saved"))
+        if saved:
+            dates.append(saved)
+        return max(dates) if dates else None
+
+    def pod_item(self, c, e, show, base):
+        site_url = c["site"]["url"]
+        notes = Markdown(base).render(strip_title_h1(read_text(self.episode_md(e["slug"])), e["title"]))
+        desc = (("<p>%s</p>\n" % esc(e["summary"])) if e["summary"] else "") + notes
+        if not desc.strip():
+            desc = "<p>%s</p>" % esc(e["title"])
+        a = e["audio"]
+        x = ["<item>",
+             "<title>%s</title>" % xml_text(e["title"]),
+             "<itunes:title>%s</itunes:title>" % xml_text(e["title"]),
+             "<link>%s</link>" % xml_text(abs_url(site_url, self.episode_rel(e["slug"], c))),
+             '<guid isPermaLink="false">%s</guid>' % xml_text(e["guid"]),
+             "<pubDate>%s</pubDate>" % email.utils.format_datetime(parse_when(e["date"])),
+             "<description>%s</description>" % cdata(cut_html(desc, 4000)),
+             "<content:encoded>%s</content:encoded>" % cdata(notes or desc),
+             '<enclosure url="%s" length="%d" type="%s"/>' % (xml_attr(self.enclosure_url(c, e)), a["bytes"],
+                                                             xml_attr(a["type"]))]
+        if e.get("duration"):
+            x.append("<itunes:duration>%d</itunes:duration>" % e["duration"])
+        if e.get("season"):
+            x.append("<itunes:season>%d</itunes:season>" % e["season"])
+        if e.get("number"):
+            x.append("<itunes:episode>%d</itunes:episode>" % e["number"])
+        x.append("<itunes:episodeType>%s</itunes:episodeType>" % e["kind"])
+        if e["explicit"]:
+            x.append("<itunes:explicit>%s</itunes:explicit>" % ("true" if e["explicit"] == "yes" else "false"))
+        art = self.art_url(c, e.get("art"))
+        if art:
+            x.append('<itunes:image href="%s"/>' % xml_attr(art))
+        t = e.get("transcript") or {}
+        if t.get("file"):
+            x.append('<podcast:transcript url="%s" type="%s" language="%s" rel="captions"/>'
+                     % (xml_attr(abs_url(site_url, self.pod_base(c) + "transcripts/" + t["file"])), xml_attr(t["type"]),
+                        xml_attr(show["language"])))
+        if e["chapters"]:
+            x.append('<podcast:chapters url="%s" type="application/json+chapters"/>'
+                     % xml_attr(abs_url(site_url, self.chapters_rel(e["slug"], c))))
+        x.append("</item>")
+        return "\n".join(x)
+
+    def pod_feed(self, c, self_url, new_url=""):
+        """The podcast feed. self_url is where this copy lives; new_url, for a feed that moved,
+        is where podcast apps should go instead."""
+        show = self.pod_show(c)
+        base = c["site"]["url"].rstrip("/") + "/"
+        eps = [e for e in self.pod_episodes(c) if e["audio"].get("file")]
+        about = Markdown(base).render(read_text(self.pod_intro_md()))
+        ch = ['<atom:link href="%s" rel="self" type="application/rss+xml"/>' % xml_attr(self_url)]
+        if show["websub"]:
+            ch.append('<atom:link href="%s" rel="hub"/>' % xml_attr(WEBSUB_HUB))
+        ch += ["<title>%s</title>" % xml_text(show["title"]),
+               "<itunes:title>%s</itunes:title>" % xml_text(show["title"]),
+               "<link>%s</link>" % xml_text(show["link"]),
+               "<description>%s</description>" % cdata(cut_html(about or "<p>%s</p>" % esc(show["title"]), 4000, by_bytes=True)),
+               "<language>%s</language>" % xml_text(show["language"])]
+        if show["copyright"]:
+            ch.append("<copyright>%s</copyright>" % xml_text(show["copyright"]))
+        last = self.pod_last_date(c, eps)
+        if last:
+            ch.append("<lastBuildDate>%s</lastBuildDate>" % email.utils.format_datetime(last))
+        ch.append("<generator>%s</generator>" % xml_text(APP))
+        img = self.art_url(c, show["image"])
+        if img:
+            ch.append("<image><url>%s</url><title>%s</title><link>%s</link></image>"
+                      % (xml_text(img), xml_text(show["title"]), xml_text(show["link"])))
+            ch.append('<itunes:image href="%s"/>' % xml_attr(img))
+        ch.append("<itunes:author>%s</itunes:author>" % xml_text(show["author"]))
+        if show["owner_name"] or show["owner_email"]:
+            ch.append("<itunes:owner><itunes:name>%s</itunes:name><itunes:email>%s</itunes:email></itunes:owner>"
+                      % (xml_text(show["owner_name"] or show["author"]), xml_text(show["owner_email"])))
+        for cat in show["categories"]:
+            if cat["sub"]:
+                ch.append('<itunes:category text="%s"><itunes:category text="%s"/></itunes:category>'
+                          % (xml_attr(cat["cat"]), xml_attr(cat["sub"])))
+            else:
+                ch.append('<itunes:category text="%s"/>' % xml_attr(cat["cat"]))
+        ch.append("<itunes:explicit>%s</itunes:explicit>" % ("true" if show["explicit"] else "false"))
+        ch.append("<itunes:type>%s</itunes:type>" % show["type"])
+        if show["complete"]:
+            ch.append("<itunes:complete>Yes</itunes:complete>")
+        if show["block"]:
+            ch.append("<itunes:block>Yes</itunes:block>")
+            ch.append("<podcast:block>yes</podcast:block>")
+        if new_url:
+            ch.append("<itunes:new-feed-url>%s</itunes:new-feed-url>" % xml_text(new_url))
+        guid = show["guid"] or podcast_guid(self.feed_url(c))
+        if guid:
+            ch.append("<podcast:guid>%s</podcast:guid>" % xml_text(guid))
+        owner = show["owner_email"]
+        ch.append("<podcast:locked%s>%s</podcast:locked>"
+                  % (' owner="%s"' % xml_attr(owner) if owner else "", "yes" if show["locked"] else "no"))
+        for f in show["funding"]:
+            ch.append('<podcast:funding url="%s">%s</podcast:funding>' % (xml_attr(f["url"]), xml_text(f["text"])))
+        items = [self.pod_item(c, e, show, base) for e in eps]
+        return ('<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" %s>\n<channel>\n%s\n%s%s</channel>\n</rss>\n'
+                % (PODCAST_FEED_NS, "\n".join(ch), "\n".join(items), "\n" if items else ""))
+
+    def chapters_json(self, e):
+        chs = []
+        for ch in e["chapters"]:
+            t = ch["start"]
+            d = {"startTime": int(t) if float(t).is_integer() else t, "title": ch["title"]}
+            if ch["url"]:
+                d["url"] = ch["url"]
+            chs.append(d)
+        return json.dumps({"version": "1.2.0", "chapters": chs}, indent=2, ensure_ascii=False) + "\n"
+
+    def legacy_rel(self, c, old):
+        """Where a feed that moved used to live, as a path in this site, or "" when it was elsewhere."""
+        here = _no_scheme(c["site"].get("url")) + "/"
+        o = _no_scheme(old)
+        if not here.strip("/") or not o.startswith(here):
+            return ""
+        rel = o[len(here):]
+        if (not safe_rel(rel) or not rel.endswith(".xml") or rel == self.feed_rel(c) or rel.startswith((".", "assets/"))
+                or rel in ("sitemap.xml",) or rel.endswith("/rss.xml") or rel == "rss.xml"):
+            return ""
+        return rel
+
+    def pod_files(self, c):
+        base = self.pod_base(c)
+        files = {}
+        rel = base + "index.html"
+        if rel != "index.html":
+            files[rel] = self.pod_landing(c, rel)
+        for e in self.pod_episodes(c):
+            files[self.episode_rel(e["slug"], c)] = self.render_episode(c, e, read_text(self.episode_md(e["slug"])))
+            if e["chapters"]:
+                files[self.chapters_rel(e["slug"], c)] = self.chapters_json(e)
+        if c["site"].get("url"):
+            url = self.feed_url(c)
+            files[self.feed_rel(c)] = self.pod_feed(c, url)
+            for old in c["podcast"]["show"]["legacy_feeds"]:
+                lrel = self.legacy_rel(c, old)
+                if lrel and lrel not in files:
+                    files[lrel] = self.pod_feed(c, old, new_url=url)
+        return files
+
+    def pod_legacy_rels(self, c=None):
+        c = c or self.cfg
+        return [r for r in (self.legacy_rel(c, u) for u in c["podcast"]["show"]["legacy_feeds"]) if r]
+
+    # ---- pages
+    def pod_head(self, c, prefix, extra=None):
+        out = []
+        if self.feed_url(c):
+            out.append('<link rel="alternate" type="application/rss+xml" title="%s" href="%s%s">'
+                       % (attr("%s (podcast)" % self.pod_show(c)["title"]), prefix, attr(self.feed_rel(c))))
+        return out + (extra or [])
+
+    def subscribe_html(self, c, prefix, compact=False):
+        show = c["podcast"]["show"]
+        items = ['<li><a href="%s">%s</a></li>' % (attr(show["links"][d["id"]]), esc(d["name"]))
+                 for d in DIRECTORIES if show["links"].get(d["id"])]
+        feed = self.feed_url(c)
+        if feed:
+            items.append('<li><a href="%s%s">RSS feed</a></li>' % (prefix, attr(self.feed_rel(c))))
+            if not compact:
+                items.append('<li class="pod-feed-url"><code>%s</code></li>' % esc(feed))
+        if not items:
+            return ""
+        return '<ul class="pod-subscribe%s" aria-label="Subscribe">%s</ul>' % (" compact" if compact else "", "".join(items))
+
+    def ep_meta_line(self, e, with_label=False):
+        bits = []
+        if with_label and self.ep_label(e):
+            bits.append(esc(self.ep_label(e)))
+        bits.append('<time datetime="%s">%s</time>' % (attr(e["date"]), esc(nice_date(e["date"][:10]))))
+        if fmt_duration(e.get("duration")):
+            bits.append(esc(fmt_duration(e["duration"])))
+        return '<p class="pod-meta">%s</p>' % " &middot; ".join(bits)
+
+    def ep_badge(self, e):
+        return ' <span class="pod-badge">%s</span>' % ("Trailer" if e["kind"] == "trailer" else "Bonus") if e["kind"] != "full" else ""
+
+    def ep_summary(self, e):
+        return e["summary"] or auto_summary(Markdown("").render(read_text(self.episode_md(e["slug"]))))
+
+    def player_html(self, c, e, prefix):
+        a = e.get("audio") or {}
+        if not a.get("file"):
+            return ""
+        src = attr(self.audio_src(c, e, prefix))
+        kind = "MP3" if a["type"] == AUDIO_TYPES["mp3"] else "M4A"
+        return ('<div class="pod-player"><audio controls preload="none"><source src="%s" type="%s"></audio>\n'
+                '<p class="pod-download"><a href="%s" download>Download (%s, %s)</a></p></div>'
+                % (src, attr(a["type"]), src, fmt_size(a["bytes"]), kind))
+
+    def episode_list(self, c, eps, prefix):
+        """The episodes on the show page, shaped by the podcast layout."""
+        if not eps:
+            return '<p class="empty">No episodes yet.</p>'
+        show = c["podcast"]["show"]
+        style = layout_opt(c, "podcast").get("list", "list")
+        serial = show["type"] == "serial"
+        if serial:
+            eps = list(reversed(eps))
+
+        def entry(e, featured=False):
+            href = prefix + attr(self.episode_rel(e["slug"], c))
+            label = self.ep_label(e)
+            num = '<span class="pod-num">%s</span> ' % esc(label) if label else ""
+            title = '<h3><a href="%s">%s%s</a>%s</h3>\n' % (href, num, esc(e["title"]), self.ep_badge(e))
+            meta = self.ep_meta_line(e) + "\n"
+            summary = "" if style == "archive" else self.ep_summary(e)
+            summ = '<p class="pod-summary">%s</p>\n' % esc(summary) if summary else ""
+            if featured:
+                img = card_image(e.get("art") or show["image"], prefix)
+                art = '<img class="pod-art" src="%s" alt="" loading="lazy">\n' % attr(img) if img else ""
+                return ('<section class="pod-spotlight">\n%s<div class="pod-body">\n<p class="pod-kicker">Latest episode</p>\n'
+                        '%s%s%s%s</div>\n</section>' % (art, title, meta, summ, self.player_html(c, e, prefix)))
+            if style == "cards":
+                img = card_image(e.get("art") or show["image"], prefix)
+                over = '<span class="pod-thumb-num">%s</span>' % esc(label) if label and not e.get("art") and img else ""
+                if over:
+                    title = '<h3><a href="%s">%s</a>%s</h3>\n' % (href, esc(e["title"]), self.ep_badge(e))
+                thumb = ('<a class="pod-thumb" href="%s" tabindex="-1" aria-hidden="true"><img src="%s" alt="" loading="lazy">%s</a>\n'
+                         % (href, attr(img), over)) if img else ""
+                return '<li class="pod-ep%s">\n%s<div class="pod-body">\n%s%s%s</div>\n</li>' % (
+                    " has-thumb" if img else "", thumb, title, meta, summ)
+            return '<li class="pod-ep">\n%s%s%s</li>' % (title, meta, summ)
+
+        head = '<h2 class="pod-episodes-title">Episodes</h2>\n'
+        lead = ""
+        if style == "spotlight" and not serial:
+            lead, eps = entry(eps[0], featured=True) + "\n", eps[1:]
+            if not eps:
+                return lead
+            head = '<h2 class="pod-episodes-title">Earlier episodes</h2>\n'
+        ul = '<ul class="pod-episodes%s">\n%s\n</ul>' % (" cards" if style == "cards" else (" archive" if style == "archive" else ""), "%s")
+        seasons = any(e.get("season") for e in eps)
+        if style == "archive" or (serial and seasons):
+            groups = []
+            for e in eps:
+                key = ("Season %d" % e["season"] if e.get("season") else "Other episodes") if seasons else e["date"][:4]
+                if not groups or groups[-1][0] != key:
+                    groups.append((key, []))
+                groups[-1][1].append(entry(e))
+            body = "\n".join('<section class="pod-season">\n<h3 class="pod-group">%s</h3>\n%s\n</section>'
+                             % (esc(k), ul % "\n".join(rows)) for k, rows in groups)
+        else:
+            body = ul % "\n".join(entry(e) for e in eps) if eps else ""
+        return lead + head + body
+
+    def pod_landing(self, c, rel, css=None, base=None, intro=None):
+        prefix = up(rel)
+        show = self.pod_show(c)
+        body = self.md(c, prefix).render(read_text(self.pod_intro_md()) if intro is None else intro)
+        art = card_image(show["image"], prefix)
+        badge = ' <span class="pod-badge">Explicit</span>' if show["explicit"] else ""
+        parts = ['<header class="pod-show">%s<div class="pod-head">\n<h1 class="page-title">%s%s</h1>\n'
+                 '<p class="pod-author">%s</p>\n</div></header>'
+                 % ('<img class="pod-art" src="%s" alt="">\n' % attr(art) if art else "", esc(show["title"]), badge,
+                    esc(show["author"])),
+                 self.subscribe_html(c, prefix)]
+        if body:
+            parts.append('<section class="pod-about">\n%s\n</section>' % body)
+        parts.append(self.episode_list(c, self.pod_episodes(c), prefix))
+        home = c["home"] == "podcast"
+        site = c["site"]
+        return self.doc(c, rel=rel, body_class="mod-podcast podcast-show",
+                        title="" if rel == "index.html" else self.module_label("podcast", c),
+                        main='<article class="content">\n%s\n</article>' % "\n".join(x for x in parts if x),
+                        desc=auto_summary(body) or site.get("description") or site.get("tagline"),
+                        image=show["image"], current_mod="podcast", css=css, base=base,
+                        head_extra=self.pod_head(c, prefix), canonical_rel="index.html" if home else None)
+
+    def render_episode(self, c, e, markdown, css=None, base=None):
+        rel = self.episode_rel(e["slug"], c)
+        prefix = up(rel)
+        show = self.pod_show(c)
+        body = self.md(c, prefix).render(strip_title_h1(markdown, e["title"]))
+        img = card_image(e.get("art") or show["image"], prefix)
+        parts = ['<p class="pod-back"><a href="%s%s">%s</a></p>' % (prefix, self.landing_rel("podcast", c), esc(show["title"])),
+                 '<header class="pod-ep-head">%s<div class="pod-head">\n<h1 class="page-title">%s%s</h1>\n%s\n</div></header>'
+                 % ('<img class="pod-art" src="%s" alt="">\n' % attr(img) if img else "", esc(e["title"]),
+                    self.ep_badge(e), self.ep_meta_line(e, with_label=True)),
+                 self.player_html(c, e, prefix)]
+        if body:
+            parts.append('<div class="pod-notes">\n%s\n</div>' % body)
+        if e["chapters"]:
+            rows = []
+            for ch in e["chapters"]:
+                t = esc(ch["title"])
+                if ch["url"]:
+                    t = '<a href="%s">%s</a>' % (attr(ch["url"]), t)
+                rows.append('<li><span class="pod-time">%s</span> %s</li>' % (clock(ch["start"]), t))
+            parts.append('<section class="pod-chapters">\n<h2>Chapters</h2>\n<ol>\n%s\n</ol>\n</section>' % "\n".join(rows))
+        t = e.get("transcript") or {}
+        if t.get("file"):
+            path = self.transcript_dir(c) / t["file"]
+            try:
+                words = transcript_html(parse_transcript(read_text(path), Path(t["file"]).suffix.lower()))
+            except ApiError:
+                words = ""
+            parts.append('<details class="pod-transcript">\n<summary>Transcript</summary>\n%s\n'
+                         '<p class="pod-download"><a href="%s%s" download>Download the transcript</a></p>\n</details>'
+                         % (words, prefix, attr(self.pod_base(c) + "transcripts/" + t["file"])))
+        sub = self.subscribe_html(c, prefix, compact=True)
+        if sub:
+            parts.append(sub)
+        eps = self.pod_episodes(c)
+        slugs = [x["slug"] for x in eps]
+        if c["site"].get("post_nav") and e["slug"] in slugs:
+            i = slugs.index(e["slug"])
+            pager = []
+            if i + 1 < len(eps):
+                o = eps[i + 1]
+                pager.append('<a class="prev" href="%s%s"><small>Older</small>%s</a>'
+                             % (prefix, attr(self.episode_rel(o["slug"], c)), esc(o["title"])))
+            if i > 0:
+                n = eps[i - 1]
+                pager.append('<a class="next" href="%s%s"><small>Newer</small>%s</a>'
+                             % (prefix, attr(self.episode_rel(n["slug"], c)), esc(n["title"])))
+            if pager:
+                parts.append('<nav class="pager" aria-label="More episodes">%s</nav>' % "".join(pager))
+        extra = []
+        enc = self.enclosure_url(c, e)
+        if enc:
+            extra.append('<meta property="og:audio" content="%s">' % attr(enc))
+            extra.append('<meta property="og:audio:type" content="%s">' % attr(e["audio"]["type"]))
+        desc = e.get("description") or e["summary"] or auto_summary(body)
+        return self.doc(c, rel=rel, body_class="mod-podcast podcast-episode ep-" + e["slug"], title=e["title"],
+                        main='<article class="content">\n%s\n</article>' % "\n".join(x for x in parts if x),
+                        desc=desc, og_type="article", published=e["date"],
+                        image=e.get("image") or e.get("art") or show["image"], seo_title=e.get("seo_title"),
+                        canonical=e.get("canonical"), noindex=e.get("noindex"), current_mod="podcast", css=css,
+                        base=base, head_extra=self.pod_head(c, prefix, extra))
+
+    def pod_sitemap(self, c):
+        rows = []
+        if c["home"] != "podcast":
+            rows.append((self.landing_rel("podcast", c), ""))
+        rows += [(self.episode_rel(e["slug"], c), e["date"][:10]) for e in self.pod_episodes(c) if not e.get("noindex")]
+        return rows
+
+    # ---- preview
+    def pod_preview(self, c, p, md, css, base):
+        if p.get("view") == "podcasthome":
+            rel = "index.html" if c["home"] == "podcast" else self.pod_base(c) + "index.html"
+            return self.pod_landing(c, rel, css=css, base=preview_base(rel), intro=md)
+        e = self.find_episode(str(p.get("orig_slug") or ""), c)
+        if e is None:
+            e = {"slug": slugify(str(p.get("new_slug") or p.get("title") or "")) or "episode", "guid": "", "audio": {},
+                 "transcript": {}, "chapters": [], "media": {}, "duration": 0}
+            c["podcast"]["episodes"].append(e)
+        e.update(title=str(p.get("title") or "").strip() or "Untitled episode", number=_pos_int(p.get("number")),
+                 season=_pos_int(p.get("season")), kind=p.get("kind") if p.get("kind") in EPISODE_KINDS else "full",
+                 date=clean_when(p.get("date")), summary=str(p.get("summary") or "").strip()[:400],
+                 explicit=p.get("explicit") if p.get("explicit") in ("yes", "no") else "",
+                 art=str(p.get("art") or "").strip()[:400], chapters=clean_chapters(p.get("chapters")), status="published")
+        if not e["audio"].get("probed") and parse_clock(p.get("duration")) is not None:
+            e["duration"] = int(round(parse_clock(p.get("duration"))))
+        seo_fields(p, e)
+        rel = self.episode_rel(e["slug"], c)
+        return self.render_episode(c, e, md, css=css, base=preview_base(rel))
+
+    def pod_preview_target(self, c, rest, css):
+        if not rest:
+            rel = self.pod_base(c) + "index.html"
+            return self.pod_landing(c, rel, css=css, base=preview_base(rel))
+        e = self.find_episode(rest, c)
+        if e:
+            rel = self.episode_rel(e["slug"], c)
+            return self.render_episode(c, e, read_text(self.episode_md(rest)), css=css, base=preview_base(rel))
+        return None
+
+    def pod_preview_targets(self, c):
+        out = [{"id": "podcast:", "label": "Podcast show page"}]
+        out += [{"id": "podcast:" + e["slug"], "label": "Episode: " + e["title"]} for e in self.pod_episodes(c)[:20]]
+        return out
+
+    # ---- feed check
+    def art_info(self, path):
+        p = self.local_file(path)
+        if p is None:
+            return None
+        st = p.stat()
+        cache = self._art_cache
+        key = str(p)
+        hit = cache.get(key)
+        if hit and hit[0] == (st.st_mtime_ns, st.st_size):
+            return hit[1]
+        info = image_info(p)
+        cache[key] = ((st.st_mtime_ns, st.st_size), info)
+        return info
+
+    def pod_check(self, c, feed):
+        """The feed check: fail stops Build and publish, warn and info are advice."""
+        out = []
+
+        def add(level, text, fix=""):
+            out.append({"level": level, "text": text, "fix": fix})
+
+        site, show = c["site"], c["podcast"]["show"]
+        url = site.get("url") or ""
+        if not url:
+            add("fail", "The site URL is missing, so there is no feed yet.",
+                "Enter it under Settings, for example https://example.com.")
+        elif url.lower().startswith("http://"):
+            add("warn", "The site URL starts with http://. Apple and Spotify expect https.",
+                "Turn on HTTPS on the server, then change the URL under Settings.")
+        if not show["owner_email"]:
+            add("fail", "The owner email is missing.", "Fill it in under Owner. Directories send verification codes to it.")
+        if re.match(r"^https?://", show["image"], re.I):
+            add("info", "The show art is a web address, so it was not checked here.")
+        else:
+            for level, text, fix in art_problems(self.art_info(show["image"]) if show["image"] else None, "Show art"):
+                add(level, text, fix)
+        if not show["categories"]:
+            add("fail", "No category is chosen.", "Pick at least a primary category under Show.")
+        eps = self.pod_episodes(c)
+        if not eps:
+            add("fail", "No episode is published yet.", "Directories turn down a feed with no episodes.")
+        if show["media_mode"] == "host" and not show["media_url"]:
+            add("fail", "Audio is set to live on a separate media host, but the media base URL is blank.",
+                "Fill in Media base URL under Media.")
+        seen_url, seen_guid = {}, {}
+        for e in eps:
+            a = e["audio"]
+            name = '"%s"' % e["title"]
+            if not a.get("file"):
+                add("fail", "%s is published but has no audio." % name, "Upload its audio, or move it back to drafts.")
+                continue
+            path = self.audio_dir(c) / a["file"]
+            if not path.is_file():
+                add("fail", "The audio for %s is missing: %s." % (name, path), "Upload it again, or restore the file.")
+            elif path.stat().st_size != a["bytes"]:
+                add("fail", "The audio for %s changed size on disk (%d bytes, the record says %d)." % (name, path.stat().st_size, a["bytes"]),
+                    "Upload it again through the editor so the feed gets the right length.")
+            if not all(ord(ch) < 128 for ch in a["file"]):
+                add("fail", "The audio file name for %s has non-ASCII characters." % name, "Upload it again; new names are ASCII.")
+            u = self.enclosure_url(c, e)
+            if u in seen_url:
+                add("fail", "%s and %s share the same audio address." % (name, seen_url[u]), "Give each episode its own audio.")
+            seen_url[u] = name
+            if e["guid"] in seen_guid:
+                add("fail", "%s and %s share a GUID." % (name, seen_guid[e["guid"]]), "Edit config.json so each one is unique.")
+            seen_guid[e["guid"]] = name
+            if not e.get("duration"):
+                add("warn", "%s has no duration." % name, "Type the length into the episode, or install ffmpeg so it is measured.")
+            if re.match(r"^\s*(#|ep\.?\s*|episode\s+)?\d+\s*[:.)|-]", e["title"], re.I):
+                add("warn", "The title of %s starts with an episode number." % name,
+                    "Apple asks for the number in the episode number field, not the title.")
+            if isinstance(a.get("lufs"), (int, float)) and abs(a["lufs"] + 16) > 1:
+                add("warn", "%s measures %.1f LUFS; the target is -16." % (name, a["lufs"]),
+                    "Turn on Normalize loudness and Retry processing.")
+            if e.get("art") and not re.match(r"^https?://", e["art"], re.I):
+                for level, text, fix in art_problems(self.art_info(e["art"]), "Episode art for %s" % name):
+                    add("warn", text, fix)
+            notes_len = len(e["summary"]) + len(Markdown("").render(read_text(self.episode_md(e["slug"]))))
+            if notes_len > 4000:
+                add("info", "The description of %s is over 4,000 characters, so the feed's short description is cut; "
+                            "the full show notes still go out." % name)
+        for e in c["podcast"]["episodes"]:
+            if e["media"]["state"] == "failed":
+                add("warn", 'Processing failed for "%s".' % e["title"], "Open the episode to see the log, then Retry processing.")
+        if len(Markdown("").render(read_text(self.pod_intro_md())).encode("utf-8")) > 4000:
+            add("info", "About the show is over 4,000 bytes, so the feed carries a shortened copy.")
+        if show["block"]:
+            add("warn", "Keep out of directories is on, so directories will not list the show.", "Turn it off under Feed when you are ready.")
+        for e in self.pod_episodes(c, scheduled=True):
+            add("info", '"%s" is scheduled for %s. It goes out with the first publish after that time.'
+                % (e["title"], e["date"].replace("T", " ")))
+        if feed:
+            try:
+                ET.fromstring(feed.encode("utf-8"))
+            except ET.ParseError as err:
+                add("fail", "The built feed does not parse as XML: %s." % err, "Report this; it is a bug in the generator.")
+        return out
+
+    def pod_check_fails(self):
+        return [x for x in self._pod_check if x["level"] == "fail"]
+
+    # ---- publishing hooks (read by the shared publish code)
+    def publish_blocker(self):
+        if self.enabled("podcast") and media_busy():
+            return "Audio is still being processed. Publish when the media job has finished."
+        return ""
+
+    def publish_check(self):
+        if not self.enabled("podcast"):
+            return ""
+        fails = self.pod_check_fails()
+        if not fails:
+            return ""
+        return ("The podcast feed check failed: %s Fix it, or tick Publish anyway to send the site regardless."
+                % " ".join(x["text"] for x in fails[:4]))
+
+    def publish_plan(self, dep, dry):
+        """What the publish needs to do differently for the podcast: the feed files go last,
+        and with a separate media host the audio goes there first and stays off the site."""
+        if not self.enabled("podcast") or not self.cfg["site"].get("url"):
+            return {}
+        c = self.cfg
+        plan = {"last": [self.feed_rel(c)] + self.pod_legacy_rels(c)}
+        if c["podcast"]["show"]["media_mode"] == "host":
+            plan["exclude"] = [self.pod_base(c) + "audio/"]
+            plan["before"] = lambda: self.pod_send_media(dry)
+        plan["after"] = lambda: self.pod_after_publish()
+        return plan
+
+    def media_target(self):
+        t = self.cfg["podcast"]["show"]["media_target"]
+        dep = clean_media_target(t)
+        if dep["method"] == "rclone":
+            if not dep["remote"]:
+                raise ApiError("Set the media host's rclone target under Media in show settings.")
+            return dep
+        if dep["method"] == "folder":
+            folder_dest(self, dep)
+        return validate_deploy(dep)
+
+    def pod_media_files(self, c):
+        """Audio files for published episodes, by file name."""
+        out = []
+        for e in self.pod_episodes(c):
+            f = e["audio"].get("file")
+            if f and (self.audio_dir(c) / f).is_file() and f not in out:
+                out.append(f)
+        return out
+
+    def pod_send_media(self, dry):
+        """Stage 1 of a publish with a separate media host: send the audio, then check that every
+        enclosure answers before the feed that points at it goes anywhere."""
+        with LOCK:
+            c = copy.deepcopy(self.cfg)
+            dep = self.media_target()
+        files = self.pod_media_files(c)
+        job_say("Stage 1 of 2: %d audio file(s) to the media host (%s)." % (len(files), dep["method"]))
+        root = self.meta / "staging"
+        root.mkdir(parents=True, exist_ok=True)
+        staged = Path(tempfile.mkdtemp(prefix="media-", dir=str(root)))
+        try:
+            for f in files:
+                src = self.audio_dir(c) / f
+                try:
+                    os.link(src, staged / f)
+                except OSError:
+                    shutil.copy2(src, staged / f)
+            sigs = file_sigs(staged, files)
+            if dep["method"] == "rclone":
+                deploy_rclone(dep, staged, dry)
+            else:
+                password = media_password(self, dep)
+                rec = MediaRecord(self)
+                send = changed_files(rec, dep, files, sigs)
+                if dep["method"] != "rsync" and len(send) < len(files):
+                    job_say("%d of them changed since the last upload to the media host; only those are sent." % len(send))
+                if dep["method"] == "rsync":
+                    deploy_rsync(dep, password, staged, dry)
+                elif dep["method"] == "sftp":
+                    deploy_sftp(rec, dep, password, files, staged, dry, send)
+                elif dep["method"] in ("ftp", "ftps"):
+                    deploy_ftp(rec, dep, password, files, staged, dry, send)
+                else:
+                    deploy_folder(rec, dep, files, staged, dry, send)
+            if not dry:
+                # The media host never deletes, so its record keeps every file ever sent there until
+                # "Remove unused audio from the media host" takes some away.
+                rec = MediaRecord(self)
+                all_sigs = load_published_sigs(rec, dep) or {}
+                all_sigs.update(sigs)
+                save_published(rec, dep, sorted(set(load_published(rec, dep) or []) | set(files)), all_sigs)
+        finally:
+            shutil.rmtree(staged, ignore_errors=True)
+        if dry:
+            job_say("Dry run: the media host was not checked over the network.")
+            return
+        job_say("Checking that every episode's audio answers at the media base URL...")
+        bad = []
+        for e in self.pod_episodes(c):
+            if not e["audio"].get("file"):
+                continue
+            url = self.enclosure_url(c, e)
+            st, hd, _, err = http_check(url)
+            if st != 200 or hd.get("content-length") not in (None, str(e["audio"]["bytes"])):
+                bad.append("%s (%s)" % (url, err or ("HTTP %d" % st if st != 200 else "wrong length")))
+        if bad:
+            for b in bad:
+                job_say("Not reachable: " + b)
+            raise ApiError("%d audio file(s) do not answer at the media base URL, so the feed was not sent. "
+                           "Check the media base URL and the media host." % len(bad))
+        job_say("Stage 2 of 2: the site, with the feed last.")
+
+    def pod_after_publish(self):
+        """After a successful publish: check what is live, ping Podcast Index when the feed
+        changed, and lock the feed URL the first time."""
+        with LOCK:
+            c = copy.deepcopy(self.cfg)
+        feed_url = self.feed_url(c)
+        local = self.root / self.feed_rel(c)
+        if not feed_url or not local.is_file():
+            return
+        show = c["podcast"]["show"]
+        verified = set(show["verified"])
+        job_say("Live check of %s" % feed_url)
+        warnings, newly, cloudflare = [], [], False
+        targets = [(e["title"], self.enclosure_url(c, e), e["audio"]["bytes"]) for e in self.pod_episodes(c)
+                   if e["audio"].get("file") and self.enclosure_url(c, e) not in verified]
+        art = self.art_url(c, show["image"])
+        for title, url, size in targets:
+            st, hd, _, err = http_check(url)
+            if "cf-ray" in hd or hd.get("server", "").lower() == "cloudflare":
+                cloudflare = True
+            if st != 200:
+                warnings.append("Audio for \"%s\" did not answer: %s (%s)." % (title, url, err or st))
+                continue
+            if hd.get("content-length") is not None and hd["content-length"] != str(size):
+                warnings.append("Audio for \"%s\" is %s bytes on the server; the feed says %d." % (title, hd["content-length"], size))
+                continue
+            if hd.get("accept-ranges", "").lower() != "bytes":
+                warnings.append("The server does not say it answers byte ranges for %s. Apple needs that for seeking." % url)
+            newly.append(url)
+        if art:
+            st, hd, _, err = http_check(art)
+            if st != 200:
+                warnings.append("The show art did not answer at %s (%s)." % (art, err or st))
+        st, hd, body, err = http_check(feed_url, "GET")
+        live = False
+        if st != 200:
+            warnings.append("The feed did not answer at %s (%s)." % (feed_url, err or st))
+        elif body != local.read_bytes():
+            warnings.append("The live feed differs from the one just built. A cache in front of the server may still "
+                            "hold the old one; it should catch up.")
+            live = True
+        else:
+            live = True
+            job_say("The live feed matches the one just built.")
+        if cloudflare and show["media_mode"] == "site":
+            warnings.append("The audio is served through Cloudflare's proxy. Cloudflare's CDN terms let it limit sites "
+                            "that serve a lot of audio this way; R2 or a DNS-only subdomain for audio avoids that. %s"
+                            % CLOUDFLARE_TERMS)
+        for w in warnings:
+            job_say("Warning: " + w)
+        if not warnings:
+            job_say("Live check passed: %d new audio file(s) answered with the right size." % len(newly))
+        feed_hash = hashlib.sha256(local.read_bytes()).hexdigest()
+        ping = None
+        if show["ping"] and live and not show["block"] and show["last_ping"].get("hash") != feed_hash:
+            ping = self.pod_ping(feed_url, feed_hash)
+        if show["websub"] and live and show["last_ping"].get("websub") != feed_hash:
+            self.pod_websub(feed_url)
+        with LOCK:
+            s = self.cfg["podcast"]["show"]
+            s["verified"] = (s["verified"] + newly)[-3000:]
+            if live:
+                s["live_seen"] = now_when().isoformat()
+            if ping is not None:
+                s["last_ping"] = ping
+            if show["websub"] and live:
+                s["last_ping"]["websub"] = feed_hash
+            if not s["feed_lock"]:
+                s["feed_lock"] = feed_url
+                s["guid"] = podcast_guid(feed_url)
+                s["locked_at"] = now_when().isoformat()
+                job_say("The feed URL is now locked to %s, and its podcast:guid is %s. Changes that would move it "
+                        "ask first." % (feed_url, s["guid"]))
+            self.save_cfg()
+
+    def pod_ping(self, feed_url, feed_hash):
+        """Tell Podcast Index the feed changed. Needs no key; a failure is only a warning."""
+        url = PODCAST_INDEX_PING + quote(feed_url, safe="")
+        req = urllib.request.Request(url, headers={"User-Agent": "%s (self-hosted podcast feed)" % APP})
+        ok, message = False, ""
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                text = r.read(4000).decode("utf-8", "replace")
+                ok = r.status == 200
+            try:
+                d = json.loads(text)
+                message = str(d.get("description") or text)[:200]
+                ok = ok and str(d.get("status")).lower() == "true"
+            except ValueError:
+                message = text[:200]
+        except urllib.error.HTTPError as e:
+            message = "HTTP %d" % e.code
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            message = str(getattr(e, "reason", e))
+        job_say(("Pinged Podcast Index: %s" if ok else "Warning: the Podcast Index ping failed: %s") % message)
+        return {"at": now_when().isoformat(), "ok": ok, "message": message, "hash": feed_hash}
+
+    def pod_websub(self, feed_url):
+        data = ("hub.mode=publish&hub.url=" + quote(feed_url, safe="")).encode("ascii")
+        req = urllib.request.Request(WEBSUB_HUB, data=data, headers={"User-Agent": "%s (self-hosted podcast feed)" % APP,
+                                                                       "Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                job_say("Notified the WebSub hub (HTTP %d)." % r.status)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            job_say("Warning: the WebSub hub did not take the notice: %s" % getattr(e, "reason", e))
+
+    # ---- feed URL lock
+    def pod_feed_moved(self, old_cfg):
+        """A message when a change would move a locked feed, else ""."""
+        lock = self.cfg["podcast"]["show"].get("feed_lock")
+        if not lock:
+            return ""
+        new = self.feed_url() if self.enabled("podcast") else ""
+        if new == lock:
+            return ""
+        if not new:
+            return ("The podcast feed at %s is locked: podcast apps and directories read it. This change takes it off "
+                    "the site, so they will stop getting new episodes. Continue?" % lock)
+        msg = ("The podcast feed moves from\n  %s\nto\n  %s\n\nPodcast apps and directories know the old address. "
+               % (lock, new))
+        if _host_of(lock) != _host_of(new):
+            msg += ("The old address is on another domain (%s), so that server has to keep serving the old feed or "
+                    "redirect it to the new one; this app cannot write there. " % _host_of(lock))
+        else:
+            msg += ("The old address keeps getting a copy of the feed that tells apps to switch (itunes:new-feed-url), "
+                    "on every build, until you remove it. ")
+        return msg + "Continue?"
+
+    def pod_accept_move(self):
+        show = self.cfg["podcast"]["show"]
+        new = self.feed_url() if self.enabled("podcast") else ""
+        old = show["feed_lock"]
+        if new and old and old != new and old not in show["legacy_feeds"]:
+            show["legacy_feeds"].append(old)
+        if new in show["legacy_feeds"]:
+            show["legacy_feeds"].remove(new)
+        if new:
+            show["feed_lock"] = new
+
+    def pod_move_files(self, old_cfg):
+        """Carry audio and transcripts along when the podcast's folder changes."""
+        if not self.enabled("podcast") or "podcast" not in old_cfg.get("modules", {}):
+            return
+        old_base = (old_cfg["modules"]["podcast"]["mount"] + "/") if old_cfg["modules"]["podcast"]["mount"] else ""
+        new_base = self.pod_base()
+        if old_base == new_base:
+            return
+        for sub in ("audio", "transcripts"):
+            src, dest = self.root / (old_base + sub), self.root / (new_base + sub)
+            if not src.is_dir() or src.is_symlink():
+                continue
+            dest.mkdir(parents=True, exist_ok=True)
+            for f in src.iterdir():
+                if f.is_file() and not f.is_symlink() and not (dest / f.name).exists():
+                    os.replace(f, dest / f.name)
+            try:
+                src.rmdir()
+            except OSError:
+                pass
+
+    # ---- rescan and unused audio
+    def pod_rescan(self):
+        r = {"episodes_added": 0}
+        d = self.pod_meta() / "episodes"
+        d.mkdir(parents=True, exist_ok=True)
+        eps = self.cfg["podcast"]["episodes"]
+        known = {e["slug"] for e in eps}
+        for f in sorted(md_files(d), key=lambda p: p.name.lower()):
+            slug = slugify(f.stem)
+            if not slug or slug in known:
+                continue
+            if slug != f.stem:
+                if self.episode_md(slug).exists():
+                    continue
+                rename_path(f, self.episode_md(slug))
+            eps.append({"slug": slug, "title": first_h1(read_text(self.episode_md(slug))) or title_from_name(f.stem),
+                        "status": "draft"})
+            known.add(slug)
+            r["episodes_added"] += 1
+        self.normalize_podcast()
+        r["unused_audio"] = len(self.unused_audio())
+        return r
+
+    def unused_audio(self):
+        folder = self.audio_dir()
+        if not folder.is_dir() or folder.is_symlink():
+            return []
+        used = {e["audio"].get("file") for e in self.cfg["podcast"]["episodes"]}
+        out = []
+        for f in sorted(folder.iterdir(), key=lambda p: p.name.lower()):
+            if f.is_file() and not f.is_symlink() and not f.name.startswith(".") and f.name not in used:
+                out.append({"file": f.name, "bytes": f.stat().st_size})
+        return out
+
+    def trash_unused(self, d):
+        names = d.get("files") if isinstance(d.get("files"), list) else []
+        unused = {x["file"] for x in self.unused_audio()}
+        n = 0
+        for name in names:
+            if name in unused:
+                self.to_trash(self.audio_dir() / name)
+                n += 1
+        return {"trashed": n, "unused": self.unused_audio()}
+
+    # ---- editor API: the show
+    def pod_state(self):
+        """The podcast part of the editor state: enough for the sidebar and the views."""
+        c = self.cfg
+        show = c["podcast"]["show"]
+        now = now_when()
+        eps = []
+        for e in c["podcast"]["episodes"]:
+            eps.append({"slug": e["slug"], "title": e["title"], "status": e["status"], "date": e["date"],
+                        "kind": e["kind"], "number": e["number"], "season": e["season"], "media": e["media"]["state"],
+                        "has_audio": bool(e["audio"].get("file")),
+                        "scheduled": e["status"] == "published" and parse_when(e["date"]) > now})
+        eps.sort(key=lambda e: (e["date"], e["title"].lower()), reverse=True)
+        fails = len(self.pod_check_fails())
+        return {"episodes": eps, "feed_url": self.feed_url(c), "check_fails": fails,
+                "checklist_done": len(show["checklist"]), "checklist_total": len(DIRECTORIES),
+                "media_mode": show["media_mode"], "upload_limit_mb": show["upload_limit_mb"],
+                "next_number": self.next_number()}
+
+    def get_show(self):
+        c = self.cfg
+        show = c["podcast"]["show"]
+        dep = clean_media_target(show["media_target"]) if show["media_target"] else {"method": "rsync"}
+        media_dep = dict(default_deploy())
+        media_dep.update(dep)
+        return {"show": show, "resolved": self.pod_show(c), "markdown": read_text(self.pod_intro_md()),
+                "categories": APPLE_CATEGORIES, "feed_url": self.feed_url(c), "feed_rel": self.feed_rel(c),
+                "guid": show["guid"] or podcast_guid(self.feed_url(c)), "check": self._pod_check,
+                "unused": self.unused_audio(), "directories": DIRECTORIES, "media_target": media_dep,
+                "media_password": bool(media_password(self, dep)) if show["media_target"] else False,
+                "audio_folder": str(self.audio_dir()), "legacy": [{"url": u, "rel": self.legacy_rel(c, u)}
+                                                                   for u in show["legacy_feeds"]],
+                "env_var": APP.upper() + "_MEDIA_PASSWORD"}
+
+    def save_show(self, d):
+        c = self.cfg
+        show = c["podcast"]["show"]
+        before = (json.dumps({k: show.get(k) for k in ("title", "author", "owner_name", "owner_email", "language",
+                                                        "categories", "explicit", "type", "image", "link", "copyright",
+                                                        "complete", "block", "locked", "funding", "websub")},
+                             sort_keys=True), read_text(self.pod_intro_md()))
+        new = dict(show)
+        for k, limit in (("title", 200), ("author", 200), ("owner_name", 200), ("owner_email", 200), ("language", 12),
+                         ("image", 400), ("link", 400), ("copyright", 400), ("media_url", 400)):
+            if k in d:
+                new[k] = re.sub(r"\s+", " ", str(d[k] or "")).strip()[:limit]
+        if new["owner_email"] and not _EMAIL_RE.match(new["owner_email"]):
+            raise ApiError("The owner email does not look like an email address.")
+        if new["language"] and not _LANG_RE.match(new["language"]):
+            raise ApiError("Language is a code such as en or en-US.")
+        for k in ("link", "media_url"):
+            if new[k] and not re.match(r"^https?://[^\s/]+", new[k], re.I):
+                raise ApiError("The %s must start with http:// or https://." % ("website link" if k == "link" else "media base URL"))
+        for k in PODCAST_SHOW_BOOLS:
+            if k in d:
+                new[k] = bool(d[k])
+        if d.get("type") in ("episodic", "serial"):
+            new["type"] = d["type"]
+        if d.get("format") in AUDIO_TYPES:
+            new["format"] = d["format"]
+        if d.get("media_mode") in ("site", "host"):
+            new["media_mode"] = d["media_mode"]
+        for k, lo, hi in (("kbps_mono", 64, 128), ("kbps_stereo", 128, 256), ("upload_limit_mb", 1, 1024 * 1024)):
+            if k in d:
+                new[k] = _clamp_int(d[k], lo, hi, new[k])
+        if "categories" in d:
+            for item in d["categories"] if isinstance(d["categories"], list) else []:
+                cat = str((item or {}).get("cat") or "") if isinstance(item, dict) else ""
+                if cat and cat not in APPLE_CATEGORY_MAP:
+                    raise ApiError("%s is not one of Apple's categories." % cat)
+            new["categories"] = clean_categories(d["categories"])
+        if "funding" in d:
+            for f in d["funding"] if isinstance(d["funding"], list) else []:
+                if isinstance(f, dict) and str(f.get("url") or "").strip() and not re.match(r"^https?://\S+$", str(f["url"]).strip()):
+                    raise ApiError("A funding link must be a full web address starting with https://.")
+            new["funding"] = clean_funding(d["funding"])
+        if isinstance(d.get("media_target"), dict):
+            t = clean_media_target(d["media_target"])
+            if t["method"] != "rclone":
+                validate_deploy(t, require=False)
+            new["media_target"] = t
+            if t["method"] != "rclone" and "media_password" in d:
+                store_media_password(self, t, str(d.get("media_password") or ""), bool(t.get("save_password")))
+        c["podcast"]["show"] = new
+        if "markdown" in d:
+            write_text(self.pod_intro_md(), str(d.get("markdown") or ""))
+        after = (json.dumps({k: new.get(k) for k in json.loads(before[0])}, sort_keys=True), read_text(self.pod_intro_md()))
+        if after != before:
+            new["saved"] = now_when().isoformat()
+        self.normalize_podcast()
+        self.save_cfg()
+        self.build()
+        return self.get_show()
+
+    # ---- editor API: episodes
+    def get_episode(self, slug):
+        e = self.get_episode_rec(slug)
+        md = read_text(self.episode_md(slug))
+        return {"episode": e, "markdown": md, "enclosure": self.enclosure_url(self.cfg, e),
+                "youtube": self.youtube_text(e, md), "src": ("/site/" + self.pod_base() + "audio/" + e["audio"]["file"])
+                if e["audio"].get("file") else "", "base": self.pod_base() + "episodes/"}
+
+    def youtube_text(self, e, md):
+        """Title, a plain-text description and chapter times, for pasting into YouTube Studio."""
+        base = (self.cfg["site"].get("url") or "").rstrip("/") + "/"
+        notes = html_to_text(Markdown(base).render(strip_title_h1(md, e["title"])))
+        lines = [e["title"], ""]
+        if e["summary"]:
+            lines += [e["summary"], ""]
+        if notes:
+            lines += [notes, ""]
+        if e["chapters"]:
+            lines += ["Chapters"] + ["%s %s" % (clock(ch["start"]), ch["title"]) for ch in e["chapters"]] + [""]
+        if self.feed_url():
+            lines += ["Podcast feed: " + self.feed_url()]
+        return "\n".join(lines).strip() + "\n"
+
+    def save_episode(self, d):
+        title = re.sub(r"\s+", " ", str(d.get("title") or "")).strip()[:200]
+        if not title:
+            raise ApiError("Give the episode a title.")
+        eps = self.cfg["podcast"]["episodes"]
+        orig = str(d.get("orig_slug") or "")
+        ep = self.find_episode(orig) if orig else None
+        if orig and not ep:
+            raise ApiError("That episode does not exist.", 404)
+        if d.get("publish") and not (ep and ep["audio"].get("file")):
+            raise ApiError("Add the audio before publishing. Save a draft, upload the recording, then publish.")
+        chapters = clean_chapters(d.get("chapters")) if "chapters" in d else (ep["chapters"] if ep else [])
+        if chapters and chapters[0]["start"] != 0:
+            raise ApiError("The first chapter has to start at 0:00.")
+        wanted = slugify(str(d.get("new_slug") or "")) or slugify(title) or "episode"
+        taken = {e["slug"] for e in eps if e is not ep}
+        slug, n = wanted, 2
+        while slug in taken:
+            slug = "%s-%d" % (wanted, n)
+            n += 1
+        if ep is None:
+            ep = {"slug": slug, "status": "draft", "guid": "urn:uuid:%s" % uuid.uuid4(), "audio": {}, "media": {},
+                  "transcript": {}, "chapters": []}
+            if "number" not in d:
+                d["number"] = self.next_number()
+            eps.append(ep)
+        elif ep["slug"] != slug:
+            old = self.episode_md(ep["slug"])
+            if old.exists():
+                os.replace(old, self.episode_md(slug))
+            ep["slug"] = slug
+
+        def val(k):
+            # A field left out of the request keeps its saved value.
+            return d[k] if k in d else ep.get(k)
+
+        ep.update(title=title, number=_pos_int(val("number")), season=_pos_int(val("season")),
+                  kind=val("kind") if val("kind") in EPISODE_KINDS else "full", date=clean_when(val("date")),
+                  summary=str(val("summary") or "").strip()[:400],
+                  explicit=val("explicit") if val("explicit") in ("yes", "no") else "",
+                  art=str(val("art") or "").strip()[:400], chapters=chapters)
+        if "duration" in d and not ep["audio"].get("probed"):
+            t = parse_clock(d.get("duration"))
+            ep["duration"] = int(round(t)) if t is not None else 0
+        seo_fields(d, ep)
+        if d.get("publish"):
+            ep["status"] = "published"
+        if "markdown" in d or not self.episode_md(slug).exists():
+            write_text(self.episode_md(slug), str(d.get("markdown") or ""))
+        self.normalize_podcast()
+        self.save_cfg()
+        self.build()
+        return {"slug": slug, "episode": self.find_episode(slug), "state": self.state()}
+
+    def unpublish_episode(self, slug):
+        e = self.get_episode_rec(slug)
+        e["status"] = "draft"
+        self.save_cfg()
+        self.build()
+        return {"episode": e}
+
+    def delete_episode(self, slug):
+        e = self.get_episode_rec(slug)
+        self.cfg["podcast"]["episodes"].remove(e)
+        self.to_trash(self.episode_md(slug))
+        t = e.get("transcript") or {}
+        if t.get("file"):
+            self.to_trash(self.transcript_dir() / t["file"])
+        self.save_cfg()
+        self.build()
+        note = ""
+        if e["audio"].get("file"):
+            note = "Its audio, %s, is now under Unused audio in show settings." % e["audio"]["file"]
+        return {"ok": True, "note": note}
+
+    # ---- transcripts
+    def upload_transcript(self, slug, name, data):
+        e = self.get_episode_rec(slug)
+        ext = Path(str(name or "")).suffix.lower()
+        if ext not in TRANSCRIPT_TYPES:
+            raise ApiError("A transcript is a .vtt or .srt file.")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ApiError("The transcript must be UTF-8 text.")
+        cues = parse_transcript(text, ext)
+        stem = Path(e["audio"]["file"]).stem if e["audio"].get("file") else ("episode-%s" % slug)
+        fname = re.sub(r"[^a-z0-9-]+", "-", stem.lower()).strip("-") + ext
+        folder = self.transcript_dir()
+        old = (e.get("transcript") or {}).get("file")
+        if old and old != fname:
+            self.to_trash(folder / old)
+        write_text(folder / fname, text.replace("\r\n", "\n").lstrip("\ufeff"))
+        e["transcript"] = {"file": fname, "type": TRANSCRIPT_TYPES[ext], "cues": len(cues)}
+        self.save_cfg()
+        self.build()
+        return {"episode": e}
+
+    def delete_transcript(self, slug):
+        e = self.get_episode_rec(slug)
+        t = e.get("transcript") or {}
+        if t.get("file"):
+            self.to_trash(self.transcript_dir() / t["file"])
+        e["transcript"] = {}
+        self.save_cfg()
+        self.build()
+        return {"episode": e}
+
+    # ---- artwork
+    def art_check(self, d):
+        path = str(d.get("path") or "").strip()
+        if not path:
+            return {"info": None, "problems": [{"level": "fail", "text": "No image chosen."}]}
+        if re.match(r"^https?://", path, re.I):
+            return {"info": None, "problems": [{"level": "info", "text": "A web address cannot be checked here."}]}
+        p = self.local_file(path)
+        info = image_info(p) if p else None
+        probs = [{"level": lv, "text": t, "fix": f} for lv, t, f in art_problems(info, "This image")]
+        return {"info": info, "problems": probs, "can_fix": bool(p) and bool(shutil.which("ffmpeg"))}
+
+    def theme_bg(self):
+        m = re.search(r"--bg:\s*#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b", read_text(self.css_path()))
+        if not m:
+            return "0xffffff"
+        h = m.group(1)
+        return "0x" + ("".join(ch * 2 for ch in h) if len(h) == 3 else h)
+
+    def art_fix(self, d):
+        """Write a 3000 pixel square RGB JPG next to the original as a media job. The original is
+        never overwritten. target: show or episode, to point that record at the new file."""
+        if not shutil.which("ffmpeg"):
+            raise ApiError("Fix artwork needs ffmpeg. " + install_hint("ffmpeg"))
+        src = self.local_file(str(d.get("path") or ""))
+        if src is None:
+            raise ApiError("Choose an image in this site's folder first.")
+        stem = re.sub(r"[^A-Za-z0-9_-]+", "-", src.stem).strip("-") or "art"
+        stem = re.sub(r"-3000(-\d+)?$", "", stem)
+        folder = self.root / "assets"
+        folder.mkdir(exist_ok=True)
+        out, n = folder / (stem + "-3000.jpg"), 2
+        while out.exists():
+            out = folder / ("%s-3000-%d.jpg" % (stem, n))
+            n += 1
+        target, slug = d.get("target"), str(d.get("episode") or "")
+        bg = self.theme_bg()
+        site = self
+
+        def run():
+            log = []
+            tmp = out.with_name("." + out.name + ".part.jpg")
+            cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-nostats", "-y", "-f", "lavfi", "-i",
+                   "color=c=%s:s=3000x3000" % bg, "-i", str(src.resolve()), "-filter_complex",
+                   "[1:v]scale=3000:3000:force_original_aspect_ratio=increase,crop=3000:3000[fg];"
+                   "[0:v][fg]overlay=shortest=1:format=auto,format=yuvj444p",
+                   "-frames:v", "1", "-q:v", "3", "-f", "image2", str(tmp)]
+            try:
+                code, _ = run_ffmpeg(cmd, log)
+                if code != 0 or not tmp.is_file():
+                    raise ApiError("ffmpeg could not convert the image (exit code %d)." % code)
+                os.replace(tmp, out)
+            finally:
+                if tmp.exists():
+                    tmp.unlink()
+            rel = "assets/" + out.name
+            media_say("Wrote %s." % rel)
+            with LOCK:
+                w = CURRENT["site"] if CURRENT["site"] is not None and CURRENT["site"].root == site.root else site
+                if target == "show":
+                    w.cfg["podcast"]["show"]["image"] = rel
+                    w.cfg["podcast"]["show"]["saved"] = now_when().isoformat()
+                elif target == "episode" and w.find_episode(slug):
+                    w.find_episode(slug)["art"] = rel
+                w.save_cfg()
+                w.build()
+
+        media_queue("Fixing artwork: %s" % src.name, run)
+        return {"started": True, "path": "assets/" + out.name}
+
+    # ---- audio
+    def upload_limit(self):
+        return self.cfg["podcast"]["show"]["upload_limit_mb"] * 1024 * 1024
+
+    def queue_audio(self, slug, original, name):
+        """An upload has landed in incoming/: mark the episode and hand it to the media job."""
+        e = self.get_episode_rec(slug)
+        old = e["media"].get("original")
+        if old and old != original.name:
+            stale = self.incoming_dir() / old
+            if stale.is_file():
+                stale.unlink()
+        e["media"] = {"state": "queued", "message": "", "log": [], "original": original.name,
+                      "name": str(name or "")[:200]}
+        self.save_cfg()
+        site = self
+        media_queue("Processing audio for \"%s\"" % e["title"], lambda: site.pod_process(slug), episode=slug)
+        return {"started": True, "episode": e}
+
+    def retry_audio(self, slug):
+        e = self.get_episode_rec(slug)
+        orig = e["media"].get("original")
+        if not orig or not (self.incoming_dir() / orig).is_file():
+            raise ApiError("The original upload is gone. Upload the audio again.")
+        return self.queue_audio(slug, self.incoming_dir() / orig, e["media"].get("name"))
+
+    def pod_media_update(self, slug, **kw):
+        with LOCK:
+            w = CURRENT["site"] if CURRENT["site"] is not None and CURRENT["site"].root == self.root else self
+            e = w.find_episode(slug)
+            if e is None:
+                return None
+            e["media"].update({k: v for k, v in kw.items() if k in ("state", "message", "log", "original", "name")})
+            if "audio" in kw:
+                e["audio"] = kw["audio"]
+            if "duration" in kw:
+                e["duration"] = kw["duration"]
+            w.save_cfg()
+            if kw.get("build"):
+                w.build()
+            return e
+
+    def pod_process(self, slug):
+        """Probe, decide, encode when asked, measure and place one upload. Runs on the media job."""
+        with LOCK:
+            e = self.find_episode(slug)
+            if e is None:
+                raise ApiError("The episode was deleted before its audio was processed.")
+            ep = copy.deepcopy(e)
+            show = copy.deepcopy(self.cfg["podcast"]["show"])
+            c = copy.deepcopy(self.cfg)
+        original = self.incoming_dir() / ep["media"]["original"]
+        log = []
+        self.pod_media_update(slug, state="processing", message="", log=[])
+        out = None
+        encoding = False
+        try:
+            if not original.is_file():
+                raise ApiError("The uploaded file is gone. Upload the audio again.")
+            info = probe_audio(original)
+            msg = "Input: %s, %s%s%s" % (info["kind"] if info["kind"] != "other" else info["codec"] or "unknown",
+                                         fmt_duration(info["duration"]) or "length unknown",
+                                         ", %d kbps" % info["kbps"] if info["kbps"] else "",
+                                         ", %d channel(s)" % info["channels"] if info["channels"] else "")
+            media_say(msg)
+            log.append(msg)
+            has_ff = bool(shutil.which("ffmpeg"))
+            keepable = info["kind"] in ("mp3", "m4a")
+            if not has_ff and not keepable:
+                raise ApiError("This is %s audio. Without ffmpeg only MP3 and M4A can be used. %s"
+                               % (info["codec"] or "unknown", install_hint("ffmpeg")))
+            if not has_ff or (not show["normalize"] and keepable and not show["tags"]):
+                result, ext = original, info["kind"]
+                media_say("Keeping the file exactly as uploaded.")
+            elif not show["normalize"] and keepable:
+                encoding = True
+                ext = info["kind"]
+                out = original.with_name(original.name + ".out.part")
+                self.pod_encode(c, ep, show, original, out, ext, info, log, copy_audio=True)
+                result = out
+            else:
+                encoding = True
+                ext = show["format"]
+                out = original.with_name(original.name + ".out.part")
+                self.pod_encode(c, ep, show, original, out, ext, info, log, normalize=show["normalize"])
+                result = out
+            final = probe_audio(result) if shutil.which("ffprobe") else info
+            size = result.stat().st_size
+            digest = sha256_file(result)
+            with LOCK:
+                w = CURRENT["site"] if CURRENT["site"] is not None and CURRENT["site"].root == self.root else self
+                cur = w.find_episode(slug)
+                if cur is None:
+                    raise ApiError("The episode was deleted while its audio was processed.")
+                folder = w.audio_dir()
+                folder.mkdir(parents=True, exist_ok=True)
+                name = w.audio_name(cur, ext)
+                os.replace(result, folder / name)
+                audio = {"file": name, "bytes": size, "type": AUDIO_TYPES[ext], "kbps": final["kbps"] or info["kbps"],
+                         "channels": final["channels"] or info["channels"],
+                         "sample_rate": final["sample_rate"] or info["sample_rate"], "codec": final["codec"],
+                         "lufs": self._lufs, "sha256": digest, "probed": bool(final.get("probed"))}
+                dur = int(round(final["duration"] or info["duration"] or 0)) or cur.get("duration") or 0
+                done = "Placed %s/%s (%s%s)." % (w.pod_base() + "audio", name, fmt_size(size),
+                                                 ", %s" % fmt_duration(dur) if dur else "")
+                media_say(done)
+                log.append(done)
+                if result != original and original.exists():
+                    original.unlink()
+                cur["audio"], cur["duration"] = audio, dur
+                cur["media"] = {"state": "ready", "message": "" if final.get("probed") else
+                                "Length unknown without ffprobe: type it in.", "log": log[-80:], "original": "", "name": ""}
+                w.save_cfg()
+                w.build()
+        except ApiError as err:
+            if out is not None and out.exists():
+                out.unlink()
+            fallback = ""
+            if encoding and original.is_file() and sniff_audio(original):
+                fallback = self.pod_fallback(slug, original, log)
+            log.append("Stopped: %s" % err)
+            self.pod_media_update(slug, state="failed", message=str(err) + fallback, log=log[-80:], build=True)
+            raise
+        finally:
+            self._lufs = None
+
+    def pod_fallback(self, slug, original, log):
+        """ffmpeg failed on an MP3 or M4A: use the upload as it is so the episode has audio, and
+        keep the original for Retry processing."""
+        kind = sniff_audio(original)
+        with LOCK:
+            w = CURRENT["site"] if CURRENT["site"] is not None and CURRENT["site"].root == self.root else self
+            cur = w.find_episode(slug)
+            if cur is None or cur["audio"].get("file"):
+                return ""
+            folder = w.audio_dir()
+            folder.mkdir(parents=True, exist_ok=True)
+            name = w.audio_name(cur, kind)
+            try:
+                os.link(original, folder / name)
+            except OSError:
+                shutil.copy2(original, folder / name)
+            cur["audio"] = {"file": name, "bytes": (folder / name).stat().st_size, "type": AUDIO_TYPES[kind], "kbps": 0,
+                            "channels": 0, "sample_rate": 0, "codec": "mp3" if kind == "mp3" else "aac", "lufs": None,
+                            "sha256": sha256_file(folder / name), "probed": False}
+            w.save_cfg()
+        log.append("Using the upload as it is for now: %s." % name)
+        return " The upload is used as it is for now."
+
+    def audio_name(self, ep, ext):
+        """ep012-the-flood.mp3. A name that is taken gets -r2, -r3, so a replaced recording never
+        reuses the address of the old one."""
+        stem = ("ep%03d-%s" % (ep["number"], ep["slug"])) if ep.get("number") else ep["slug"]
+        stem = re.sub(r"[^a-z0-9-]+", "-", stem.lower()).strip("-")[:90] or "episode"
+        folder = self.audio_dir()
+        used = {e["audio"].get("file") for e in self.cfg["podcast"]["episodes"]}
+        name, n = "%s.%s" % (stem, ext), 2
+        while (folder / name).exists() or name in used:
+            name = "%s-r%d.%s" % (stem, n, ext)
+            n += 1
+        return name
+
+    _lufs = None
+
+    def pod_encode(self, c, ep, show, src, out, ext, info, log, normalize=False, copy_audio=False):
+        """Build and run the ffmpeg command: loudness in two passes when normalizing, the show's
+        format and bit rate, and tags, cover art and chapters when Write tags is on."""
+        self._lufs = None
+        base = ["ffmpeg", "-hide_banner", "-nostdin", "-nostats"]
+        target = "I=-16:TP=-1.5:LRA=11"
+        af = []
+        if normalize:
+            media_say("Measuring loudness (pass 1 of 2)...")
+            code, lines = run_ffmpeg(base + ["-i", str(src.resolve()), "-map", "0:a:0", "-af",
+                                             "loudnorm=%s:print_format=json" % target, "-f", "null", "-"], log)
+            stats = loudnorm_json(lines)
+            if code != 0 or not stats:
+                raise ApiError("ffmpeg could not measure the loudness (exit code %d)." % code)
+            af = ["-af", "loudnorm=%s:measured_I=%s:measured_TP=%s:measured_LRA=%s:measured_thresh=%s:offset=%s:"
+                         "linear=true:print_format=json" % (target, stats["input_i"], stats["input_tp"],
+                                                            stats["input_lra"], stats["input_thresh"],
+                                                            stats["target_offset"])]
+            media_say("Measured %s LUFS; normalizing to -16 (pass 2 of 2)..." % stats["input_i"])
+        inputs = ["-i", str(src.resolve())]
+        maps = ["-map", "0:a:0"]
+        extra = []
+        meta_file = None
+        if show["tags"]:
+            pc = self.pod_show(c)
+            tags = {"title": ep["title"], "artist": pc["author"], "album": pc["title"], "genre": "Podcast",
+                    "date": ep["date"][:4], "comment": ep["summary"]}
+            if ep.get("number"):
+                tags["track"] = str(ep["number"])
+            extra += ["-map_metadata", "-1"]
+            for k, v in tags.items():
+                if v:
+                    extra += ["-metadata", "%s=%s" % (k, v)]
+            art = self.local_file(ep.get("art")) or self.local_file(show["image"])
+            info_art = image_info(art) if art else None
+            if art and info_art and info_art["format"] in ("png", "jpeg"):
+                inputs += ["-i", str(art.resolve())]
+                maps += ["-map", "1:v:0"]
+                extra += ["-c:v", "mjpeg", "-q:v", "3", "-vf", "scale=1400:1400:force_original_aspect_ratio=decrease",
+                          "-disposition:v:0", "attached_pic", "-metadata:s:v", "title=Album cover",
+                          "-metadata:s:v", "comment=Cover (front)"]
+            if ep["chapters"]:
+                dur = info["duration"] or 0
+                rows = [";FFMETADATA1"]
+                for i, ch in enumerate(ep["chapters"]):
+                    end = ep["chapters"][i + 1]["start"] if i + 1 < len(ep["chapters"]) else max(dur, ch["start"] + 1)
+                    title = re.sub(r"([=;#\\\n])", r"\\\1", ch["title"])
+                    rows += ["[CHAPTER]", "TIMEBASE=1/1000", "START=%d" % int(ch["start"] * 1000),
+                             "END=%d" % int(end * 1000), "title=%s" % title]
+                meta_file = src.with_name(src.name + ".chapters.part")
+                meta_file.write_text("\n".join(rows) + "\n", encoding="utf-8")
+                idx = (len(inputs) // 2)
+                inputs += ["-f", "ffmetadata", "-i", str(meta_file.resolve())]
+                extra += ["-map_chapters", str(idx)]
+        if copy_audio:
+            codec = ["-c:a", "copy"]
+        else:
+            mono = show["mono"] or info["channels"] == 1
+            kbps = show["kbps_mono"] if mono else show["kbps_stereo"]
+            codec = ["-ar", "44100", "-ac", "1" if mono else "2", "-b:a", "%dk" % kbps]
+            codec = (["-c:a", "libmp3lame"] if ext == "mp3" else ["-c:a", "aac"]) + codec
+        fmt = ["-id3v2_version", "3", "-write_id3v1", "0", "-f", "mp3"] if ext == "mp3" else ["-movflags", "+faststart", "-f", "mp4"]
+        cmd = base + ["-y"] + inputs + maps + af + codec + extra + fmt + [str(out.resolve())]
+        try:
+            code, lines = run_ffmpeg(cmd, log)
+        finally:
+            if meta_file is not None and meta_file.exists():
+                meta_file.unlink()
+        if code != 0 or not out.is_file():
+            raise ApiError("ffmpeg could not encode the audio (exit code %d). The log has its reasons." % code)
+        if normalize:
+            st = loudnorm_json(lines)
+            try:
+                self._lufs = round(float(st["output_i"]), 1) if st else None
+            except (KeyError, TypeError, ValueError):
+                self._lufs = None
+
+    def clear_incoming(self):
+        """At startup: drop half-finished uploads and originals no episode is waiting to retry."""
+        d = self.incoming_dir()
+        if not d.is_dir():
+            return
+        keep = {e["media"].get("original") for e in self.cfg["podcast"]["episodes"]}
+        for f in d.iterdir():
+            if f.is_file() and (f.name.endswith(".part") or f.name not in keep):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+
+    # ---- small routes
+    def pod_tools(self):
+        v = tool_versions()
+        return {"tools": v, "hint_ffmpeg": install_hint("ffmpeg"), "hint_rclone": install_hint("rclone")}
+
+    def ping_now(self):
+        url = self.feed_url()
+        if not url:
+            raise ApiError("Set the site URL first, so the feed has an address.")
+        local = self.root / self.feed_rel()
+        h = hashlib.sha256(local.read_bytes()).hexdigest() if local.is_file() else ""
+        r = self.pod_ping(url, h)
+        self.cfg["podcast"]["show"]["last_ping"] = r
+        self.save_cfg()
+        return {"ping": r}
+
+    def save_checklist(self, d):
+        show = self.cfg["podcast"]["show"]
+        for k, v in (d.get("checklist") if isinstance(d.get("checklist"), dict) else {}).items():
+            if k not in DIRECTORY_IDS:
+                continue
+            if v and not show["checklist"].get(k):
+                show["checklist"][k] = today()
+            elif not v:
+                show["checklist"].pop(k, None)
+        for k, v in (d.get("links") if isinstance(d.get("links"), dict) else {}).items():
+            if k not in DIRECTORY_IDS:
+                continue
+            v = str(v or "").strip()
+            if v and not re.match(r"^https?://\S+$", v):
+                raise ApiError("A listing address must be a full web address starting with https://.")
+            if v:
+                show["links"][k] = v[:400]
+            else:
+                show["links"].pop(k, None)
+        self.normalize_podcast()
+        self.save_cfg()
+        self.build()
+        return {"show": self.cfg["podcast"]["show"]}
+
+    def start_media_job(self, kind, d):
+        """Test the media host, or remove audio from it that no episode uses any more. Runs as a
+        publish-style job so it shares the publish log."""
+        with JOB_LOCK:
+            if JOB["running"]:
+                raise ApiError("A publish is already running.")
+        if isinstance(d.get("media_target"), dict):
+            self.save_show({"media_target": d["media_target"], "media_password": d.get("media_password", "")})
+        dep = self.media_target()
+        password = str(d.get("media_password") or "") or (media_password(self, dep) if dep["method"] != "rclone" else "")
+        site = self
+        unused = []
+        if kind == "clean":
+            sent = load_published(MediaRecord(self), dep) or []
+            used = {e["audio"].get("file") for e in self.cfg["podcast"]["episodes"]}
+            unused = [f for f in sent if f not in used and safe_rel(f)]
+            if not unused:
+                return {"started": False, "message": "Nothing to remove: every file sent to the media host is in use."}
+            if not d.get("confirm"):
+                return {"needs_confirm": True, "message": "Remove these %d file(s) from the media host?\n\n%s"
+                        % (len(unused), "\n".join(unused[:40]) + ("\n..." if len(unused) > 40 else ""))}
+        what = "Testing the media host" if kind == "test" else "Removing unused audio from the media host"
+        with JOB_LOCK:
+            JOB.update(running=True, ok=None, what=what, lines=[], proc=None, cancel=False,
+                       started=datetime.datetime.now().isoformat(" ", "seconds"))
+        job_say("%s (%s) at %s" % (what, dep["method"], JOB["started"]))
+
+        def work():
+            ok = False
+            try:
+                if kind == "test":
+                    site.media_test(dep, password)
+                else:
+                    site.media_clean(dep, password, unused)
+                job_say("Done.")
+                ok = True
+            except ApiError as e:
+                job_say("Stopped: %s" % e)
+            except Exception as e:  # noqa: BLE001
+                job_say("Stopped: %s: %s" % (type(e).__name__, e))
+                traceback.print_exc()
+            with JOB_LOCK:
+                JOB.update(running=False, ok=ok, proc=None)
+
+        threading.Thread(target=work, daemon=True, name="media-host").start()
+        return {"started": True}
+
+    def media_test(self, dep, password):
+        if dep["method"] != "rclone":
+            test_deploy(self, dep, password)
+            return
+        if not shutil.which("rclone"):
+            raise ApiError("rclone is not installed on this machine. " + install_hint("rclone"))
+        code, out, err = run_quiet(["rclone", "listremotes"], 30)
+        name = dep["remote"].split(":", 1)[0] + ":"
+        job_say("$ rclone listremotes")
+        for line in out.splitlines():
+            job_say(line)
+        if code != 0 or name not in out.split():
+            raise ApiError("rclone has no remote called %s. Set it up once with: rclone config" % name)
+        if run_stream(["rclone", "lsf", "--max-depth", "1", "--", dep["remote"]]) != 0:
+            raise ApiError("rclone could not list %s. The log above says why." % dep["remote"])
+
+    def media_clean(self, dep, password, unused):
+        """Delete audio from the media host that an earlier publish sent there and no episode uses."""
+        method = dep["method"]
+        if method == "rclone":
+            if not shutil.which("rclone"):
+                raise ApiError("rclone is not installed on this machine. " + install_hint("rclone"))
+            for f in unused:
+                if run_stream(["rclone", "deletefile", "--", dep["remote"].rstrip("/") + "/" + f]) != 0:
+                    raise ApiError("rclone could not delete %s." % f)
+        elif method == "rsync":
+            # rsync from an empty folder with --delete, limited by include rules to exactly these
+            # files: everything else on the server is excluded, and excluded files are never deleted.
+            empty = Path(tempfile.mkdtemp(prefix="empty-", dir=str(self.meta)))
+            try:
+                ssh = ["ssh"] + ssh_opts(dep, password)
+                cmd = ["rsync", "-r", "--delete", "--itemize-changes", "--timeout=120"]
+                cmd += ["--include=/" + f for f in unused] + ["--exclude=*"]
+                cmd += ["-e", " ".join(shlex.quote(x) for x in ssh), "--", str(empty) + "/",
+                        "%s:%s/" % (remote_target(dep), server_path(dep).rstrip("/"))]
+                cmd, env = with_sshpass(cmd, password)
+                if run_stream(cmd, env=env) != 0:
+                    raise ApiError("rsync exited with an error. The log above says why.")
+            finally:
+                shutil.rmtree(empty, ignore_errors=True)
+        else:
+            empty = Path(tempfile.mkdtemp(prefix="empty-", dir=str(self.meta)))
+            keep = [f for f in (load_published(MediaRecord(self), dep) or []) if f not in unused]
+            mdep = dict(dep, mirror=True)
+            try:
+                # Mirror mode removes what an earlier publish sent and this one does not list. The list
+                # given is every file still in use, and nothing is sent, so only the unused files go.
+                if method == "sftp":
+                    deploy_sftp(MediaRecord(self), mdep, password, keep, empty, False, [])
+                elif method in ("ftp", "ftps"):
+                    deploy_ftp(MediaRecord(self), mdep, password, keep, empty, False, [])
+                else:
+                    deploy_folder(MediaRecord(self), mdep, keep, empty, False, [])
+            finally:
+                shutil.rmtree(empty, ignore_errors=True)
+        rec = MediaRecord(self)
+        kept = [f for f in (load_published(rec, dep) or []) if f not in unused]
+        sigs = {k: v for k, v in (load_published_sigs(rec, dep) or {}).items() if k in kept}
+        save_published(rec, dep, kept, sigs)
+        job_say("Removed %d file(s) from the media host." % len(unused))
+
+    # ---- import from PodcastGen
+    def _import_podcastgen(self, src, scfg, report, settings):
+        if self.cfg["podcast"]["episodes"]:
+            raise ApiError("This site already has a podcast with episodes. A site holds one show, so import the "
+                           "PodcastGen site into a new SiteForge site instead.")
+        meta = src / ".podcastgen"
+        s = scfg.get("site") if isinstance(scfg.get("site"), dict) else {}
+        if settings:
+            self._copy_site_settings(s, ("title", "tagline", "author", "footer", "lang", "url", "description", "image",
+                                         "twitter", "noindex", "sitemap", "feeds", "post_nav", "layout", "podcast_layout"))
+            for k in ("secure", "frame", "text"):
+                if isinstance(s.get(k), dict):
+                    self.cfg["site"][k] = s[k]
+        self.enable_module("podcast")
+        pod = scfg.get("podcast") if isinstance(scfg.get("podcast"), dict) else {}
+        show = pod.get("show") if isinstance(pod.get("show"), dict) else {}
+        self.cfg["podcast"] = {"show": {k: v for k, v in show.items() if k in PODCAST_SHOW_DEFAULTS},
+                               "episodes": [dict(e) for e in (pod.get("episodes") or []) if isinstance(e, dict)]}
+        for e in self.cfg["podcast"]["episodes"]:
+            e["media"] = {}
+        write_text(self.pod_intro_md(), src_text(meta / "podcast" / "_index.md"))
+        n = 0
+        for e in self.cfg["podcast"]["episodes"]:
+            slug = slugify(str(e.get("slug") or ""))
+            if slug:
+                write_text(self.episode_md(slug), src_text(meta / "podcast" / "episodes" / (slug + ".md")))
+                n += 1
+        pages = 0
+        for p in scfg.get("pages") if isinstance(scfg.get("pages"), list) else []:
+            if not isinstance(p, dict) or not slugify(str(p.get("slug", ""))) or p.get("slug") == "index":
+                continue
+            new = self._new_page_slug(slugify(p["slug"]))
+            rec = {"slug": new, "title": str(p.get("title") or title_from_name(new)), "show_title": bool(p.get("show_title", True))}
+            seo_fields({k: p.get(k) for k in ("seo_title", "description", "image", "canonical", "noindex") if k in p}, rec)
+            self.cfg["pages"].append(rec)
+            write_text(self.page_md(new), src_text(meta / "pages" / (slugify(p["slug"]) + ".md")))
+            pages += 1
+        for n_ in scfg.get("nav") if isinstance(scfg.get("nav"), list) else []:
+            if isinstance(n_, dict) and n_.get("type") == "link" and str(n_.get("url") or "").strip():
+                self.cfg["nav"].append({"type": "link", "label": str(n_.get("label") or "Link")[:60],
+                                        "url": str(n_["url"])[:400], "visible": bool(n_.get("visible", True))})
+        self.normalize_podcast()
+        report["_podcastgen"] = {"src": src, "url": str(s.get("url") or "").rstrip("/")}
+        report["notes"].insert(0, "Imported the show, %d episode(s) with their GUIDs and %d extra page(s) from PodcastGen."
+                               % (n, pages))
+
+    def _finish_podcastgen(self, info, report):
+        """After the podcast's folder is settled: transcripts now, audio as a media job, and the
+        feed lock carried over (with the old address kept as a legacy feed when it moves)."""
+        src = info["src"]
+        tdir = src / "transcripts"
+        if tdir.is_dir() and not tdir.is_symlink():
+            dest = self.transcript_dir()
+            dest.mkdir(parents=True, exist_ok=True)
+            for f in tdir.iterdir():
+                if f.is_file() and not f.is_symlink() and f.suffix.lower() in TRANSCRIPT_TYPES:
+                    shutil.copy2(f, dest / f.name)
+        show = self.cfg["podcast"]["show"]
+        new = self.feed_url()
+        lock = show.get("feed_lock")
+        if lock and new and lock != new:
+            if lock not in show["legacy_feeds"]:
+                show["legacy_feeds"].append(lock)
+            show["feed_lock"] = new
+            report["notes"].append("The feed moves from %s to %s. The old address keeps a copy of the feed that tells "
+                                   "podcast apps to switch." % (lock, new))
+        adir = src / "audio"
+        files = [f for f in sorted(adir.iterdir()) if f.is_file() and not f.is_symlink() and not f.name.startswith(".")] \
+            if adir.is_dir() and not adir.is_symlink() else []
+        if files:
+            dest = self.audio_dir()
+            site = self
+
+            def run():
+                dest.mkdir(parents=True, exist_ok=True)
+                for i, f in enumerate(files, 1):
+                    target = dest / f.name
+                    if target.exists() and target.stat().st_size == f.stat().st_size:
+                        media_say("%d/%d %s is already here." % (i, len(files), f.name))
+                        continue
+                    try:
+                        os.link(f, target)
+                        how = "linked"
+                    except OSError:
+                        shutil.copy2(f, target)
+                        how = "copied"
+                    media_say("%d/%d %s %s (%s)" % (i, len(files), how, f.name, fmt_size(f.stat().st_size)))
+                with LOCK:
+                    w = CURRENT["site"] if CURRENT["site"] is not None and CURRENT["site"].root == site.root else site
+                    w.build()
+
+            media_queue("Bringing over %d audio file(s) from PodcastGen" % len(files), run)
+            report["notes"].append("%d audio file(s) are being brought over in the background; the episode audio panel "
+                                   "shows the progress." % len(files))
+
+
+class Site(ImportMixin, BlogMixin, WikiMixin, LibraryMixin, PodcastMixin, SiteBase):
     pass
 
 
@@ -5389,6 +8241,7 @@ def default_deploy():
         "save_password": False,
         "passive": True,
         "insecure_tls": False,
+        "full_upload": False,
     }
 
 
@@ -5408,7 +8261,7 @@ def clean_deploy(d, current):
     if "port" in d:
         out["port"] = str(d.get("port") or "").strip()[:5]
     out["port"] = str(out.get("port") or "")
-    for k in ("mirror", "include_sources", "save_password", "passive", "insecure_tls"):
+    for k in ("mirror", "include_sources", "save_password", "passive", "insecure_tls", "full_upload"):
         if k in d:
             out[k] = bool(d[k])
         out[k] = bool(out.get(k))
@@ -5624,13 +8477,41 @@ def safe_rel(rel):
 
 
 def stage(site, files):
-    """Copy the files into a private temporary folder and publish from there."""
-    tmp = Path(tempfile.mkdtemp(prefix="%s-publish-" % APP.lower()))
+    """Put the files in a private folder inside the sources folder and publish from there, so
+    saving in the editor during an upload cannot change what is sent. Hard links cost no time
+    or space, and they are a true snapshot because every writer here replaces a file with a new
+    one instead of changing it in place. Across filesystems, or where links are not allowed, the
+    file is copied. A file that disappeared since the folder was read is left out.
+    Returns the folder and the files that made it in."""
+    base = site.meta / "staging"
+    base.mkdir(parents=True, exist_ok=True)
+    for old in base.iterdir():
+        # Only one publish runs at a time, so anything here is left over from a crash.
+        if old.is_dir() and not old.is_symlink():
+            shutil.rmtree(old, ignore_errors=True)
+    tmp = Path(tempfile.mkdtemp(prefix="publish-", dir=str(base)))
+    kept, copied = [], 0
     for rel in files:
+        src = site.root / rel
         dst = tmp / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(site.root / rel, dst, follow_symlinks=False)
-    return tmp
+        try:
+            if src.is_symlink():
+                continue
+            try:
+                os.link(src, dst)
+            except FileNotFoundError:
+                raise
+            except OSError:
+                shutil.copy2(src, dst, follow_symlinks=False)
+                copied += 1
+        except FileNotFoundError:
+            job_say("Skipped %s: it was removed while the publish was starting." % rel)
+            continue
+        kept.append(rel)
+    if copied:
+        job_say("Copied %d file(s) for the upload (hard links were not possible for them)." % copied)
+    return tmp, kept
 
 
 def target_key(dep):
@@ -5650,9 +8531,47 @@ def load_published(site, dep):
     return [f for f in (d.get("files") or []) if safe_rel(f)]
 
 
-def save_published(site, dep, files):
+def load_published_sigs(site, dep):
+    """Size and modification time of every file the last publish to this exact target sent, or
+    None when there is no such record, so the first publish anywhere sends everything."""
+    try:
+        d = json.loads((site.meta / "published.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or d.get("target") != target_key(dep) or not isinstance(d.get("sigs"), dict):
+        return None
+    out = {}
+    for k, v in d["sigs"].items():
+        if safe_rel(k) and isinstance(v, list) and len(v) == 2 and all(isinstance(x, int) for x in v):
+            out[k] = v
+    return out
+
+
+def file_sigs(root, files):
+    out = {}
+    for rel in files:
+        try:
+            st = (Path(root) / rel).stat()
+        except OSError:
+            continue
+        out[rel] = [st.st_size, st.st_mtime_ns]
+    return out
+
+
+def changed_files(site, dep, files, sigs):
+    """Files to send: every file when that was asked for or on the first publish to a target,
+    otherwise those whose size or modification time differs from the last publish there."""
+    if dep.get("full_upload"):
+        return list(files)
+    before = load_published_sigs(site, dep)
+    if before is None:
+        return list(files)
+    return [f for f in files if before.get(f) != sigs.get(f)]
+
+
+def save_published(site, dep, files, sigs=None):
     write_text(site.meta / "published.json",
-               json.dumps({"target": target_key(dep), "files": sorted(files),
+               json.dumps({"target": target_key(dep), "files": sorted(files), "sigs": sigs or {},
                            "when": datetime.date.today().isoformat()}, indent=1))
 
 
@@ -5709,25 +8628,49 @@ def resolve_password(site, dep, given):
 
 # ---- the methods
 
-def deploy_rsync(dep, password, staged, dry):
-    if not shutil.which("rsync"):
-        raise ApiError("rsync is not installed on this machine. Install it, or choose another method.")
+def rsync_commands(dep, password, staged, dry, last=(), exclude=()):
+    """The rsync command lines for a publish: one run, or two when some files must go last.
+    Run 1 excludes those files and the excluded folders, and rsync never deletes an excluded
+    file on the receiver, so mirror mode leaves them alone. Run 2 sends only the held-back
+    files and never deletes anything."""
     ssh = ["ssh"] + ssh_opts(dep, password)
     # -r -t -z without -l or -p: no symlinks, no local permission bits; --chmod gives sane web
     # permissions. The protect filter keeps server-side dotfiles (.htaccess, .well-known) safe
     # from --delete.
-    cmd = ["rsync", "-rtz", "--human-readable", "--itemize-changes", "--timeout=120",
-           "--chmod=D755,F644", "--filter=P .*"]
+    base = ["rsync", "-rtz", "--human-readable", "--itemize-changes", "--timeout=120",
+            "--chmod=D755,F644", "--filter=P .*"]
     if dry:
-        cmd.append("--dry-run")
-    if dep.get("mirror"):
-        cmd.append("--delete")
-    cmd += ["-e", " ".join(shlex.quote(x) for x in ssh), "--",
+        base.append("--dry-run")
+    tail = ["-e", " ".join(shlex.quote(x) for x in ssh), "--",
             str(staged) + "/", "%s:%s/" % (remote_target(dep), server_path(dep).rstrip("/"))]
-    cmd, env = with_sshpass(cmd, password)
-    code = run_stream(cmd, env=env)
-    if code != 0:
-        raise ApiError("rsync exited with code %d. The log above says why." % code)
+    first = list(base)
+    if dep.get("mirror"):
+        first.append("--delete")
+    first += ["--exclude=/" + f for f in last] + ["--exclude=/" + e.strip("/") + "/" for e in exclude]
+    cmds = [first + tail]
+    if last:
+        inc = []
+        for f in last:
+            parts = f.split("/")
+            for i in range(1, len(parts)):
+                d = "--include=/" + "/".join(parts[:i]) + "/"
+                if d not in inc:
+                    inc.append(d)
+            inc.append("--include=/" + f)
+        cmds.append(base + inc + ["--exclude=*"] + tail)
+    return cmds
+
+
+def deploy_rsync(dep, password, staged, dry, last=(), exclude=()):
+    if not shutil.which("rsync"):
+        raise ApiError("rsync is not installed on this machine. Install it, or choose another method.")
+    for i, cmd in enumerate(rsync_commands(dep, password, staged, dry, last, exclude)):
+        if i:
+            job_say("Now the files that go last: %s" % ", ".join(last))
+        cmd, env = with_sshpass(cmd, password)
+        code = run_stream(cmd, env=env)
+        if code != 0:
+            raise ApiError("rsync exited with code %d. The log above says why." % code)
 
 
 def sftp_quote(s):
@@ -5738,7 +8681,8 @@ def sftp_quote(s):
     return '"%s"' % s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def deploy_sftp(site, dep, password, files, staged, dry):
+def deploy_sftp(site, dep, password, files, staged, dry, send=None):
+    send = files if send is None else send
     if not shutil.which("sftp"):
         raise ApiError("The sftp program (part of OpenSSH) is not installed. Install it, or choose another method.")
     odd = [f for f in files if set(f) & set("*?[]\\\"")]
@@ -5754,19 +8698,19 @@ def deploy_sftp(site, dep, password, files, staged, dry):
     for part in [p for p in base.split("/") if p and p != "."]:
         walked.append(part)
         lines.append("-mkdir " + sftp_quote(prefix + "/".join(walked)))
-    for f in files:
+    for f in send:
         parts = f.split("/")[:-1]
         for i in range(len(parts)):
             sub = "/".join(parts[: i + 1])
             if sub not in made:
                 made.add(sub)
                 lines.append("-mkdir " + sftp_quote(base + "/" + sub))
-    for f in files:
+    for f in send:
         lines.append("put %s %s" % (sftp_quote(str(staged / f)), sftp_quote(base + "/" + f)))
     for f in stale:
         lines.append("-rm " + sftp_quote(base + "/" + f))
     if dry:
-        job_say("Dry run. %d file(s) would be uploaded and %d removed." % (len(files), len(stale)))
+        job_say("Dry run. %d file(s) would be uploaded and %d removed." % (len(send), len(stale)))
         for line in lines[:80]:
             job_say("  " + line)
         if len(lines) > 80:
@@ -5843,19 +8787,20 @@ def ftp_enter(ftp, path, create):
     return ftp.pwd()
 
 
-def deploy_ftp(site, dep, password, files, staged, dry):
+def deploy_ftp(site, dep, password, files, staged, dry, send=None):
+    send = files if send is None else send
     if not password:
         raise ApiError("FTP needs a password.")
     previous = load_published(site, dep) or []
     stale = [f for f in previous if f not in files] if dep.get("mirror") else []
     if dry:
-        job_say("Dry run. %d file(s) would be uploaded and %d removed." % (len(files), len(stale)))
+        job_say("Dry run. %d file(s) would be uploaded and %d removed." % (len(send), len(stale)))
         return
     ftp = ftp_connect(dep, password)
     try:
         home = ftp_enter(ftp, server_path(dep), create=True).rstrip("/")
         made = set()
-        for i, f in enumerate(files, 1):
+        for i, f in enumerate(send, 1):
             if job_cancelled():
                 raise ApiError("Stopped before it finished. Publish again to complete the upload.")
             parts = f.split("/")[:-1]
@@ -5869,8 +8814,8 @@ def deploy_ftp(site, dep, password, files, staged, dry):
                         pass
             with open(staged / f, "rb") as fh:
                 ftp.storbinary("STOR " + home + "/" + f, fh)
-            if i % 10 == 0 or i == len(files):
-                job_say("Uploaded %d/%d" % (i, len(files)))
+            if i % 10 == 0 or i == len(send):
+                job_say("Uploaded %d/%d" % (i, len(send)))
         for f in stale:
             try:
                 ftp.delete(home + "/" + f)
@@ -5905,7 +8850,7 @@ def git_cmd(*args):
             "-c", "protocol.ext.allow=never", "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60"] + list(args)
 
 
-def deploy_git(site, dep, password, dry):
+def deploy_git(site, dep, password, dry, exclude=()):
     if not shutil.which("git"):
         raise ApiError("git is not installed on this machine.")
     branch = dep.get("branch") or "main"
@@ -5921,13 +8866,19 @@ def deploy_git(site, dep, password, dry):
     ignore = site.root / ".gitignore"
     current = read_text(ignore)
     if dep.get("include_sources"):
-        wanted = [META_DIR + "/secret.json", META_DIR + "/secret.json.tmp", META_DIR + "/published.json"]
+        wanted = [META_DIR + "/secret.json", META_DIR + "/secret.json.tmp", META_DIR + "/published.json",
+                  META_DIR + "/media-secret.json", META_DIR + "/staging/", META_DIR + "/podcast/incoming/"]
     else:
         wanted = [META_DIR + "/"]
+    wanted += ["/" + e.strip("/") + "/" for e in exclude]
     add = [w for w in wanted if w not in current.split("\n")]
     if add:
         write_text(ignore, (current.rstrip("\n") + "\n" if current.strip() else "") + "\n".join(add) + "\n")
-    run_stream(git_cmd("rm", "-r", "-q", "--cached", "--ignore-unmatch", META_DIR + "/secret.json"), cwd=root, env=env)
+    run_stream(git_cmd("rm", "-r", "-q", "--cached", "--ignore-unmatch", META_DIR + "/secret.json",
+                       META_DIR + "/media-secret.json"), cwd=root, env=env)
+    for e in exclude:
+        # Ignoring a folder does not untrack files already committed, so take them out of the index.
+        run_stream(git_cmd("rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", e.strip("/")), cwd=root, env=env)
     if run_stream(git_cmd("add", "-A"), cwd=root, env=env) != 0:
         raise ApiError("git add failed.")
     if dry:
@@ -5953,15 +8904,16 @@ def folder_dest(site, dep):
     return dest
 
 
-def deploy_folder(site, dep, files, staged, dry):
+def deploy_folder(site, dep, files, staged, dry, send=None):
+    send = files if send is None else send
     dest = folder_dest(site, dep)
     previous = load_published(site, dep) or []
     stale = [f for f in previous if f not in files] if dep.get("mirror") else []
     if dry:
-        job_say("Dry run. %d file(s) would be copied to %s and %d removed." % (len(files), dest, len(stale)))
+        job_say("Dry run. %d file(s) would be copied to %s and %d removed." % (len(send), dest, len(stale)))
         return
     dest.mkdir(parents=True, exist_ok=True)
-    for i, f in enumerate(files, 1):
+    for i, f in enumerate(send, 1):
         if job_cancelled():
             raise ApiError("Stopped before it finished.")
         target = dest / f
@@ -5969,8 +8921,8 @@ def deploy_folder(site, dep, files, staged, dry):
         if target.is_symlink():
             target.unlink()
         shutil.copy2(staged / f, target, follow_symlinks=False)
-        if i % 25 == 0 or i == len(files):
-            job_say("Copied %d/%d" % (i, len(files)))
+        if i % 25 == 0 or i == len(send):
+            job_say("Copied %d/%d" % (i, len(send)))
     for f in stale:
         p = dest / f
         try:
@@ -5983,30 +8935,70 @@ def deploy_folder(site, dep, files, staged, dry):
 
 
 def run_deploy(site, dep, password, dry):
+    """Send the site. A site object may offer publish_plan(dep, dry), a dict with any of: last
+    (files sent after everything else, such as a podcast feed that must not point at audio that
+    is not up yet), exclude (folders left out and left alone on the server), before (run after
+    staging, ahead of the transfer) and after (run once a real publish succeeded)."""
     method = dep["method"]
+    plan_of = getattr(site, "publish_plan", None)
+    plan = (plan_of(dep, dry) if plan_of else None) or {}
+    exclude = tuple(plan.get("exclude") or ())
     if method == "git":
-        deploy_git(site, dep, password, dry)
+        if plan.get("before"):
+            plan["before"]()
+        deploy_git(site, dep, password, dry, exclude)
+        if plan.get("after") and not dry:
+            plan["after"]()
         return
     files, skipped = local_files(site.root)
     for s in skipped:
         job_say("Skipped %s (a symlink or special file, which is never published)" % s)
+    if exclude:
+        kept = [f for f in files if not f.startswith(exclude)]
+        if len(kept) < len(files):
+            job_say("%d file(s) under %s are left out here; they go to their own host." % (len(files) - len(kept),
+                                                                                          ", ".join(exclude)))
+        files = kept
+    last = [f for f in (plan.get("last") or ()) if f in files]
+    files = [f for f in files if f not in last] + last
     job_say("%d file(s) to publish from %s" % (len(files), site.root))
-    staged = stage(site, files)
+    staged, files = stage(site, files)
     try:
+        if plan.get("before"):
+            plan["before"]()
+        sigs = file_sigs(staged, files)
+        send = files
+        if method in ("sftp", "ftp", "ftps", "folder"):
+            send = changed_files(site, dep, files, sigs)
+            if len(send) < len(files):
+                job_say("%d of them changed since the last publish to this target; only those are sent. "
+                        "Tick \"Upload every file\" to send them all." % len(send))
         if method == "rsync":
-            deploy_rsync(dep, password, staged, dry)
+            deploy_rsync(dep, password, staged, dry, last, exclude)
         elif method == "sftp":
-            deploy_sftp(site, dep, password, files, staged, dry)
+            deploy_sftp(site, dep, password, files, staged, dry, send)
         elif method in ("ftp", "ftps"):
-            deploy_ftp(site, dep, password, files, staged, dry)
+            deploy_ftp(site, dep, password, files, staged, dry, send)
         elif method == "folder":
-            deploy_folder(site, dep, files, staged, dry)
+            deploy_folder(site, dep, files, staged, dry, send)
         else:
             raise ApiError("Unknown publish method.")
     finally:
         shutil.rmtree(staged, ignore_errors=True)
     if not dry:
-        save_published(site, dep, files)
+        save_published(site, dep, files, sigs)
+        if plan.get("after"):
+            plan["after"]()
+
+
+def remote_dir_test(path):
+    """A shell test for a folder on the server. A leading ~/ stays outside the quotes, so the
+    remote shell expands it to the login folder instead of looking for a folder named ~."""
+    if path in ("~", "~/"):
+        return 'test -d "$HOME"'
+    if path.startswith("~/"):
+        return 'test -d "$HOME"/' + shlex.quote(path[2:])
+    return "test -d " + shlex.quote(path)
 
 
 def test_deploy(site, dep, password):
@@ -6017,7 +9009,7 @@ def test_deploy(site, dep, password):
             raise ApiError("The ssh program is not installed, so the connection cannot be tested here.")
         path = server_path(dep)
         cmd = ["ssh"] + ssh_opts(dep, password) + [
-            "--", remote_target(dep), "test -d %s && echo FOUND || echo MISSING" % shlex.quote(path)]
+            "--", remote_target(dep), remote_dir_test(path) + " && echo FOUND || echo MISSING"]
         cmd, env = with_sshpass(cmd, password)
         code = run_stream(cmd, env=env)
         if code != 0:
@@ -6055,6 +9047,10 @@ def start_publish(site, d, dry=False, test=False):
     with JOB_LOCK:
         if JOB["running"]:
             raise ApiError("A publish is already running.")
+    blocker = getattr(site, "publish_blocker", None)
+    reason = blocker() if blocker else ""
+    if reason:
+        raise ApiError(reason)
     dep = validate_deploy(clean_deploy(d, site.cfg.get("deploy")))
     if dep["method"] == "folder":
         folder_dest(site, dep)
@@ -6076,11 +9072,19 @@ def start_publish(site, d, dry=False, test=False):
         store_password(site, dep, given, dep.get("save_password"))
     if not test:
         site.build()
+    # A site can hold the publish back when its own checks fail (the podcast feed check does).
+    # A dry run still goes ahead, and "anyway" overrides it.
+    check = getattr(site, "publish_check", None)
+    problem = check() if (check and not test) else ""
+    if problem and not dry and not d.get("anyway"):
+        raise ApiError(problem)
     what = "Testing the connection" if test else ("Dry run" if dry else "Publishing")
     with JOB_LOCK:
         JOB.update(running=True, ok=None, what=what, lines=[], proc=None, cancel=False,
                    started=datetime.datetime.now().isoformat(" ", "seconds"))
     job_say("%s (%s) at %s" % (what, dep["method"], JOB["started"]))
+    if problem:
+        job_say("Warning: " + problem)
 
     def work():
         ok = False
@@ -6163,9 +9167,9 @@ def open_site(path, confirm=False, setup=None):
     else:
         if root.exists() and not confirm and any(not n.name.startswith(".") for n in root.iterdir()):
             return {"needs_confirm": True, "message": (
-                "This folder already has files that SiteForge did not create.\n\nSiteForge will add its own files here "
+                "This folder already has files that %s did not create.\n\n%s will add its own files here "
                 "and overwrite index.html and any page it generates with the same name. Other files are left alone.\n\n"
-                "Use this folder anyway?")}
+                "Use this folder anyway?" % (APP, APP))}
         if not isinstance(setup, dict):
             PENDING["folder"] = str(root)
             return {"needs_setup": True, "folder": str(root)}
@@ -6188,7 +9192,8 @@ def app_state():
     site = CURRENT["site"]
     if site is None:
         return {"folder": None, "pending": PENDING["folder"], "suggest": str(Path.home() / "my-site"),
-                "last": last_folder(), "themes": [{"id": k, "label": v[0], "group": v[1]} for k, v in THEMES.items()]}
+                "last": last_folder(), "themes": [{"id": k, "label": v[0], "group": v[1]} for k, v in THEMES.items()],
+                "app": APP, "only": ONLY_MODULE}
     return site.state()
 
 
@@ -6238,7 +9243,8 @@ def api(method, route, query, h):
     if parts == ["detect-import"] and method == "POST":
         kind, src, cfg = detect_import(h.read_json().get("path"))
         title = (cfg.get("site") or {}).get("title") if isinstance(cfg.get("site"), dict) else ""
-        return {"kind": kind, "title": title or src.name, "home": {"sitegen": "page", "wikigen": "wiki", "storygen": "library"}[kind]}
+        return {"kind": kind, "title": title or src.name,
+                "home": {"sitegen": "page", "wikigen": "wiki", "storygen": "library", "podcastgen": "podcast"}[kind]}
 
     w = CURRENT["site"]
     if w is None:
@@ -6343,6 +9349,55 @@ def api(method, route, query, h):
         if method == "DELETE":
             return w.delete_chapter(parts[1], parts[2])
 
+    # podcast (the audio upload streams in Handler.receive_audio, outside the lock)
+    if parts[0] == "podcast":
+        need(w, "podcast")
+        if parts == ["podcast", "show"]:
+            if method == "GET":
+                return w.get_show()
+            if method == "PUT":
+                return w.save_show(h.read_json())
+        if parts == ["podcast", "episodes"] and method == "POST":
+            return w.save_episode(h.read_json())
+        if n == 3 and parts[1] == "episodes":
+            if method == "GET":
+                return w.get_episode(parts[2])
+            if method == "DELETE":
+                return w.delete_episode(parts[2])
+        if n == 4 and parts[1] == "episodes":
+            if parts[3] == "unpublish" and method == "POST":
+                return w.unpublish_episode(parts[2])
+            if parts[3] == "process" and method == "POST":
+                return w.retry_audio(parts[2])
+            if parts[3] == "transcript" and method == "DELETE":
+                return w.delete_transcript(parts[2])
+        if parts == ["podcast", "transcript"] and method == "POST":
+            return w.upload_transcript(q.get("episode", [""])[0], q.get("name", [""])[0], h.read_body(MAX_TRANSCRIPT))
+        if parts == ["podcast", "art-check"] and method == "POST":
+            return w.art_check(h.read_json())
+        if parts == ["podcast", "art-fix"] and method == "POST":
+            return w.art_fix(h.read_json())
+        if parts == ["podcast", "check"] and method == "GET":
+            return {"check": w._pod_check}
+        if parts == ["podcast", "unused"] and method == "GET":
+            return {"unused": w.unused_audio()}
+        if parts == ["podcast", "unused", "trash"] and method == "POST":
+            return w.trash_unused(h.read_json())
+        if parts == ["podcast", "tools"] and method == "GET":
+            return w.pod_tools()
+        if parts == ["podcast", "ping"] and method == "POST":
+            return w.ping_now()
+        if parts == ["podcast", "checklist"] and method == "PUT":
+            return w.save_checklist(h.read_json())
+        if n == 3 and parts[1] == "media" and parts[2] in ("test", "clean") and method == "POST":
+            return w.start_media_job(parts[2], h.read_json())
+    if n == 3 and parts[0] == "jobs" and parts[1] in ("publish", "media"):
+        if parts[2] == "status" and method == "GET":
+            since = q.get("since", ["0"])[0]
+            return media_status(since) if parts[1] == "media" else job_status(since)
+        if parts[2] == "cancel" and method == "POST":
+            return media_cancel() if parts[1] == "media" else cancel_publish()
+
     # everything else
     if parts == ["css"]:
         if method == "GET":
@@ -6381,6 +9436,7 @@ def api(method, route, query, h):
 
 class Handler(BaseHTTPRequestHandler):
     server_version = APP
+    head_only = False
 
     def log_message(self, *args):
         pass
@@ -6394,6 +9450,56 @@ class Handler(BaseHTTPRequestHandler):
         if n > limit:
             raise ApiError("That file is too large.", 413)
         return self.rfile.read(n) if n else b""
+
+    def receive_audio(self, query):
+        """The one request handled outside the global lock. The body streams to disk in 1 MiB
+        pieces, so a 2 GB recording never sits in memory and the editor stays usable while it
+        arrives. The token and Host checks have already run in dispatch()."""
+        q = parse_qs(query)
+        slug, name = q.get("episode", [""])[0], q.get("name", ["audio"])[0]
+        with LOCK:
+            w = CURRENT["site"]
+            if w is None:
+                raise ApiError("Open a site folder first.", 409)
+            need(w, "podcast")
+            w.get_episode_rec(slug)
+            limit, folder = w.upload_limit(), w.incoming_dir()
+        try:
+            n = int(self.headers.get("Content-Length") or "")
+        except ValueError:
+            raise ApiError("The upload needs a Content-Length header.", 411)
+        if n <= 0:
+            raise ApiError("That file is empty.")
+        if n > limit:
+            raise ApiError("That file is %s and the upload limit is %s. Raise it under Audio in show settings."
+                           % (fmt_size(n), fmt_size(limit)), 413)
+        folder.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(str(folder)).free
+        if free < 2 * n:
+            raise ApiError("Not enough free disk space: %s free, and processing needs about twice the file size (%s)."
+                           % (fmt_size(free), fmt_size(2 * n)), 507)
+        part = folder / ("%s.part" % secrets.token_hex(8))
+        ext = Path(name).suffix.lower()
+        orig = part.with_name(part.stem + ".orig" + (ext if re.match(r"^\.[a-z0-9]{1,6}$", ext) else ""))
+        left = n
+        try:
+            with open(part, "wb") as f:
+                while left > 0:
+                    chunk = self.rfile.read(min(1 << 20, left))
+                    if not chunk:
+                        raise ApiError("The upload stopped before the whole file arrived.")
+                    f.write(chunk)
+                    left -= len(chunk)
+            os.replace(part, orig)
+        finally:
+            if part.exists():
+                part.unlink()
+        with LOCK:
+            w2 = CURRENT["site"]
+            if w2 is None or w2.root != w.root or not w2.find_episode(slug):
+                orig.unlink()
+                raise ApiError("The site or the episode was closed during the upload.", 409)
+            return w2.queue_audio(slug, orig, name)
 
     def read_json(self):
         raw = self.read_body(8 * 1024 * 1024)
@@ -6413,7 +9519,55 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(data)
+        if not self.head_only:
+            self.wfile.write(data)
+
+    def send_file(self, path, ctype, extra=None):
+        """Stream a file in chunks, answering a single byte range when one is asked for, so an
+        audio or video file can be scrubbed in the preview without loading it into memory."""
+        size = path.stat().st_size
+        start, end, status = 0, size - 1, 200
+        m = re.fullmatch(r"bytes=(\d*)-(\d*)", (self.headers.get("Range") or "").strip())
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                start = int(m.group(1))
+                end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+            else:
+                start, end = max(0, size - int(m.group(2))), size - 1
+                if int(m.group(2)) == 0:
+                    start = size
+            if start >= size or start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % size)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            status = 206
+        length = max(0, end - start + 1)
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.send_header("Accept-Ranges", "bytes")
+        if status == 206:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.head_only:
+            return
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                left = length
+                while left > 0:
+                    chunk = fh.read(min(65536, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the browser stopped reading, which it does whenever a player seeks
 
     def send_json(self, obj, status=200):
         self.send_bytes(status, "application/json; charset=utf-8", json.dumps(obj).encode("utf-8"))
@@ -6424,6 +9578,12 @@ class Handler(BaseHTTPRequestHandler):
     def host_ok(self):
         port = SERVER["port"]
         return self.headers.get("Host", "") in ("127.0.0.1:%d" % port, "localhost:%d" % port)
+
+    def search_src(self, w):
+        """CSP source for the wiki's search.js on this host, or 'none' when the site has none."""
+        if not w.enabled("wiki") or w.cfg["site"].get("search") != "builtin":
+            return "'none'"
+        return "http://%s/site/%ssearch.js" % (self.headers.get("Host", ""), w.mbase("wiki"))
 
     def send_site(self, rel):
         w = CURRENT["site"]
@@ -6446,10 +9606,11 @@ class Handler(BaseHTTPRequestHandler):
         ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
         if ctype.startswith("text/") or ctype.endswith("xml") or ctype.endswith("javascript"):
             ctype += "; charset=utf-8"
-        # Built pages share an origin with the editor. Only same-origin script files may run (that is
-        # search.js); inline script, such as one inside an uploaded SVG, is refused.
-        self.send_bytes(200, ctype, target.read_bytes(), {
-            "Content-Security-Policy": "script-src 'self'; object-src 'none'; base-uri 'self'",
+        # Built pages share an origin with the editor, so the only script they may run is the wiki's
+        # generated search.js, named by its exact address. Inline script and any other script file,
+        # such as one inside an uploaded SVG or a stray .js in the site folder, are refused.
+        self.send_file(target, ctype, {
+            "Content-Security-Policy": "script-src %s; object-src 'none'; base-uri 'self'" % self.search_src(w),
             "X-Content-Type-Options": "nosniff",
         })
 
@@ -6461,13 +9622,16 @@ class Handler(BaseHTTPRequestHandler):
             if not self.host_ok():
                 return self.send_text(403, "Forbidden")
             if method == "GET" and path == "/":
-                return self.send_bytes(200, "text/html; charset=utf-8", UI_HTML.replace("__TOKEN__", TOKEN).encode("utf-8"))
+                return self.send_bytes(200, "text/html; charset=utf-8",
+                                       UI_HTML.replace("__TOKEN__", TOKEN).replace("__APP__", APP).encode("utf-8"))
             if method == "GET" and path.startswith("/site/"):
                 return self.send_site(path[len("/site/"):])
             if path.startswith("/api/"):
                 if self.headers.get("X-Token") != TOKEN:
                     return self.send_json({"error": "Not authorized."}, 401)
                 route = path[len("/api/"):]
+                if route == "podcast/audio" and method == "POST":
+                    return self.send_json(self.receive_audio(parts.query))
                 if route == "pick-folder" and method == "POST":
                     return self.send_json(pick_folder())
                 if route == "quit" and method == "POST":
@@ -6485,6 +9649,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "Unexpected error: %s" % e}, 500)
 
     def do_GET(self):
+        self.dispatch("GET")
+
+    def do_HEAD(self):
+        """HEAD answers for the editor page and built files only; the API has nothing to offer it."""
+        path = urlsplit(self.path).path
+        if path != "/" and not path.startswith("/site/"):
+            return self.send_text(405, "Method not allowed")
+        self.head_only = True
         self.dispatch("GET")
 
     def do_POST(self):
@@ -6506,7 +9678,7 @@ UI_HTML = r'''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SiteForge</title>
+<title>__APP__</title>
 <style>
 :root {
   color-scheme: light;
@@ -6623,6 +9795,31 @@ details.box .pad { max-width: none; }
 #preview { position: absolute; top: 0; left: 0; border: 0; background: #fff; transform-origin: 0 0; }
 #pv-size button { padding: 2px 8px; font-size: 12px; }
 #pv-size button.on { background: var(--primary); border-color: var(--primary); color: #fff; }
+.chip.bad { color: var(--danger); border-color: var(--danger); }
+.drop { border: 2px dashed var(--line); border-radius: 8px; padding: 14px; text-align: center; color: var(--muted); }
+.drop.over { border-color: var(--accent); background: var(--panel2); }
+.artcheck { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }
+.artcheck:empty { display: none; }
+.artcheck img { width: 72px; height: 72px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); }
+ul.checks { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; flex: 1 1 100%; }
+ul.checks li { padding: 4px 8px; border-radius: 6px; border-left: 3px solid var(--line); background: var(--panel2); font-size: 13px; }
+ul.checks li.fail { border-left-color: var(--danger); }
+ul.checks li.warn { border-left-color: var(--amber); }
+ul.checks li.ok { border-left-color: var(--ok); }
+.warnline { color: var(--amber); }
+.chrow { display: flex; gap: 6px; align-items: center; margin-bottom: 4px; }
+.chrow input { flex: 1; min-width: 0; }
+.chrow .ch-start { flex: 0 0 6.5em; }
+.chrow button { padding: 1px 8px; }
+.podpad { max-width: 760px; }
+.mdbox { border: 1px solid var(--line); border-radius: 6px; display: flex; flex-direction: column; overflow: hidden; }
+.mdbox .code { min-height: 170px; resize: vertical; }
+.btnlink { display: inline-flex; align-items: center; justify-content: center; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px; color: var(--accent); text-decoration: none; background: var(--btn-bg); }
+.mod-card.grey { opacity: 0.55; }
+#dir-rows { display: flex; flex-direction: column; gap: 10px; }
+.sub-fields { display: flex; flex-direction: column; gap: 8px; padding-left: 12px; border-left: 2px solid var(--line); }
+#e-player { width: 100%; }
+#e-progress progress { width: 60%; }
 #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--ink); color: #fff; padding: 8px 16px; border-radius: 8px; opacity: 0; pointer-events: none; transition: opacity 0.15s; max-width: 80vw; white-space: pre-line; z-index: 50; }
 #toast.show { opacity: 1; }
 #toast.bad { background: #b3261e; }
@@ -6650,8 +9847,8 @@ details.box .pad { max-width: none; }
 <body>
 
 <div id="welcome" class="card-screen" hidden>
-  <h1>SiteForge</h1>
-  <p>Choose the folder for your site. A new or empty folder starts a new site. A folder that already holds a SiteForge site opens as you left it.</p>
+  <h1>__APP__</h1>
+  <p>Choose the folder for your site. A new or empty folder starts a new site. A folder that already holds a __APP__ site opens as you left it.</p>
   <div class="row2">
     <input id="w-path" aria-label="Site folder path" placeholder="/home/you/my-site">
     <button id="w-browse">Browse</button>
@@ -6663,23 +9860,27 @@ details.box .pad { max-width: none; }
   <h1>New site</h1>
   <p id="u-folder" class="mono"></p>
   <label class="field">Site title <input id="u-title"></label>
+  <div id="u-structure">
   <p style="margin:12px 0 4px;color:var(--text)"><b>What should the homepage be?</b></p>
   <div class="choices">
     <label class="choice"><input type="radio" name="u-home" value="page" checked><div><b>A page</b><span>A normal page you write, like a landing or about page.</span></div></label>
     <label class="choice"><input type="radio" name="u-home" value="blog"><div><b>A blog feed</b><span>Your newest posts, with tags and an RSS feed.</span></div></label>
     <label class="choice"><input type="radio" name="u-home" value="wiki"><div><b>A wiki</b><span>Sections of articles with a sidebar and search.</span></div></label>
     <label class="choice"><input type="radio" name="u-home" value="library"><div><b>A book list</b><span>Short stories and serials, with chapters.</span></div></label>
+    <label class="choice"><input type="radio" name="u-home" value="podcast"><div><b>A podcast</b><span>A show page, episodes with a player, and the feed podcast apps read.</span></div></label>
   </div>
   <p style="margin:0 0 4px;color:var(--text)"><b>Also switch on</b> <span class="hint">(you can change all of this later in Site structure)</span></p>
   <div style="display:flex;gap:14px;margin-bottom:12px">
     <label><input type="checkbox" class="u-mod" value="blog"> Blog</label>
     <label><input type="checkbox" class="u-mod" value="wiki"> Wiki</label>
     <label><input type="checkbox" class="u-mod" value="library"> Library</label>
+    <label><input type="checkbox" class="u-mod" value="podcast"> Podcast</label>
+  </div>
   </div>
   <label class="field">Theme <select id="u-theme"></select></label>
-  <details style="margin:12px 0"><summary>Import an existing SiteGen, WikiGen or StoryGen site</summary>
+  <details style="margin:12px 0" id="u-importbox"><summary>Import an existing SiteGen, WikiGen, StoryGen or PodcastGen site</summary>
     <div class="pad" style="padding:10px 0 0">
-      <div class="row2" style="margin:0"><input id="u-import" placeholder="/opt/trstswiki (the folder with .sitegen, .wikigen or .storygen in it)"><button id="u-import-browse">Browse</button><button id="u-detect">Check</button></div>
+      <div class="row2" style="margin:0"><input id="u-import" placeholder="The folder with .sitegen, .wikigen, .storygen or .podcastgen in it"><button id="u-import-browse">Browse</button><button id="u-detect">Check</button></div>
       <span class="hint" id="u-detected"></span>
       <label id="u-rootrow" hidden><input type="checkbox" id="u-root" checked> Serve it from the site root, so its existing URLs keep working</label>
     </div>
@@ -6689,12 +9890,13 @@ details.box .pad { max-width: none; }
 
 <div id="workspace" hidden>
   <div id="top">
-    <span class="brand">SiteForge</span>
+    <span class="brand">__APP__</span>
     <button data-act="new-page">Page</button>
     <button data-act="new-post" data-mod="blog">Post</button>
     <button data-act="new-article" data-mod="wiki">Article</button>
     <button data-act="new-story" data-mod="library">Story</button>
     <button data-act="new-chapter" data-mod="library">Chapter</button>
+    <button data-act="new-episode" data-mod="podcast">Episode</button>
     <span class="sep"></span>
     <button data-act="structure">Site structure</button>
     <button data-act="menu">Menu</button>
@@ -6944,6 +10146,9 @@ function previewPayload() {
     case "css": return { view: "css", target: $("#css-target").value, css: themeCss($("#css").value), layouts: layoutVals() };
     case "settings": return { view: "settings", target: "home", site: readSettings() };
     case "menu": return { view: "menu", target: "home", nav: S.nav };
+    case "episode": return Object.assign({ view: "episode" }, epPayload());
+    case "show": return { view: "podcasthome", markdown: md(), show: readShow() };
+    case "dirs": return { view: "dirs", target: "podcast:" };
   }
   return null;
 }
@@ -6971,7 +10176,8 @@ function renderTop() {
   $("#folder").textContent = S.folder;
   $("#folder").title = S.folder;
   $$("#top [data-mod]").forEach((b) => { b.hidden = !on(b.dataset.mod); });
-  $("#b-rescan").hidden = !(on("wiki") || on("library"));
+  $("#b-rescan").hidden = !(on("wiki") || on("library") || on("podcast"));
+  $$('#top [data-act="structure"]').forEach((b) => { b.hidden = !!S.only; });
 }
 
 function renderSide() {
@@ -6988,8 +10194,8 @@ function renderSide() {
     if (btn) h.appendChild(el("button", { text: btn, on: { click: () => go(fn) } }));
     side.appendChild(h);
   };
-  const homeLabel = S.home === "page" ? "Home page" : "Home page (" + label(S.home) + ")";
-  item(homeLabel, "", view.type === "page" && view.slug === "index" || (view.type === "landing" && view.mod === S.home), () => go(openHome), ["Home", "home"]);
+  const homeLabel = S.home === "page" ? "Home page" : (S.home === "podcast" ? "Home page (show settings)" : "Home page (" + label(S.home) + ")");
+  item(homeLabel, "", view.type === "page" && view.slug === "index" || (view.type === "landing" && view.mod === S.home) || (view.type === "show" && S.home === "podcast"), () => go(openHome), ["Home", "home"]);
   head("Pages", "+ Page", newPage);
   S.pages.filter((p) => p.slug !== "index").forEach((p) => item(p.title, "", view.type === "page" && view.slug === p.slug, () => go(() => openPage(p.slug))));
   if (on("blog")) {
@@ -7019,8 +10225,23 @@ function renderSide() {
       if (s.kind !== "single") item("+ Chapter", "add", false, () => go(() => openChapter(null, null, s.slug)));
     });
   }
-  if (!on("blog") && !on("wiki") && !on("library")) {
-    side.appendChild(el("p", { class: "empty", text: "Add a blog, wiki or library in Site structure." }));
+  if (on("podcast")) {
+    head(label("podcast"), "+ Episode", () => openEpisode(null));
+    if (S.home !== "podcast") item("Show settings", "", view.type === "show", () => go(openShow), pod().check_fails ? ["!", "bad"] : null);
+    else if (pod().check_fails) item("Feed check", "", view.type === "show", () => go(openShow), ["!", "bad"]);
+    item("Directories", "", view.type === "dirs", () => go(openDirs), [pod().checklist_done + "/" + pod().checklist_total]);
+    pod().episodes.forEach((e) => {
+      let chip = null;
+      if (e.media === "queued" || e.media === "processing") chip = ["Processing"];
+      else if (e.media === "failed") chip = ["Failed", "bad"];
+      else if (e.status === "draft") chip = ["Draft", "draft"];
+      else if (e.scheduled) chip = ["Scheduled", "draft"];
+      else if (e.kind !== "full") chip = [e.kind === "trailer" ? "Trailer" : "Bonus"];
+      item((e.number ? "E" + e.number + " " : "") + e.title, "", view.type === "episode" && view.slug === e.slug, () => go(() => openEpisode(e.slug)), chip);
+    });
+  }
+  if (!on("blog") && !on("wiki") && !on("library") && !on("podcast")) {
+    side.appendChild(el("p", { class: "empty", text: "Add a blog, wiki, library or podcast in Site structure." }));
   }
 }
 
@@ -7036,6 +10257,7 @@ function watch(ids) { ids.forEach((id) => { const e = $(id); if (e) e.addEventLi
 /* ---------- home ---------- */
 async function openHome() {
   if (S.home === "page") await openPage("index");
+  else if (S.home === "podcast") await openShow();
   else await openLanding(S.home);
 }
 
@@ -8021,7 +11243,7 @@ async function openCss() {
 }
 
 const LAYOUT_AXES = [["site", "layout", "Site", null], ["blog", "blog_layout", "Blog", "blog"],
-  ["wiki", "wiki_layout", "Wiki", "wiki"], ["library", "lib_layout", "Stories", "library"]];
+  ["wiki", "wiki_layout", "Wiki", "wiki"], ["library", "lib_layout", "Stories", "library"], ["podcast", "podcast_layout", "Podcast", "podcast"]];
 
 function layoutVals() {
   const out = {};
@@ -8413,7 +11635,15 @@ function openSettings() {
   $$("#left fieldset[data-need]").forEach((f) => { f.hidden = !on(f.dataset.need); });
   $$("#left input, #left textarea").forEach((i) => i.addEventListener(i.type === "checkbox" || i.type === "radio" ? "change" : "input", markDirty));
   $("#st-save").addEventListener("click", async () => {
-    try { await api("PUT", "settings", readSettings()); setDirty(false); await refresh(); toast("Saved"); } catch (e) { toast(e.message, "bad"); }
+    try {
+      const body = readSettings();
+      let r = await api("PUT", "settings", body);
+      if (r.needs_confirm) {
+        if (!window.confirm(r.message)) return;
+        r = await api("PUT", "settings", Object.assign(body, { confirm_feed_move: true }));
+      }
+      setDirty(false); await refresh(); toast("Saved");
+    } catch (e) { toast(e.message, "bad"); }
   });
   renderSide();
   renderPreview();
@@ -8425,11 +11655,11 @@ const STRUCT_TPL = `
   <div class="bar"><strong>Site structure</strong><span class="grow"></span><button id="x-save" class="primary">Save structure</button></div>
   <div class="pad">
     <label class="field">Homepage <select id="x-home"></select></label>
-    <label id="x-rootrow"><input type="checkbox" id="x-root"> Serve it from the site root <span class="hint">(its sections or stories get addresses like /linux/portainer.html instead of /wiki/linux/portainer.html, which is what WikiGen and StoryGen produced)</span></label>
+    <label id="x-rootrow"><input type="checkbox" id="x-root"> Serve it from the site root <span class="hint">(its sections, stories or episodes get addresses like /linux/portainer.html instead of /wiki/linux/portainer.html, which is what WikiGen, StoryGen and PodcastGen produce)</span></label>
     <div id="x-mods"></div>
     <p class="hint">Switching a module off removes its pages from the built site but keeps everything you wrote, so switching it back on restores it. Changing the homepage or where a module is served from changes addresses, so links to the old ones from elsewhere will break.</p>
-    <fieldset><legend>Import a SiteGen, WikiGen or StoryGen site</legend>
-      <div style="display:flex;gap:6px"><input id="x-import" style="flex:1" placeholder="Folder that contains .sitegen, .wikigen or .storygen"><button id="x-browse">Browse</button><button id="x-check">Check</button></div>
+    <fieldset><legend>Import a SiteGen, WikiGen, StoryGen or PodcastGen site</legend>
+      <div style="display:flex;gap:6px"><input id="x-import" style="flex:1" placeholder="Folder that contains .sitegen, .wikigen, .storygen or .podcastgen"><button id="x-browse">Browse</button><button id="x-check">Check</button></div>
       <span class="hint" id="x-found"></span>
       <label><input type="checkbox" id="x-settings"> Also copy its title, URL and other site settings</label>
       <button id="x-go" disabled>Import into this site</button>
@@ -8440,21 +11670,21 @@ const STRUCT_TPL = `
 function openStructure() {
   view = { type: "structure" };
   show(STRUCT_TPL);
-  const homeOpts = [["page", "A page"]].concat(["blog", "wiki", "library"].map((m) => [m, label(m) + " (" + ({ blog: "blog feed", wiki: "wiki home", library: "book list" }[m]) + ")"]));
+  const homeOpts = [["page", "A page"]].concat(["blog", "wiki", "library", "podcast"].map((m) => [m, label(m) + " (" + ({ blog: "blog feed", wiki: "wiki home", library: "book list", podcast: "show page" }[m]) + ")"]));
   opts($("#x-home"), homeOpts, S.home);
   $("#x-root").checked = S.home !== "page" && S.home !== "blog" && S.modules[S.home].mount === "";
   const box = $("#x-mods");
-  ["blog", "wiki", "library"].forEach((m) => {
+  ["blog", "wiki", "library", "podcast"].forEach((m) => {
     const cb = el("input", { type: "checkbox", id: "x-on-" + m });
     cb.checked = on(m);
     const name = el("input", { id: "x-label-" + m, placeholder: S.names[m] });
     name.value = S.modules[m].label;
-    const counts = { blog: S.posts.length + " post(s)", wiki: S.wiki.sections.length + " section(s)", library: S.library.stories.length + " stor(ies)" }[m];
+    const counts = { blog: S.posts.length + " post(s)", wiki: S.wiki.sections.length + " section(s)", library: S.library.stories.length + " stor(ies)", podcast: pod().episodes.length + " episode(s)" }[m];
     const rm = el("button", { class: "danger", text: "Move its content to the trash" });
     rm.hidden = on(m) || counts.startsWith("0");
     rm.addEventListener("click", async () => {
       if (!window.confirm("Move all " + S.names[m] + " content (" + counts + ") to the trash folder?")) return;
-      try { await api("POST", "modules/" + m + "/remove"); await refresh(); openStructure(); toast("Moved to the trash folder"); } catch (e) { toast(e.message, "bad"); }
+      try { const r = await api("POST", "modules/" + m + "/remove"); await refresh(); openStructure(); toast("Moved to the trash folder. " + (r.note || "")); } catch (e) { toast(e.message, "bad"); }
     });
     box.appendChild(el("div", { class: "mod-card" }, [
       el("h4", {}, [cb, el("label", { for: "x-on-" + m, text: S.names[m] }), el("span", { class: "hint", text: counts })]),
@@ -8462,7 +11692,7 @@ function openStructure() {
   });
   const sync = () => {
     const h = $("#x-home").value;
-    $("#x-rootrow").hidden = !(h === "wiki" || h === "library");
+    $("#x-rootrow").hidden = !(h === "wiki" || h === "library" || h === "podcast");
     if (h !== "page") $("#x-on-" + h).checked = true;
   };
   $("#x-home").addEventListener("change", () => { sync(); markDirty(); });
@@ -8475,11 +11705,14 @@ function openStructure() {
   renderSide();
 }
 
+let importKind = "";
 async function checkImport() {
   $("#x-go").disabled = true;
+  importKind = "";
   try {
     const r = await api("POST", "detect-import", { path: $("#x-import").value });
-    $("#x-found").textContent = "Found a " + { sitegen: "SiteGen", wikigen: "WikiGen", storygen: "StoryGen" }[r.kind] + " site: " + r.title;
+    importKind = r.kind;
+    $("#x-found").textContent = "Found a " + { sitegen: "SiteGen", wikigen: "WikiGen", storygen: "StoryGen", podcastgen: "PodcastGen" }[r.kind] + " site: " + r.title;
     $("#x-go").disabled = false;
   } catch (e) { $("#x-found").textContent = e.message; }
 }
@@ -8487,7 +11720,10 @@ async function checkImport() {
 async function runImport() {
   if (!(await guard())) return;
   try {
-    const r = await api("POST", "import", { path: $("#x-import").value, settings: $("#x-settings").checked });
+    const body = { path: $("#x-import").value, settings: $("#x-settings").checked };
+    if (importKind === "podcastgen" && window.confirm("Make the podcast the homepage and serve it from the site root? Then every address it had stays the same, its feed included. Cancel keeps it under /podcast/, and the old feed address gets a copy of the feed that tells apps to move."))
+      Object.assign(body, { home: "podcast", root_mount: true });
+    const r = await api("POST", "import", body);
     S = r.state; renderTop(); renderSide(); setDirty(false);
     toast(r.notes.join("\n"));
     openStructure();
@@ -8496,18 +11732,772 @@ async function runImport() {
 
 async function saveStructure() {
   const mods = {};
-  ["blog", "wiki", "library"].forEach((m) => { mods[m] = { enabled: $("#x-on-" + m).checked, label: $("#x-label-" + m).value }; });
+  ["blog", "wiki", "library", "podcast"].forEach((m) => { mods[m] = { enabled: $("#x-on-" + m).checked, label: $("#x-label-" + m).value }; });
   const home = $("#x-home").value;
-  const off = ["blog", "wiki", "library"].filter((m) => on(m) && !mods[m].enabled);
+  const off = ["blog", "wiki", "library", "podcast"].filter((m) => on(m) && !mods[m].enabled);
   if (off.length && !window.confirm("Switch off " + off.map(label).join(" and ") + "? Its pages leave the built site; your content is kept.")) return;
   try {
-    await api("PUT", "structure", { home, modules: mods, root_mount: $("#x-root").checked });
+    const body = { home, modules: mods, root_mount: $("#x-root").checked };
+    const r = await api("PUT", "structure", body);
+    if (r.needs_confirm) {
+      if (!window.confirm(r.message)) return;
+      await api("PUT", "structure", Object.assign(body, { confirm_feed_move: true }));
+    }
     setDirty(false);
     await refresh();
     openStructure();
     toast("Structure saved");
     schedulePreview();
   } catch (e) { toast(e.message, "bad"); }
+}
+
+/* ---------- podcast ---------- */
+function pod() { return S.podcast || { episodes: [], check_fails: 0, checklist_done: 0, checklist_total: 8, upload_limit_mb: 2048, next_number: 1 }; }
+function clockOf(sec) {
+  sec = Math.round(Number(sec) || 0);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const two = (n) => String(n).padStart(2, "0");
+  return h ? h + ":" + two(m) + ":" + two(s) : two(m) + ":" + two(s);
+}
+function fmtSize(n) {
+  n = Number(n) || 0;
+  if (n >= 1073741824) return (n / 1073741824).toFixed(1) + " GB";
+  if (n >= 1048576) return Math.round(n / 1048576) + " MB";
+  if (n >= 1024) return Math.round(n / 1024) + " KB";
+  return n + " bytes";
+}
+function fmtDur(sec) {
+  sec = Math.round(Number(sec) || 0);
+  if (sec <= 0) return "";
+  if (sec < 60) return sec + " sec";
+  const m = Math.floor((sec + 30) / 60);
+  if (m < 60) return m + " min";
+  return Math.floor(m / 60) + " h" + (m % 60 ? " " + (m % 60) + " min" : "");
+}
+function localNow() { const d = new Date(); d.setSeconds(0, 0); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16); }
+function localOffset() { const o = -new Date().getTimezoneOffset(), a = Math.abs(o); return (o < 0 ? "-" : "+") + String(Math.floor(a / 60)).padStart(2, "0") + ":" + String(a % 60).padStart(2, "0"); }
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t); }
+  catch (e) { const ta = el("textarea", {}); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
+}
+function sitePath(p) { return /^https?:\/\//i.test(p) ? p : "/site/" + String(p || "").replace(/^\.?\//, ""); }
+
+let mediaTimer = null, mediaSeen = 0, pendingArt = null;
+
+async function pollMedia() {
+  clearTimeout(mediaTimer);
+  mediaTimer = null;
+  try {
+    const r = await api("GET", "jobs/media/status?since=" + mediaSeen);
+    mediaSeen = r.total;
+    const log = $("#e-log") || $("#m-mlog");
+    if (log && r.lines.length) {
+      if (log.id === "e-log") $("#e-logbox").hidden = false;
+      log.hidden = false;
+      log.textContent += r.lines.join("\n") + "\n";
+      log.scrollTop = log.scrollHeight;
+    }
+    if (view.type === "episode" && $("#e-mstate")) {
+      if (r.running && r.current === view.slug) $("#e-mstate").textContent = "Processing";
+      else if (r.running) $("#e-mstate").textContent = "Waiting for: " + r.what;
+    }
+    if (r.running || r.queued) { mediaTimer = setTimeout(pollMedia, 800); return; }
+    const art = pendingArt;
+    pendingArt = null;
+    await refresh();
+    if (view.type === "episode" && view.slug) {
+      const d = await api("GET", "podcast/episodes/" + enc(view.slug));
+      syncAudio(d);
+      schedulePreview();
+      if (art && art.target === "episode" && r.ok) { $("#e-art").value = art.path; artCheck($("#e-art").value, $("#e-artcheck"), "episode"); schedulePreview(); }
+    }
+    if (view.type === "show" && art && art.target === "show" && r.ok) { $("#s-image").value = art.path; artCheck(art.path, $("#s-artcheck"), "show"); schedulePreview(); }
+    if (r.ok === true) toast(r.what + ": done");
+    else if (r.ok === false) toast(r.what + " failed. See the log.", "bad");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+/* ---------- artwork check ---------- */
+async function artCheck(path, box, target) {
+  box.innerHTML = "";
+  if (!path) return;
+  let r;
+  try { r = await api("POST", "podcast/art-check", { path }); } catch (e) { box.textContent = e.message; return; }
+  if (r.info && r.info.format) {
+    box.appendChild(el("img", { src: sitePath(path), alt: "" }));
+    box.appendChild(el("span", { class: "hint", text: r.info.width + " x " + r.info.height + " " + r.info.format.toUpperCase() + ", " + fmtSize(r.info.bytes) }));
+  }
+  const ul = el("ul", { class: "checks" });
+  const probs = r.problems.length ? r.problems : [{ level: "ok", text: "Meets Apple's cover rules." }];
+  probs.forEach((p) => ul.appendChild(el("li", { class: p.level, text: p.text + (p.fix ? " " + p.fix : "") })));
+  box.appendChild(ul);
+  if (r.can_fix && r.problems.some((p) => p.level === "fail" || p.level === "warn")) {
+    const b = el("button", { text: "Fix artwork" });
+    b.addEventListener("click", async () => {
+      try {
+        const f = await api("POST", "podcast/art-fix", { path, target, episode: view.slug || "" });
+        pendingArt = { target, path: f.path };
+        toast("Writing " + f.path + "...");
+        mediaSeen = 0;
+        pollMedia();
+      } catch (e) { toast(e.message, "bad"); }
+    });
+    box.appendChild(b);
+  }
+}
+
+/* ---------- episode editor ---------- */
+const EP_TPL = `
+<div class="fill">
+  <div class="bar">
+    <input id="e-title" class="title-input" placeholder="Episode title (no number in it)" aria-label="Episode title">
+    <span class="chip" id="e-status"></span>
+    <button id="e-save">Save draft</button>
+    <button id="e-publish" class="primary">Publish</button>
+    <button id="e-unpublish" hidden>Unpublish</button>
+  </div>
+  <div class="bar sub">
+    <label>Address <span class="slug-wrap"><span id="e-base"></span><input id="e-slug" aria-label="Episode address">.html</span></label>
+    <label>Episode <input type="number" id="e-number" min="1" style="width:5em"></label>
+    <label>Season <input type="number" id="e-season" min="1" style="width:4.5em"></label>
+    <label>Type <select id="e-kind"><option value="full">Full</option><option value="trailer">Trailer</option><option value="bonus">Bonus</option></select></label>
+  </div>
+  <div class="bar sub">
+    <label>Date and time <input type="datetime-local" id="e-date"></label><span class="hint" id="e-offset"></span>
+    <label>Explicit <select id="e-explicit"><option value="">Show default</option><option value="yes">Yes</option><option value="no">No</option></select></label>
+    <span class="grow"></span>
+    <button id="e-import">Import .md</button>
+    <button id="e-delete" class="danger">Delete episode</button>
+  </div>
+  <details class="box" id="e-audiobox" open>
+    <summary>Audio <span class="chip" id="e-mstate"></span></summary>
+    <div class="pad">
+      <div class="drop" id="e-drop"><span>Drop the recording here, or</span> <button id="e-choose">Choose audio</button><input type="file" id="e-file" accept="audio/*,.mp3,.m4a,.wav,.flac,.aif,.aiff,.ogg,.opus" hidden></div>
+      <div id="e-progress" hidden><progress id="e-bar" max="100" value="0"></progress> <span class="hint" id="e-ptext"></span></div>
+      <div id="e-audioinfo" class="hint"></div>
+      <audio id="e-player" controls preload="none" hidden></audio>
+      <label class="field" id="e-durrow">Length <input id="e-duration" placeholder="H:MM:SS or MM:SS"><span class="hint">Measured for you when ffprobe is installed; type it in otherwise.</span></label>
+      <div class="two"><button id="e-retry" hidden>Retry processing</button><button id="e-stop" class="danger" hidden>Stop processing</button><button id="e-youtube">Copy for YouTube</button></div>
+      <details id="e-logbox" hidden><summary>Processing log</summary><pre class="log" id="e-log"></pre></details>
+    </div>
+  </details>
+  <details class="box">
+    <summary>Summary, art, chapters and transcript</summary>
+    <div class="pad">
+      <label class="field">Summary <textarea id="e-summary" rows="2" maxlength="400" placeholder="Optional plain text. The first paragraph of the show notes is used otherwise."></textarea><span class="hint" id="e-scount"></span></label>
+      <label class="field">Episode art <span style="display:flex;gap:6px"><input id="e-art" style="flex:1" placeholder="Optional. The show art is used otherwise."><button id="e-artup" type="button">Upload</button></span></label>
+      <div class="artcheck" id="e-artcheck"></div>
+      <fieldset><legend>Chapters</legend>
+        <div id="e-chapters"></div>
+        <div class="two"><button id="e-chadd">Add chapter</button><button id="e-chpaste">Paste chapters</button></div>
+        <div id="e-chpastebox" hidden><textarea id="e-chtext" class="small" rows="5" placeholder="00:00 Intro&#10;04:10 The news&#10;1:02:30 Questions"></textarea><button id="e-chapply">Use these</button></div>
+        <span class="hint">The first chapter starts at 0:00. Times are H:MM:SS or MM:SS. The feed, the episode page and Copy for YouTube all use this list.</span>
+      </fieldset>
+      <fieldset><legend>Transcript</legend>
+        <span class="hint" id="e-trinfo"></span>
+        <div class="two"><button id="e-trup">Upload .vtt or .srt</button><button id="e-trdel" class="danger" hidden>Remove</button></div>
+        <input type="file" id="e-trfile" accept=".vtt,.srt" hidden>
+      </fieldset>
+    </div>
+  </details>
+  SEOBLOCK
+  <div class="bar warn" id="missing" hidden></div>
+  MDTOOLS
+  <textarea id="md" class="code" spellcheck="true" placeholder="Show notes in Markdown: what the episode covers, links, guests, credits"></textarea>
+</div>`;
+
+let epChapters = [];
+
+function renderChapters() {
+  const box = $("#e-chapters");
+  box.innerHTML = "";
+  epChapters.forEach((ch, i) => {
+    const row = el("div", { class: "chrow" });
+    const start = el("input", { class: "ch-start", placeholder: "0:00", "aria-label": "Start" });
+    const title = el("input", { class: "ch-title", placeholder: "Chapter title", "aria-label": "Title" });
+    const url = el("input", { class: "ch-url", placeholder: "Link (optional)", "aria-label": "Link" });
+    start.value = ch.start; title.value = ch.title; url.value = ch.url || "";
+    start.addEventListener("input", () => { ch.start = start.value; markDirty(); });
+    title.addEventListener("input", () => { ch.title = title.value; markDirty(); });
+    url.addEventListener("input", () => { ch.url = url.value; markDirty(); });
+    const btn = (text, fn, label) => { const b = el("button", { text, type: "button", title: label, "aria-label": label }); b.addEventListener("click", () => { fn(); renderChapters(); markDirty(); }); return b; };
+    row.append(start, title, url,
+      btn("\u2191", () => { if (i > 0) epChapters = moved(epChapters, i, i - 1); }, "Move up"),
+      btn("\u2193", () => { if (i < epChapters.length - 1) epChapters = moved(epChapters, i, i + 1); }, "Move down"),
+      btn("\u00d7", () => { epChapters.splice(i, 1); }, "Remove"));
+    box.appendChild(row);
+  });
+}
+
+function chapterVals() { return epChapters.filter((c) => String(c.title).trim()).map((c) => ({ start: String(c.start).trim(), title: c.title, url: c.url || "" })); }
+
+function pasteChapters(text) {
+  const out = [];
+  text.split(/\r?\n/).forEach((line) => {
+    const m = line.trim().match(/^\(?((?:\d+:)?\d{1,2}:\d{2})\)?\s*[-\u2013:.]?\s+(.+)$/);
+    if (m) out.push({ start: m[1], title: m[2].trim(), url: "" });
+  });
+  return out;
+}
+
+function epPayload() {
+  const dv = $("#e-date").value;
+  return Object.assign({ orig_slug: view.slug, new_slug: $("#e-slug").value, title: $("#e-title").value,
+    number: $("#e-number").value, season: $("#e-season").value, kind: $("#e-kind").value,
+    date: dv && view.origDate && view.origDate.slice(0, 16) === dv ? view.origDate : dv,
+    explicit: $("#e-explicit").value, summary: $("#e-summary").value, art: $("#e-art").value.trim(),
+    duration: $("#e-duration").value, chapters: chapterVals(), markdown: $("#md").value }, seoVals());
+}
+
+async function openEpisode(slug) {
+  let e = { title: "", slug: "", number: pod().next_number, season: null, kind: "full", date: "", explicit: "", summary: "", art: "",
+    chapters: [], audio: {}, media: {}, transcript: {}, status: "draft", duration: 0 }, md = "", info = { episode: e, src: "" };
+  if (slug) { info = await api("GET", "podcast/episodes/" + enc(slug)); e = info.episode; md = info.markdown; }
+  view = { type: "episode", slug: slug || "", origDate: e.date };
+  show(EP_TPL);
+  $("#e-title").value = e.title;
+  $("#e-slug").value = e.slug;
+  $("#e-base").textContent = (S.modules.podcast.mount ? S.modules.podcast.mount + "/" : "") + "episodes/";
+  $("#e-number").value = e.number || "";
+  $("#e-season").value = e.season || "";
+  $("#e-kind").value = e.kind;
+  $("#e-date").value = e.date ? e.date.slice(0, 16) : localNow();
+  $("#e-offset").textContent = "UTC" + (e.date ? e.date.slice(19) || "" : localOffset());
+  $("#e-explicit").value = e.explicit || "";
+  $("#e-summary").value = e.summary || "";
+  $("#e-art").value = e.art || "";
+  $("#md").value = md;
+  epChapters = (e.chapters || []).map((c) => ({ start: clockOf(c.start), title: c.title, url: c.url }));
+  renderChapters();
+  slugTouched = !!slug;
+  setSeo(e);
+  syncEpisode(e);
+  syncAudio(info);
+  const scount = () => { const n = $("#e-summary").value.length; $("#e-scount").textContent = n ? n + " of 400 characters" : ""; };
+  scount();
+  $("#e-title").addEventListener("input", () => { if (!slugTouched) $("#e-slug").value = slugify($("#e-title").value); markDirty(); });
+  $("#e-slug").addEventListener("input", () => { slugTouched = true; markDirty(); });
+  $("#e-summary").addEventListener("input", () => { scount(); markDirty(); });
+  watch(["#e-number", "#e-season", "#e-kind", "#e-date", "#e-explicit", "#e-duration"]);
+  let artT = null;
+  $("#e-art").addEventListener("input", () => { markDirty(); clearTimeout(artT); artT = setTimeout(() => artCheck($("#e-art").value.trim(), $("#e-artcheck"), "episode"), 500); });
+  $("#e-artup").addEventListener("click", () => pickFile("image/*", async (f) => {
+    try { $("#e-art").value = await uploadImage(f); markDirty(); artCheck($("#e-art").value, $("#e-artcheck"), "episode"); } catch (err) { toast(err.message, "bad"); }
+  }));
+  artCheck(e.art, $("#e-artcheck"), "episode");
+  $("#e-save").addEventListener("click", () => saveEpisode(false));
+  $("#e-publish").addEventListener("click", () => saveEpisode(true));
+  $("#e-unpublish").addEventListener("click", unpublishEpisode);
+  $("#e-delete").addEventListener("click", deleteEpisode);
+  $("#e-import").addEventListener("click", () => importInto("#e-title", "#e-slug"));
+  $("#e-choose").addEventListener("click", () => $("#e-file").click());
+  $("#e-file").addEventListener("change", () => { const f = $("#e-file").files[0]; $("#e-file").value = ""; uploadAudio(f); });
+  const drop = $("#e-drop");
+  drop.addEventListener("dragover", (ev) => { ev.preventDefault(); drop.classList.add("over"); });
+  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+  drop.addEventListener("drop", (ev) => { ev.preventDefault(); drop.classList.remove("over"); uploadAudio(ev.dataTransfer.files[0]); });
+  $("#e-retry").addEventListener("click", async () => {
+    try { await api("POST", "podcast/episodes/" + enc(view.slug) + "/process"); $("#e-log").textContent = ""; mediaSeen = 0; pollMedia(); toast("Processing again"); }
+    catch (err) { toast(err.message, "bad"); }
+  });
+  $("#e-stop").addEventListener("click", async () => { try { await api("POST", "jobs/media/cancel"); } catch (err) { toast(err.message, "bad"); } });
+  $("#e-youtube").addEventListener("click", copyYouTube);
+  $("#e-chadd").addEventListener("click", () => { epChapters.push({ start: epChapters.length ? "" : "00:00", title: "", url: "" }); renderChapters(); markDirty(); });
+  $("#e-chpaste").addEventListener("click", () => { $("#e-chpastebox").hidden = !$("#e-chpastebox").hidden; });
+  $("#e-chapply").addEventListener("click", () => {
+    const list = pasteChapters($("#e-chtext").value);
+    if (!list.length) { toast("No lines like 00:00 Intro found.", "bad"); return; }
+    epChapters = list; renderChapters(); markDirty(); $("#e-chpastebox").hidden = true; $("#e-chtext").value = "";
+  });
+  $("#e-trup").addEventListener("click", () => $("#e-trfile").click());
+  $("#e-trfile").addEventListener("change", uploadTranscript);
+  $("#e-trdel").addEventListener("click", async () => {
+    if (!window.confirm("Remove the transcript? The file is moved to the trash folder.")) return;
+    try { const r = await api("DELETE", "podcast/episodes/" + enc(view.slug) + "/transcript"); syncTranscript(r.episode); schedulePreview(); }
+    catch (err) { toast(err.message, "bad"); }
+  });
+  syncTranscript(e);
+  bindEditor();
+  renderSide();
+  renderPreview();
+  if (e.media && (e.media.state === "queued" || e.media.state === "processing")) { mediaSeen = 0; $("#e-log").textContent = ""; pollMedia(); }
+  if (!slug) $("#e-title").focus();
+}
+
+function pickFile(accept, fn) {
+  const inp = el("input", { type: "file", accept, hidden: "" });
+  document.body.appendChild(inp);
+  inp.addEventListener("change", () => { const f = inp.files[0]; inp.remove(); if (f) fn(f); });
+  inp.click();
+}
+
+function syncEpisode(e) {
+  const pub = e.status === "published";
+  $("#e-status").textContent = view.slug ? (pub ? "Published" : "Draft") : "New";
+  $("#e-status").className = "chip" + (pub ? "" : " draft");
+  $("#e-save").textContent = pub ? "Save" : "Save draft";
+  $("#e-publish").textContent = pub ? "Update" : "Publish";
+  $("#e-unpublish").hidden = !pub;
+  $("#e-delete").hidden = !view.slug;
+}
+
+function syncAudio(d) {
+  const e = d.episode, a = e.audio || {}, m = e.media || {};
+  const label = { queued: "Queued", processing: "Processing", ready: "Ready", failed: "Failed" }[m.state] || (a.file ? "Ready" : "No audio yet");
+  $("#e-mstate").textContent = label;
+  $("#e-mstate").className = "chip" + (m.state === "failed" ? " bad" : (a.file ? "" : " draft"));
+  const box = $("#e-audioinfo");
+  box.innerHTML = "";
+  if (a.file) {
+    const bits = [a.file, fmtDur(e.duration) || "length unknown", fmtSize(a.bytes), a.type === "audio/mpeg" ? "MP3" : "M4A"];
+    if (a.kbps) bits.push(a.kbps + " kbps");
+    if (a.channels) bits.push(a.channels === 1 ? "mono" : (a.channels === 2 ? "stereo" : a.channels + " channels"));
+    if (a.lufs !== null && a.lufs !== undefined) bits.push(a.lufs + " LUFS");
+    box.appendChild(el("div", { text: bits.join(" \u00b7 ") }));
+  }
+  if (m.message) box.appendChild(el("div", { class: "warnline", text: m.message }));
+  const p = $("#e-player");
+  if (d.src) { if (p.getAttribute("src") !== d.src) p.src = d.src; p.hidden = false; } else { p.hidden = true; }
+  $("#e-durrow").hidden = !!a.probed;
+  $("#e-duration").value = e.duration ? clockOf(e.duration) : "";
+  $("#e-retry").hidden = !(m.state === "failed" && m.original);
+  $("#e-stop").hidden = !(m.state === "processing" || m.state === "queued");
+  $("#e-choose").textContent = a.file ? "Replace audio" : "Choose audio";
+  if (m.log && m.log.length && m.state !== "processing" && m.state !== "queued") { $("#e-log").textContent = m.log.join("\n") + "\n"; $("#e-logbox").hidden = false; }
+  $("#e-youtube").disabled = !view.slug;
+}
+
+function syncTranscript(e) {
+  const t = e.transcript || {};
+  $("#e-trinfo").textContent = t.file ? t.file + ": " + fmt(t.cues || 0) + " cues. The words show on the episode page under Transcript." : "No transcript. A .vtt or .srt file (from Whisper, for example) puts the words on the episode page and in the feed.";
+  $("#e-trdel").hidden = !t.file;
+  $("#e-trup").textContent = t.file ? "Replace transcript" : "Upload .vtt or .srt";
+}
+
+async function saveEpisode(publish) {
+  try {
+    const r = await api("POST", "podcast/episodes", Object.assign(epPayload(), { publish }));
+    view.slug = r.slug;
+    view.origDate = r.episode.date;
+    $("#e-slug").value = r.slug;
+    slugTouched = true;
+    setDirty(false);
+    S = r.state; renderTop(); renderSide();
+    syncEpisode(r.episode);
+    $("#e-youtube").disabled = false;
+    toast(publish ? "Published. It goes live with the next publish to the server." : "Saved");
+    return true;
+  } catch (e) { toast(e.message, "bad"); return false; }
+}
+
+async function unpublishEpisode() {
+  try { const r = await api("POST", "podcast/episodes/" + enc(view.slug) + "/unpublish"); await refresh(); syncEpisode(r.episode); toast("Moved back to drafts"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+async function deleteEpisode() {
+  if (!window.confirm("Delete this episode? Its show notes go to the trash folder; its audio stays under Unused audio in show settings.")) return;
+  try { const r = await api("DELETE", "podcast/episodes/" + enc(view.slug)); setDirty(false); await refresh(); await openHome(); toast(r.note || "Episode deleted"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+async function uploadAudio(file) {
+  if (!file) return;
+  const limit = pod().upload_limit_mb * 1048576;
+  if (file.size > limit) { toast("That file is " + fmtSize(file.size) + "; the upload limit is " + fmtSize(limit) + ". Raise it under Audio in show settings.", "bad"); return; }
+  if (!view.slug || dirty) {
+    if (!$("#e-title").value.trim()) { toast("Give the episode a title first, so it can be saved before the upload.", "bad"); return; }
+    if (!(await saveEpisode(false))) return;
+  }
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/api/podcast/audio?episode=" + enc(view.slug) + "&name=" + enc(file.name || "audio"));
+  xhr.setRequestHeader("X-Token", TOKEN);
+  $("#e-progress").hidden = false;
+  $("#e-bar").value = 0;
+  $("#e-choose").disabled = true;
+  xhr.upload.onprogress = (ev) => {
+    if (!ev.lengthComputable || !$("#e-bar")) return;
+    $("#e-bar").value = ev.loaded / ev.total * 100;
+    $("#e-ptext").textContent = fmtSize(ev.loaded) + " of " + fmtSize(ev.total);
+  };
+  const done = () => { if ($("#e-progress")) { $("#e-progress").hidden = true; $("#e-choose").disabled = false; } };
+  xhr.onload = () => {
+    done();
+    let d = {};
+    try { d = JSON.parse(xhr.responseText); } catch (e) { /* not json */ }
+    if (xhr.status >= 400) { toast(d.error || "The upload failed.", "bad"); return; }
+    toast("Uploaded. Processing the audio...");
+    if ($("#e-log")) { $("#e-log").textContent = ""; $("#e-logbox").hidden = false; $("#e-logbox").open = true; }
+    mediaSeen = 0;
+    pollMedia();
+  };
+  xhr.onerror = () => { done(); toast("The upload failed: the connection dropped.", "bad"); };
+  xhr.send(file);
+}
+
+async function uploadTranscript() {
+  const f = $("#e-trfile").files[0];
+  $("#e-trfile").value = "";
+  if (!f) return;
+  if (!view.slug) { toast("Save the episode first.", "bad"); return; }
+  try {
+    const r = await fetch("/api/podcast/transcript?episode=" + enc(view.slug) + "&name=" + enc(f.name), { method: "POST", headers: { "X-Token": TOKEN }, body: f });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "Upload failed");
+    syncTranscript(d.episode);
+    schedulePreview();
+    toast("Transcript added");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+async function copyYouTube() {
+  if (!view.slug) { toast("Save the episode first.", "bad"); return; }
+  if (dirty && !(await saveEpisode(false))) return;
+  try { const d = await api("GET", "podcast/episodes/" + enc(view.slug)); await copyText(d.youtube); toast("Copied the title, description and chapter times for YouTube Studio"); }
+  catch (e) { toast(e.message, "bad"); }
+}
+
+/* ---------- show settings ---------- */
+const SHOW_TPL = `
+<div class="fill">
+  <div class="bar"><strong>Show settings</strong><span class="grow"></span><button id="s-save" class="primary">Save</button></div>
+  <div class="pad podpad">
+    <fieldset><legend>Feed check</legend><ul class="checks" id="s-check"></ul></fieldset>
+    <fieldset><legend>Show</legend>
+      <label class="field">Title <input id="s-title" maxlength="200"></label>
+      <label class="field">Author <input id="s-author" maxlength="200"></label>
+      <span><b>About the show</b> <span class="hint">Markdown. It is the intro on the show page, and the feed carries the first 4,000 bytes of it.</span></span>
+      <div class="mdbox">MDTOOLS<textarea id="md" class="code" rows="8" spellcheck="true"></textarea></div>
+      <div class="two">
+        <label class="field">Language <input id="s-language" placeholder="en or en-US"></label>
+        <label class="field">Type <select id="s-type"><option value="episodic">Episodic: newest first</option><option value="serial">Serial: oldest first</option></select></label>
+      </div>
+      <div class="two"><label class="field">Primary category <select id="s-cat0"></select></label><label class="field">Subcategory <select id="s-sub0"></select></label></div>
+      <div class="two"><label class="field">Secondary category <select id="s-cat1"></select></label><label class="field">Subcategory <select id="s-sub1"></select></label></div>
+      <label><input type="checkbox" id="s-explicit"> Explicit content</label>
+      <label class="field">Copyright <input id="s-copyright"></label>
+      <label class="field">Website link <input id="s-link"></label>
+    </fieldset>
+    <fieldset><legend>Artwork</legend>
+      <div style="display:flex;gap:6px"><input id="s-image" style="flex:1" placeholder="assets/show-art.jpg"><button id="s-imgup" type="button">Upload</button></div>
+      <span class="hint">A square JPG or PNG, 1400 to 3000 pixels, RGB with no transparency. 3000 pixels is best.</span>
+      <div class="artcheck" id="s-artcheck"></div>
+    </fieldset>
+    <fieldset><legend>Owner</legend>
+      <div class="two"><label class="field">Name <input id="s-owner_name"></label><label class="field">Email <input id="s-owner_email" type="email"></label></div>
+      <span class="hint">The email is public in the feed, and Spotify, Amazon and YouTube send their verification codes to it, so an address just for the show is the better choice.</span>
+    </fieldset>
+    <fieldset><legend>Feed</legend>
+      <div style="display:flex;gap:6px"><input id="s-feedurl" readonly style="flex:1" aria-label="Feed URL"><button id="s-copyfeed" type="button">Copy</button></div>
+      <span class="hint" id="s-guid"></span>
+      <span class="hint" id="s-lock"></span>
+      <div id="s-legacy" class="hint"></div>
+      <label><input type="checkbox" id="s-complete"> The show has ended; no new episodes are coming</label>
+      <label><input type="checkbox" id="s-block"> Keep out of directories (for testing)</label>
+      <label><input type="checkbox" id="s-locked"> Locked: directories that honor it refuse imports of this feed by anyone else</label>
+      <div id="s-funding"></div>
+      <label><input type="checkbox" id="s-ping"> Ping Podcast Index after a publish that changed the feed (no key needed)</label>
+      <label><input type="checkbox" id="s-websub"> WebSub: name pubsubhubbub.appspot.com in the feed and notify it on every change</label>
+      <div style="display:flex;gap:8px;align-items:center"><span class="hint grow" id="s-lastping"></span><button id="s-pingnow" type="button">Ping now</button></div>
+    </fieldset>
+    <fieldset><legend>Audio</legend>
+      <label><input type="checkbox" id="s-normalize"> Normalize loudness to -16 LUFS, Apple's target (ffmpeg, two passes)</label>
+      <div class="two">
+        <label class="field">Output format <select id="s-format"><option value="mp3">MP3: plays everywhere</option><option value="m4a">AAC in M4A: smaller, better seeking</option></select></label>
+        <label class="field">Mono bit rate <select id="s-kbps_mono"></select></label>
+        <label class="field">Stereo bit rate <select id="s-kbps_stereo"></select></label>
+      </div>
+      <label><input type="checkbox" id="s-mono"> Mono output: half the size, and most talk shows lose nothing</label>
+      <label><input type="checkbox" id="s-tags"> Write tags, cover art and chapters into the audio file</label>
+      <label class="field">Upload size limit in MB <input type="number" id="s-upload_limit_mb" min="1" style="max-width:10em"></label>
+      <span class="hint" id="s-tools"></span>
+    </fieldset>
+    <fieldset><legend>Media</legend>
+      <label><input type="radio" name="s-mode" value="site"> Audio lives with the site, in <span class="mono" id="s-audiodir"></span>, and goes out with every publish</label>
+      <label><input type="radio" name="s-mode" value="host"> Audio lives on a separate media host, such as Cloudflare R2 or a DNS-only subdomain</label>
+      <div id="s-hostbox" class="sub-fields">
+        <label class="field">Media base URL <input id="s-media_url" placeholder="https://media.example.com/podcast/"><span class="hint">The public address the files are served from. Each publish checks it before the feed goes out.</span></label>
+        <label class="field">Upload method <select id="m-method"><option value="rclone">rclone (R2, B2, S3 and others)</option><option value="rsync">rsync over SSH</option><option value="sftp">SFTP</option><option value="ftps">FTPS</option><option value="ftp">FTP</option><option value="folder">A local folder or mount</option></select></label>
+        <label class="field" id="m-remoterow">rclone target <input id="m-remote" placeholder="r2:my-bucket/podcast"><span class="hint">Set the remote up once with rclone config; the app never holds the cloud keys.</span></label>
+        <div class="two" id="m-hostrow"><label class="field">Host <input id="m-host"></label><label class="field">Port <input id="m-port"></label></div>
+        <div class="two" id="m-userrow"><label class="field">User <input id="m-user"></label><label class="field">Password <input type="password" id="m-pass" placeholder="Leave blank to use an SSH key"></label></div>
+        <label id="m-remember"><input type="checkbox" id="m-save_password"> Remember the password (plain text, readable by your user only)</label>
+        <label class="field" id="m-pathrow">Path <input id="m-path"></label>
+        <label class="field" id="m-keyrow">SSH key file <input id="m-key" placeholder="Optional, for example ~/.ssh/id_ed25519"></label>
+        <label id="m-passiverow"><input type="checkbox" id="m-passive"> Passive mode</label>
+        <label id="m-tlsrow"><input type="checkbox" id="m-insecure_tls"> Trust a self-signed certificate (FTPS only)</label>
+        <div class="two"><button id="m-test" type="button">Test connection</button><button id="m-clean" type="button" class="danger">Remove unused audio from the media host</button></div>
+        <pre class="log" id="m-log" hidden></pre>
+      </div>
+    </fieldset>
+    <fieldset><legend>Unused audio</legend><div id="s-unused"></div></fieldset>
+  </div>
+</div>`;
+
+const SHOW_TEXT = ["title", "author", "language", "copyright", "link", "image", "owner_name", "owner_email", "media_url"];
+const SHOW_BOOL = ["explicit", "complete", "block", "locked", "ping", "websub", "normalize", "mono", "tags"];
+const MEDIA_TEXT = ["remote", "host", "port", "user", "path", "key"];
+const MEDIA_BOOL = ["save_password", "passive", "insecure_tls"];
+let showInfo = null, funding = [];
+
+function catSelects(cats) {
+  [0, 1].forEach((i) => {
+    const c = $("#s-cat" + i), sub = $("#s-sub" + i);
+    opts(c, [["", i ? "None" : "Choose a category"]].concat(showInfo.categories.map(([name]) => [name, name])), (cats[i] || {}).cat || "");
+    const fill = (keep) => {
+      const found = showInfo.categories.find(([name]) => name === c.value);
+      const subs = found ? found[1] : [];
+      opts(sub, [["", subs.length ? "None" : "No subcategories"]].concat(subs.map((s) => [s, s])), keep);
+      sub.disabled = !subs.length;
+    };
+    fill((cats[i] || {}).sub || "");
+    c.addEventListener("change", () => { fill(""); markDirty(); });
+    sub.addEventListener("change", markDirty);
+  });
+}
+
+function renderFunding() {
+  const box = $("#s-funding");
+  box.innerHTML = "";
+  box.appendChild(el("span", { text: "Support links (up to three): ", class: "hint" }));
+  funding.forEach((f, i) => {
+    const row = el("div", { class: "chrow" });
+    const u = el("input", { placeholder: "https://...", "aria-label": "Support link" });
+    const t = el("input", { placeholder: "Support the show", maxlength: "127", "aria-label": "Link text" });
+    u.value = f.url; t.value = f.text;
+    u.addEventListener("input", () => { f.url = u.value; markDirty(); });
+    t.addEventListener("input", () => { f.text = t.value; markDirty(); });
+    const rm = el("button", { text: "\u00d7", type: "button", "aria-label": "Remove" });
+    rm.addEventListener("click", () => { funding.splice(i, 1); renderFunding(); markDirty(); });
+    row.append(u, t, rm);
+    box.appendChild(row);
+  });
+  if (funding.length < 3) {
+    const add = el("button", { text: "Add a support link", type: "button" });
+    add.addEventListener("click", () => { funding.push({ url: "", text: "" }); renderFunding(); });
+    box.appendChild(add);
+  }
+}
+
+function renderChecks(list, box) {
+  box.innerHTML = "";
+  if (!list.length) { box.appendChild(el("li", { class: "ok", text: "Everything checks out." })); return; }
+  const order = { fail: 0, warn: 1, info: 2 };
+  list.slice().sort((a, b) => order[a.level] - order[b.level]).forEach((x) => {
+    const li = el("li", { class: x.level }, [el("b", { text: { fail: "Fail", warn: "Warning", info: "Note" }[x.level] + ": " }), document.createTextNode(x.text)]);
+    if (x.fix) li.appendChild(el("span", { class: "hint", text: " " + x.fix }));
+    box.appendChild(li);
+  });
+}
+
+function mediaSync() {
+  const m = $("#m-method").value;
+  const ssh = m === "rsync" || m === "sftp", ftp = m === "ftp" || m === "ftps";
+  $("#s-hostbox").hidden = ($("input[name=s-mode]:checked") || {}).value !== "host";
+  $("#m-remoterow").hidden = m !== "rclone";
+  $("#m-hostrow").hidden = !(ssh || ftp);
+  $("#m-userrow").hidden = !(ssh || ftp);
+  $("#m-remember").hidden = !(ssh || ftp);
+  $("#m-pathrow").hidden = m === "rclone";
+  $("#m-keyrow").hidden = !ssh;
+  $("#m-passiverow").hidden = !ftp;
+  $("#m-tlsrow").hidden = m !== "ftps";
+}
+
+function readMedia() {
+  const o = { method: $("#m-method").value };
+  MEDIA_TEXT.forEach((k) => { o[k] = $("#m-" + k).value.trim(); });
+  MEDIA_BOOL.forEach((k) => { o[k] = $("#m-" + k).checked; });
+  return o;
+}
+
+function readShow() {
+  const o = { markdown: $("#md").value, media_mode: ($("input[name=s-mode]:checked") || { value: "site" }).value };
+  SHOW_TEXT.forEach((k) => { o[k] = $("#s-" + k).value.trim(); });
+  SHOW_BOOL.forEach((k) => { o[k] = $("#s-" + k).checked; });
+  ["type", "format", "kbps_mono", "kbps_stereo", "upload_limit_mb"].forEach((k) => { o[k] = $("#s-" + k).value; });
+  o.categories = [0, 1].map((i) => ({ cat: $("#s-cat" + i).value, sub: $("#s-sub" + i).value })).filter((x) => x.cat);
+  o.funding = funding.filter((f) => f.url.trim());
+  if (o.media_mode === "host" || showInfo.show.media_target.method) o.media_target = readMedia();
+  if ($("#m-pass").value) o.media_password = $("#m-pass").value;
+  return o;
+}
+
+function fillShow(info) {
+  showInfo = info;
+  const s = info.show, r = info.resolved;
+  SHOW_TEXT.forEach((k) => { $("#s-" + k).value = s[k] || ""; });
+  SHOW_BOOL.forEach((k) => { $("#s-" + k).checked = !!s[k]; });
+  $("#s-title").placeholder = r.title;
+  $("#s-author").placeholder = r.author;
+  $("#s-language").placeholder = r.language;
+  $("#s-copyright").placeholder = r.copyright || "Defaults to the site footer";
+  $("#s-link").placeholder = r.link || "Defaults to the show page";
+  $("#s-type").value = s.type;
+  $("#s-format").value = s.format;
+  opts($("#s-kbps_mono"), [64, 80, 96, 112, 128].map((n) => [String(n), n + " kbps"]), String(s.kbps_mono));
+  opts($("#s-kbps_stereo"), [128, 160, 192, 224, 256].map((n) => [String(n), n + " kbps"]), String(s.kbps_stereo));
+  $("#s-upload_limit_mb").value = s.upload_limit_mb;
+  catSelects(s.categories);
+  funding = (s.funding || []).map((f) => ({ url: f.url, text: f.text }));
+  renderFunding();
+  $("#s-feedurl").value = info.feed_url || "Set the site URL under Settings to get a feed address.";
+  $("#s-guid").textContent = info.guid ? "podcast:guid " + info.guid : "";
+  $("#s-lock").textContent = s.feed_lock ? "Locked to " + s.feed_lock + " since " + s.locked_at.slice(0, 10) + ". A change that would move it asks first." : "Not locked yet. The first successful publish locks this address.";
+  $("#s-legacy").textContent = info.legacy.length ? "Old addresses that still get a copy of the feed pointing here: " + info.legacy.map((l) => l.url + (l.rel ? "" : " (on another domain; that server has to redirect it)")).join(", ") : "";
+  const lp = s.last_ping || {};
+  $("#s-lastping").textContent = lp.at ? "Last Podcast Index ping " + lp.at.replace("T", " ").slice(0, 16) + ": " + (lp.ok ? "" : "failed, ") + (lp.message || "") : "Podcast Index has not been pinged yet.";
+  $("#s-audiodir").textContent = (S.modules.podcast.mount ? S.modules.podcast.mount + "/" : "") + "audio/";
+  const mode = $("input[name=s-mode][value=" + s.media_mode + "]");
+  if (mode) mode.checked = true;
+  const mt = info.media_target || {};
+  $("#m-method").value = mt.method || "rclone";
+  MEDIA_TEXT.forEach((k) => { $("#m-" + k).value = mt[k] || ""; });
+  MEDIA_BOOL.forEach((k) => { $("#m-" + k).checked = !!mt[k]; });
+  if (info.media_password) $("#m-pass").placeholder = "Saved password in use. Type to change it.";
+  mediaSync();
+  renderChecks(info.check, $("#s-check"));
+  renderUnused(info.unused);
+  artCheck(s.image, $("#s-artcheck"), "show");
+}
+
+function renderUnused(list) {
+  const box = $("#s-unused");
+  box.innerHTML = "";
+  if (!list.length) { box.appendChild(el("span", { class: "hint", text: "Every audio file in the audio folder belongs to an episode." })); return; }
+  box.appendChild(el("span", { class: "hint", text: "Files in the audio folder that no episode uses, such as replaced recordings. They are still published until you remove them." }));
+  list.forEach((f) => box.appendChild(el("div", { class: "row" }, [el("span", { class: "t mono", text: f.file }), el("span", { class: "n", text: fmtSize(f.bytes) })])));
+  const b = el("button", { text: "Move these to the trash", class: "danger", type: "button" });
+  b.addEventListener("click", async () => {
+    if (!window.confirm("Move " + list.length + " unused audio file(s) to the trash folder? They leave the site with the next publish.")) return;
+    try { const r = await api("POST", "podcast/unused/trash", { files: list.map((f) => f.file) }); renderUnused(r.unused); toast("Moved " + r.trashed + " file(s) to the trash"); }
+    catch (e) { toast(e.message, "bad"); }
+  });
+  box.appendChild(b);
+}
+
+async function openShow() {
+  const info = await api("GET", "podcast/show");
+  view = { type: "show" };
+  show(SHOW_TPL);
+  $("#md").value = info.markdown;
+  fillShow(info);
+  $$("#left input, #left textarea, #left select").forEach((i) => i.addEventListener(i.type === "checkbox" || i.type === "radio" || i.tagName === "SELECT" ? "change" : "input", markDirty));
+  $$("input[name=s-mode]").forEach((r) => r.addEventListener("change", mediaSync));
+  $("#m-method").addEventListener("change", mediaSync);
+  let artT = null;
+  $("#s-image").addEventListener("input", () => { clearTimeout(artT); artT = setTimeout(() => artCheck($("#s-image").value.trim(), $("#s-artcheck"), "show"), 500); });
+  $("#s-imgup").addEventListener("click", () => pickFile("image/png,image/jpeg", async (f) => {
+    try { $("#s-image").value = await uploadImage(f); markDirty(); artCheck($("#s-image").value, $("#s-artcheck"), "show"); schedulePreview(); } catch (e) { toast(e.message, "bad"); }
+  }));
+  $("#s-copyfeed").addEventListener("click", async () => { if (showInfo.feed_url) { await copyText(showInfo.feed_url); toast("Feed URL copied"); } });
+  $("#s-pingnow").addEventListener("click", async () => {
+    try { const r = await api("POST", "podcast/ping"); $("#s-lastping").textContent = "Pinged just now: " + (r.ping.ok ? "" : "failed, ") + r.ping.message; } catch (e) { toast(e.message, "bad"); }
+  });
+  $("#m-test").addEventListener("click", () => mediaJob("test"));
+  $("#m-clean").addEventListener("click", () => mediaJob("clean"));
+  $("#s-save").addEventListener("click", saveShow);
+  api("GET", "podcast/tools").then((t) => {
+    const v = t.tools;
+    const line = ["ffmpeg", "ffprobe", "rclone"].map((k) => k + ": " + (v[k] ? v[k] : "not found")).join(" \u00b7 ");
+    const hints = [];
+    if (!v.ffmpeg || !v.ffprobe) hints.push("Without ffmpeg, MP3 and M4A files are used as they are and other formats are refused. " + t.hint_ffmpeg);
+    if (!v.rclone) hints.push("rclone is only needed for an R2, B2 or S3 media host. " + t.hint_rclone);
+    if ($("#s-tools")) $("#s-tools").textContent = line + ". " + hints.join(" ");
+  }).catch(() => {});
+  bindEditor();
+  renderSide();
+  renderPreview();
+}
+
+async function saveShow() {
+  try {
+    const info = await api("PUT", "podcast/show", readShow());
+    setDirty(false);
+    $("#m-pass").value = "";
+    fillShow(info);
+    await refresh();
+    toast("Show settings saved");
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+let mjobTimer = null, mjobSeen = 0;
+async function mediaJob(kind, confirmed) {
+  if (mjobTimer) return;
+  const body = { media_target: readMedia(), media_password: $("#m-pass").value, confirm: !!confirmed };
+  try {
+    const r = await api("POST", "podcast/media/" + kind, body);
+    if (r.needs_confirm) { if (window.confirm(r.message)) return mediaJob(kind, true); return; }
+    if (!r.started) { toast(r.message || "Nothing to do"); return; }
+    const log = $("#m-log");
+    log.hidden = false;
+    log.textContent = "";
+    mjobSeen = 0;
+    const poll = async () => {
+      const s = await api("GET", "jobs/publish/status?since=" + mjobSeen);
+      if (s.lines.length && $("#m-log")) { $("#m-log").textContent += s.lines.join("\n") + "\n"; $("#m-log").scrollTop = $("#m-log").scrollHeight; mjobSeen = s.total; }
+      if (s.running) { mjobTimer = setTimeout(poll, 700); return; }
+      mjobTimer = null;
+      toast(s.what + (s.ok ? " finished" : " failed. See the log."), s.ok ? "" : "bad");
+    };
+    poll();
+  } catch (e) { toast(e.message, "bad"); }
+}
+
+/* ---------- directories checklist ---------- */
+const DIR_TPL = `
+<div class="fill">
+  <div class="bar"><strong>Directories</strong><span class="hint" id="dir-count"></span><span class="grow"></span><button id="dir-save" class="primary">Save</button></div>
+  <div class="pad podpad">
+    <div class="bar warn" id="dir-gate" hidden></div>
+    <div style="display:flex;gap:6px;align-items:center"><span>Feed</span><input id="dir-feed" readonly style="flex:1" aria-label="Feed URL"><button id="dir-copy" type="button">Copy feed URL</button></div>
+    <span class="hint">Owner email in the feed: <b id="dir-email"></b>. Most directories send their verification code to it.</span>
+    <p class="hint">Work down the list once. Paste each listing address back in as it goes live; they become the subscribe links on the show page.</p>
+    <div id="dir-rows"></div>
+    <p class="hint">Before the first submission, run the feed through Apple's validation in Podcasts Connect, and add the show by its feed URL in the Apple Podcasts app as a test. Google Podcasts and RadioPublic shut down in 2024; older guides still list them.</p>
+  </div>
+</div>`;
+
+async function openDirs() {
+  const info = await api("GET", "podcast/show");
+  view = { type: "dirs" };
+  show(DIR_TPL);
+  const s = info.show;
+  const fails = info.check.filter((x) => x.level === "fail");
+  const ready = !fails.length && !!s.live_seen;
+  $("#dir-gate").hidden = ready;
+  $("#dir-gate").textContent = fails.length ? "The feed check has " + fails.length + " failure(s); fix them in Show settings first. Directories turn down a feed they cannot use."
+    : "Publish once so the live check can see the feed online. Directories turn down a feed they cannot fetch.";
+  $("#dir-feed").value = info.feed_url || "";
+  $("#dir-email").textContent = s.owner_email || "not set";
+  const count = () => { $("#dir-count").textContent = $$(".dir-done:checked").length + " of " + info.directories.length + " done"; };
+  const box = $("#dir-rows");
+  info.directories.forEach((d, i) => {
+    const done = el("input", { type: "checkbox", class: "dir-done", id: "dir-done-" + d.id });
+    done.checked = !!s.checklist[d.id];
+    const url = el("input", { id: "dir-link-" + d.id, placeholder: "Listing address once it is live, for example https://..." });
+    url.value = s.links[d.id] || "";
+    const open = el("a", { href: d.url, target: "_blank", rel: "noopener", class: "btnlink", text: "Open " + d.where });
+    const copy = el("button", { type: "button", text: "Copy feed URL" });
+    copy.addEventListener("click", async () => { await copyText(info.feed_url); toast("Feed URL copied"); });
+    const card = el("div", { class: "mod-card dir" + (ready ? "" : " grey") }, [
+      el("h4", {}, [done, el("label", { for: done.id, text: (i + 1) + ". " + d.name }), el("span", { class: "hint", text: s.checklist[d.id] ? "done " + s.checklist[d.id] : "" })]),
+      el("span", { class: "hint", text: d.needs }),
+      el("div", { class: "two" }, [open, copy]),
+      el("label", { class: "field" }, [el("span", { text: "Listing address" }), url])]);
+    [done, url].forEach((x) => x.addEventListener(x.type === "checkbox" ? "change" : "input", () => { markDirty(); count(); }));
+    box.appendChild(card);
+  });
+  count();
+  $("#dir-copy").addEventListener("click", async () => { if (info.feed_url) { await copyText(info.feed_url); toast("Feed URL copied"); } });
+  $("#dir-save").addEventListener("click", async () => {
+    const checklist = {}, links = {};
+    info.directories.forEach((d) => { checklist[d.id] = $("#dir-done-" + d.id).checked; links[d.id] = $("#dir-link-" + d.id).value.trim(); });
+    try { await api("PUT", "podcast/checklist", { checklist, links }); setDirty(false); await refresh(); openDirs(); toast("Saved"); }
+    catch (e) { toast(e.message, "bad"); }
+  });
+  renderSide();
+  renderPreview();
 }
 
 /* ---------- publish panel ---------- */
@@ -8549,10 +12539,13 @@ const PUB_TPL = `
       <label class="field">Branch <input id="d-branch" placeholder="main"></label>
     </div>
     <label id="d-mirrorrow"><input type="checkbox" id="d-mirror"> Remove files on the server that are no longer part of the site</label>
+    <label id="d-fullrow"><input type="checkbox" id="d-full_upload"> Upload every file, not only the ones that changed since the last publish</label>
     <p class="hint" id="d-mirrorhint"></p>
     <label id="d-srcrow"><input type="checkbox" id="d-include_sources"> Include the hidden source folder</label>
     <label id="d-passiverow"><input type="checkbox" id="d-passive"> Passive mode (leave this on unless the server says otherwise)</label>
     <label id="d-tlsrow"><input type="checkbox" id="d-insecure_tls"> Trust a self-signed certificate (FTPS only, weaker)</label>
+    <label id="d-anywayrow" hidden><input type="checkbox" id="d-anyway"> Publish anyway, even when the podcast feed check fails</label>
+    <p class="hint" id="d-podnote" hidden></p>
     <p class="hint" id="d-tools"></p>
     <p class="hint" id="d-note"></p>
   </div>
@@ -8560,7 +12553,7 @@ const PUB_TPL = `
 </div>`;
 
 let pubTimer = null, pubSeen = 0;
-const DEPLOY_BOOLS = ["mirror", "include_sources", "save_password", "passive", "insecure_tls"];
+const DEPLOY_BOOLS = ["mirror", "include_sources", "save_password", "passive", "insecure_tls", "full_upload"];
 
 function readDeploy() {
   const o = { method: $("#d-method").value };
@@ -8584,6 +12577,7 @@ function pubSync(info) {
   $("#d-tlsrow").hidden = m !== "ftps";
   $("#d-mirrorrow").hidden = m === "git";
   $("#d-mirrorhint").hidden = m === "git";
+  $("#d-fullrow").hidden = !(m === "sftp" || ftp || m === "folder");
   $("#d-mirrorhint").textContent = m === "rsync"
     ? "rsync mirrors the folder: anything there that is not part of the site is deleted, apart from hidden files. The first publish to a new folder asks before doing that."
     : "Only files that an earlier publish sent are removed. Nothing else on the server is touched.";
@@ -8594,7 +12588,9 @@ function pubSync(info) {
   if (m === "git" && !t.git) notes.push("git is not installed on this machine.");
   if (m === "ftp") notes.push("Plain FTP sends your password and files in the clear. Prefer FTPS or SFTP.");
   if (m === "rsync") notes.push("rsync only transfers what changed, so repeat publishes are quick.");
+  if (m === "sftp" || ftp || m === "folder") notes.push("Only files that changed since the last publish to this target are sent; the first publish sends everything.");
   if (m === "git") notes.push("For GitHub or GitLab pages, or a bare repo on your VPS with a post-receive hook that checks the files out into the web root.");
+  if (m === "git" && on("podcast") && pod().media_mode !== "host") notes.push("With the podcast's audio in the site, git keeps every version of every recording forever, and GitHub refuses files over 100 MB. A separate media host (show settings, Media) avoids both.");
   $("#d-note").textContent = notes.join(" ");
   $("#d-tools").textContent = "On this machine: " + ["rsync", "ssh", "sftp", "sshpass", "git"]
     .map((x) => x + (t[x] ? " yes" : " no")).join(", ") + ". The password can also come from the "
@@ -8633,6 +12629,7 @@ async function pubRun(kind, confirmed) {
   body.password = $("#d-pass").value;
   body.dry = kind === "dry";
   body.test = kind === "test";
+  body.anyway = !!($("#d-anyway") && $("#d-anyway").checked);
   if (confirmed) body.confirm_mirror = true;
   try {
     const r = await api("POST", "publish", body);
@@ -8685,6 +12682,14 @@ async function openPublish() {
   $("#d-dry").addEventListener("click", () => pubRun("dry"));
   $("#d-test").addEventListener("click", () => pubRun("test"));
   $("#d-stop").addEventListener("click", pubStop);
+  if (on("podcast")) {
+    $("#d-anywayrow").hidden = false;
+    $("#d-podnote").hidden = false;
+    $("#d-podnote").textContent = pod().media_mode === "host"
+      ? "This publish has two stages: first the audio goes to the media host and every episode's audio address is checked, then the site goes out with the podcast feed last. After that the live check looks at the published feed and Podcast Index is pinged when the feed changed."
+      : "The podcast feed goes out last, after the audio it points at. After that the live check looks at the published feed and audio, and Podcast Index is pinged when the feed changed.";
+    if (pod().check_fails) $("#d-podnote").textContent += " The feed check has " + pod().check_fails + " failure(s) right now (see Show settings), so Build and publish stops unless Publish anyway is ticked.";
+  }
   pubSync(info);
   renderSide();
   if (info.running) { pubSeen = 0; pubBusy(true); pollJob(); }
@@ -8704,13 +12709,14 @@ async function act(name) {
   if (name === "quit") {
     if (!(await guard())) return;
     await api("POST", "quit");
-    document.body.innerHTML = "<p style='padding:40px;font:16px system-ui'>SiteForge has stopped. You can close this tab.</p>";
+    document.body.innerHTML = "<p style='padding:40px;font:16px system-ui'>__APP__ has stopped. You can close this tab.</p>";
     return;
   }
   await go(async () => {
     const fns = {
       "new-page": newPage, "new-post": () => openPost(null), "new-article": () => openArticle(null, null, null),
-      "new-story": newStory, "new-chapter": () => openChapter(null, null, null), structure: openStructure, menu: openMenu,
+      "new-story": newStory, "new-chapter": () => openChapter(null, null, null), "new-episode": () => openEpisode(null),
+      structure: openStructure, menu: openMenu,
       css: openCss, settings: openSettings, publish: openPublish, switch: chooseFolder,
       rescan: async () => {
         const r = await api("POST", "rescan");
@@ -8761,13 +12767,16 @@ function showSetup(folder) {
       groups[t.group].appendChild(el("option", { value: t.id, text: t.label }));
     });
   }
-  const pickTheme = () => { sel.value = { page: "site-clean", blog: "site-clean", wiki: "wiki-classic", library: "book-paperback" }[$("input[name=u-home]:checked").value]; };
+  $("#u-structure").hidden = !!S.only;
+  $("#u-importbox").hidden = !!S.only;
+  if (S.only) $("input[name=u-home][value=" + S.only + "]").checked = true;
+  const pickTheme = () => { sel.value = { page: "site-clean", blog: "site-clean", wiki: "wiki-classic", library: "book-paperback", podcast: "site-clean" }[$("input[name=u-home]:checked").value]; };
   $$("input[name=u-home]").forEach((r) => { r.onchange = pickTheme; });
   pickTheme();
   $("#u-detect").onclick = async () => {
     try {
       const r = await api("POST", "detect-import", { path: $("#u-import").value });
-      $("#u-detected").textContent = "Found a " + { sitegen: "SiteGen", wikigen: "WikiGen", storygen: "StoryGen" }[r.kind] + " site: " + r.title;
+      $("#u-detected").textContent = "Found a " + { sitegen: "SiteGen", wikigen: "WikiGen", storygen: "StoryGen", podcastgen: "PodcastGen" }[r.kind] + " site: " + r.title;
       $("input[name=u-home][value=" + r.home + "]").checked = true;
       pickTheme();
       $("#u-rootrow").hidden = r.home === "page";
@@ -8819,19 +12828,63 @@ themeLabel();
 '''
 
 
+def headless_publish(folder):
+    """Build and publish without the editor, with the saved settings: for a cron job or a
+    systemd timer, so scheduled episodes go out after their date. Returns the exit code."""
+    if not folder:
+        print("--publish needs the site folder, for example: %s.py ~/my-site --publish" % APP.lower(), file=sys.stderr)
+        return 2
+    root = Path(folder).expanduser().resolve()
+    if not (root / META_DIR / "config.json").is_file():
+        print("There is no %s site in %s." % (APP, root), file=sys.stderr)
+        return 2
+    try:
+        site = Site(root)
+        site.load()
+        CURRENT["site"] = site
+        if not site.cfg.get("deploy"):
+            print("Set up publishing once in the editor (Publish, Save settings) first.", file=sys.stderr)
+            return 2
+        r = start_publish(site, {})
+    except ApiError as e:
+        print("Stopped: %s" % e, file=sys.stderr)
+        return 1
+    if r.get("needs_confirm"):
+        print(r["message"], file=sys.stderr)
+        print("Publish once from the editor to confirm that, then run this again.", file=sys.stderr)
+        return 2
+    seen = 0
+    while True:
+        st = job_status(seen)
+        for line in st["lines"]:
+            print(line, flush=True)
+        seen = st["total"]
+        if not st["running"]:
+            break
+        time.sleep(0.5)
+    return 0 if st["ok"] else 1
+
+
 def main():
-    ap = argparse.ArgumentParser(description="SiteForge: one site generator for pages, a blog, a wiki and a story library.")
+    what = ("a podcast site: a show page, episode pages and the feed podcast apps read" if ONLY_MODULE else
+            "one site generator for pages, a blog, a wiki, a story library and a podcast")
+    ap = argparse.ArgumentParser(description="%s: %s." % (APP, what))
     ap.add_argument("folder", nargs="?", help="site folder to open (created if it does not exist)")
-    ap.add_argument("--port", type=int, default=8768, help="port for the local editor (default 8768)")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="port for the local editor (default %d)" % DEFAULT_PORT)
     ap.add_argument("--no-browser", action="store_true", help="do not open a browser tab automatically")
+    ap.add_argument("--publish", action="store_true",
+                    help="build the site in FOLDER and publish it with its saved settings, print the log and exit; "
+                         "exits non-zero on failure (for a cron job or systemd timer)")
     args = ap.parse_args()
+    if args.publish:
+        sys.exit(headless_publish(args.folder))
 
     if args.folder:
         try:
             r = open_site(args.folder)
             if r.get("needs_confirm"):
                 PENDING["folder"] = str(Path(args.folder).expanduser().resolve())
-                print("That folder has files SiteForge did not create. Confirm in the editor to use it.")
+                print("That folder has files %s did not create. Confirm in the editor to use it." % APP)
             elif r.get("needs_setup"):
                 print("New site: finish the setup in your browser.")
         except ApiError as e:
@@ -8857,7 +12910,7 @@ def main():
     SERVER["httpd"] = httpd
     SERVER["port"] = httpd.server_address[1]
     url = "http://127.0.0.1:%d/" % SERVER["port"]
-    print("SiteForge is running at %s (Ctrl+C to stop)" % url)
+    print("%s is running at %s (Ctrl+C to stop)" % (APP, url))
     if not args.no_browser:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:
